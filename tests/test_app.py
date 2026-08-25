@@ -5,6 +5,7 @@ import pytest
 from repetui.app import DeckScreen, HelpScreen, RepetuiApp, ReviewScreen
 from repetui.backend import Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
+from repetui.presentation import CardTemplateIdentity, RawCardContent, present_card
 
 
 class FakeBackend:
@@ -30,7 +31,9 @@ class FakeBackend:
 
     def next_card(self) -> ReviewCard | None:
         if self.card_available:
-            return ReviewCard(42, "question", "answer")
+            identity = CardTemplateIdentity(1, "Basic", 0, "Card 1")
+            presentation = present_card(RawCardContent(identity, "question", "answer"))
+            return ReviewCard(42, presentation)
         return None
 
     def answer(self, rating: int) -> None:
@@ -52,6 +55,8 @@ async def test_complete_keyboard_review_loop() -> None:
         assert isinstance(app.screen, DeckScreen)
         await pilot.press("enter")
         assert isinstance(app.screen, ReviewScreen)
+        assert "question" in str(app.screen.query_one("#card").render())
+        assert "answer" not in str(app.screen.query_one("#card").render())
 
         await pilot.press("enter")
         review = app.screen
@@ -73,4 +78,3 @@ async def test_help_is_hidden_until_requested() -> None:
         assert isinstance(app.screen, HelpScreen)
         await pilot.press("escape")
         assert isinstance(app.screen, DeckScreen)
-

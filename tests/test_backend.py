@@ -4,21 +4,44 @@ from repetui.backend import AnkiBackend, DueCounts
 
 
 class FakeRendered:
+    question_text = "<div>front</div>"
+    answer_text = "front<hr id=answer><div>back [anki:play:a:0] [anki:play:a:1]</div>"
+    question_av_tags: list[object] = []
+    answer_av_tags: list[object] = [
+        SimpleNamespace(filename="大人_b.mp3"),
+        SimpleNamespace(lang="ja_JP", field_text="大人"),
+    ]
+
     def question_and_style(self) -> str:
-        return "<div>front</div>"
+        return self.question_text
 
     def answer_and_style(self) -> str:
-        return "front<hr id=answer><div>back</div>"
+        return self.answer_text
+
+
+class FakeNote:
+    def items(self) -> list[tuple[str, str]]:
+        return [("Front", "front"), ("Back", "back")]
 
 
 class FakeCard:
     id = 99
+    ord = 0
 
     def __init__(self) -> None:
         self.timer_started = False
 
     def render_output(self) -> FakeRendered:
         return FakeRendered()
+
+    def note_type(self) -> dict[str, object]:
+        return {"id": 123, "name": "Basic"}
+
+    def template(self) -> dict[str, object]:
+        return {"name": "Card 1"}
+
+    def note(self) -> FakeNote:
+        return FakeNote()
 
     def start_timer(self) -> None:
         self.timer_started = True
@@ -116,8 +139,12 @@ def test_review_uses_anki_rendering_and_scheduler() -> None:
     card = service.next_card()
 
     assert card is not None
-    assert card.question == "front"
-    assert card.answer == "back"
+    assert card.presentation.front.text == "front"
+    assert card.presentation.back.text == ("back [audio: 大人_b.mp3] [text to speech: ja_JP]")
+    assert card.identity.note_type_id == 123
+    assert card.identity.note_type_name == "Basic"
+    assert card.identity.template_ordinal == 0
+    assert card.identity.template_name == "Card 1"
 
     service.answer(3)
 

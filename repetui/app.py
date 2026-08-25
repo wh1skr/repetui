@@ -204,7 +204,12 @@ class ReviewScreen(Screen[None]):
             return
 
         if self.revealed:
-            content.update(Text(f"{self.card.question}\n\n────────\n\n{self.card.answer}"))
+            content.update(
+                Text(
+                    f"{self.card.presentation.front.text}\n\n────────\n\n"
+                    f"{self.card.presentation.back.text}"
+                )
+            )
             actions.update(
                 "[#dc6b72][b]1[/b] again[/]   "
                 "[#d7b85a][b]2[/b] hard[/]   "
@@ -212,7 +217,7 @@ class ReviewScreen(Screen[None]):
                 "[#68a8df][b]4[/b] easy[/]   [dim]?[/dim]"
             )
         else:
-            content.update(Text(self.card.question))
+            content.update(Text(self.card.presentation.front.text))
             actions.update("[reverse] enter [/reverse] reveal   [dim]?[/dim]")
         self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
 

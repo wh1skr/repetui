@@ -7,11 +7,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .render import html_to_text
+from .presentation import (
+    AVReference,
+    CardPresentation,
+    CardTemplateIdentity,
+    RawCardContent,
+    SourceField,
+    present_card,
+)
 
 
 class BackendError(RuntimeError):
     """Raised when the local Anki collection cannot be used."""
+
+
+def _av_references(tags: list[Any]) -> tuple[AVReference, ...]:
+    references: list[AVReference] = []
+    for tag in tags:
+        if filename := getattr(tag, "filename", None):
+            name = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+            references.append(AVReference("audio", name))
+        else:
+            language = str(getattr(tag, "lang", "")).strip()
+            references.append(AVReference("text to speech", language or None))
+    return tuple(references)
 
 
 @dataclass(frozen=True)
@@ -40,8 +59,11 @@ class Deck:
 @dataclass(frozen=True)
 class ReviewCard:
     id: int
-    question: str
-    answer: str
+    presentation: CardPresentation
+
+    @property
+    def identity(self) -> CardTemplateIdentity:
+        return self.presentation.identity
 
 
 class AnkiBackend:
@@ -134,12 +156,24 @@ class AnkiBackend:
         queued_card = queued.cards[0]
         card = collection.get_card(queued_card.card.id)
         rendered = card.render_output()
-        self._current = (card, queued_card.states)
-        return ReviewCard(
-            id=card.id,
-            question=html_to_text(rendered.question_and_style()),
-            answer=html_to_text(rendered.answer_and_style(), answer=True),
+        note_type = card.note_type()
+        template = card.template()
+        note = card.note()
+        raw_content = RawCardContent(
+            identity=CardTemplateIdentity(
+                note_type_id=int(note_type["id"]),
+                note_type_name=str(note_type["name"]),
+                template_ordinal=int(card.ord),
+                template_name=str(template["name"]),
+            ),
+            front_html=rendered.question_text,
+            back_html=rendered.answer_text,
+            fields=tuple(SourceField(name, html) for name, html in note.items()),
+            front_av=_av_references(rendered.question_av_tags),
+            back_av=_av_references(rendered.answer_av_tags),
         )
+        self._current = (card, queued_card.states)
+        return ReviewCard(id=card.id, presentation=present_card(raw_content))
 
     def answer(self, rating: int) -> None:
         collection = self._require_collection()

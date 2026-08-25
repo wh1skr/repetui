@@ -25,5 +25,4 @@ def test_answer_drops_duplicated_front_side() -> None:
 
 
 def test_empty_or_media_only_card_has_stable_fallback() -> None:
-    assert html_to_text("<style>x</style>[sound:voice.mp3]") == "(empty card)"
-
+    assert html_to_text("<style>x</style>[sound:voice.mp3]") == "[audio: voice.mp3]"
