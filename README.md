@@ -10,6 +10,7 @@ Anki collection.
 
 - Browse decks and current due counts.
 - Review cards with Anki's Again, Hard, Good, and Easy ratings.
+- Show, fold, or hide answer sections per card template.
 - Scroll long cards without a mouse.
 - Synchronize review progress with AnkiWeb.
 
@@ -42,7 +43,8 @@ If more than one Anki profile exists:
 uv run repetui --profile PROFILE_NAME
 ```
 
-Inside the application, press `?` for the complete keyboard reference.
+Inside the application, press `?` for help. During review it opens the current
+template's section settings and keyboard reference.
 
 ## Licence and relationship to Anki
 

@@ -48,3 +48,18 @@ interface should feel calm and intentional rather than decorative or sterile.
   distracting.
 - Original ASCII artwork belongs at meaningful moments such as startup and an
   empty review queue, not throughout the working interface.
+
+### Review Flow
+
+Review is small-pane-first. The prompt starts at the first terminal cell and
+the revealed answer follows immediately below it; no border, logo, margin, or
+permanent help line competes with card content. Ratings consume one row only
+after reveal.
+
+- Card content always wraps and remains scrollable.
+- Metadata disappears in this order as width shrinks: deck, split counts,
+  total due, then template name. Prompt content then wraps without truncation.
+- Every detected answer section is shown by default.
+- A user may explicitly show, fold, or hide sections for one stable Anki note
+  type and card template.
+- Opening a fold during a review is temporary and never changes its saved mode.

@@ -8,12 +8,15 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import ListItem, ListView, Static
 
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
 from .config import ProfilePaths
+from .flow import SectionState, compose_ratings, compose_review, section_name
+from .preferences import Preferences, SectionMode, SectionPreferences
+from .presentation import CardTemplateIdentity, PresentationSection
 from .sync import SyncOutcome, sync_profile
 
 LOGO = """\
@@ -139,11 +142,159 @@ class DeckScreen(Screen[None]):
             self.app.push_screen(ReviewScreen(item.deck))
 
 
+class SectionSettingItem(ListItem):
+    """One keyboard-editable presentation section."""
+
+    def __init__(self, section: PresentationSection) -> None:
+        super().__init__()
+        self.section = section
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="setting-label")
+        yield Static(classes="setting-mode")
+
+    def refresh_mode(
+        self, preferences: Preferences, identity: CardTemplateIdentity
+    ) -> None:
+        mode = preferences.mode(identity, self.section.id)
+        label = section_name(self.section)
+        colour = {
+            SectionMode.SHOW: "#79c98b",
+            SectionMode.FOLD: "#d7b85a",
+            SectionMode.HIDE: "#dc6b72",
+        }[mode]
+        self.query_one(".setting-label", Static).update(
+            Text(label, style="#d9d5ce", overflow="ellipsis", no_wrap=True)
+        )
+        self.query_one(".setting-mode", Static).update(Text(mode.value, style=colour))
+
+
+class TemplateSettingsScreen(Screen[None]):
+    """A full-screen, tiny-pane-safe surface for one card template."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", show=False),
+        Binding("j", "down", "Down", show=False),
+        Binding("k", "up", "Up", show=False),
+        Binding("space", "cycle", "Change", show=False),
+        Binding("enter", "cycle", "Change", show=False),
+        Binding("h", "sections", "Sections", show=False),
+        Binding("l", "keys", "Keys", show=False),
+        Binding("tab", "toggle_tab", "Next tab", show=False),
+    ]
+
+    def __init__(self, review: ReviewScreen) -> None:
+        super().__init__()
+        self.review = review
+        assert review.card is not None
+        self.card = review.card
+        self.tab = "sections"
+
+    @property
+    def repetui(self) -> RepetuiApp:
+        return cast("RepetuiApp", self.app)
+
+    def compose(self) -> ComposeResult:
+        identity = self.card.presentation.identity
+        yield Vertical(
+            Static(
+                f"settings · {identity.note_type_name} / {identity.template_name}",
+                id="settings-header",
+            ),
+            Static(id="settings-tabs"),
+            ListView(
+                *(SectionSettingItem(section) for section in self.card.presentation.back.sections),
+                id="settings-sections",
+            ),
+            VerticalScroll(
+                Static(
+                    "review\n"
+                    "  enter    reveal / Good\n"
+                    "  1–4      Again / Hard / Good / Easy\n"
+                    "  space    reveal / open selected fold\n"
+                    "  j / k    scroll and select folds\n"
+                    "  g / G    top / bottom\n"
+                    "  s        sync\n"
+                    "  esc      decks\n\n"
+                    "settings\n"
+                    "  h / l    sections / keys\n"
+                    "  j / k    select section\n"
+                    "  space    show → fold → hide\n"
+                    "  esc      return",
+                    id="settings-key-text",
+                ),
+                id="settings-keys",
+            ),
+            Static("j/k move · space mode · h/l tabs · esc", id="settings-footer"),
+            id="settings-layout",
+        )
+
+    def on_mount(self) -> None:
+        for item in self.query(SectionSettingItem):
+            item.refresh_mode(self.repetui.preferences, self.card.presentation.identity)
+        sections = self.query_one("#settings-sections", ListView)
+        if sections.children:
+            sections.index = 0
+        self._show_tab("sections")
+
+    def _show_tab(self, tab: str) -> None:
+        self.tab = tab
+        sections = self.query_one("#settings-sections", ListView)
+        keys = self.query_one("#settings-keys", VerticalScroll)
+        sections.display = tab == "sections"
+        keys.display = tab == "keys"
+        self.query_one("#settings-tabs", Static).update(
+            "[reverse] sections [/reverse]  keys"
+            if tab == "sections"
+            else "sections  [reverse] keys [/reverse]"
+        )
+        (sections if tab == "sections" else keys).focus()
+
+    def action_sections(self) -> None:
+        self._show_tab("sections")
+
+    def action_keys(self) -> None:
+        self._show_tab("keys")
+
+    def action_toggle_tab(self) -> None:
+        self._show_tab("keys" if self.tab == "sections" else "sections")
+
+    def action_down(self) -> None:
+        if self.tab == "sections":
+            self.query_one("#settings-sections", ListView).action_cursor_down()
+        else:
+            self.query_one("#settings-keys", VerticalScroll).scroll_down(animate=False)
+
+    def action_up(self) -> None:
+        if self.tab == "sections":
+            self.query_one("#settings-sections", ListView).action_cursor_up()
+        else:
+            self.query_one("#settings-keys", VerticalScroll).scroll_up(animate=False)
+
+    def action_cycle(self) -> None:
+        if self.tab != "sections":
+            return
+        view = self.query_one("#settings-sections", ListView)
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return
+        item = view.children[view.index]
+        if not isinstance(item, SectionSettingItem):
+            return
+        identity = self.card.presentation.identity
+        mode = self.repetui.preferences.mode(identity, item.section.id)
+        self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
+        item.refresh_mode(self.repetui.preferences, identity)
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+        self.review.preferences_changed()
+
+
 class ReviewScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "back", "Decks", show=False),
         Binding("enter", "primary", "Reveal/Good", show=False),
-        Binding("space", "reveal", "Reveal", show=False),
+        Binding("space", "toggle_fold", "Reveal/expand", show=False),
         Binding("1", "again", "Again", show=False),
         Binding("2", "hard", "Hard", show=False),
         Binding("3", "good", "Good", show=False),
@@ -160,6 +311,8 @@ class ReviewScreen(Screen[None]):
         self.deck = deck
         self.card: ReviewCard | None = None
         self.revealed = False
+        self.expanded_sections: set[str] = set()
+        self.selected_folded = 0
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -167,9 +320,8 @@ class ReviewScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static(id="review-header"),
             VerticalScroll(Static(id="card"), id="card-scroll"),
-            Horizontal(Static(id="review-actions"), id="action-row"),
+            Static(id="review-actions"),
             id="review-layout",
         )
 
@@ -186,44 +338,85 @@ class ReviewScreen(Screen[None]):
     def load_next(self) -> None:
         self.card = self.repetui.backend.next_card()
         self.revealed = False
+        self.expanded_sections.clear()
+        self.selected_folded = 0
         self._refresh_view()
 
-    def _refresh_view(self) -> None:
-        counts = self.repetui.backend.counts()
-        self.query_one("#review-header", Static).update(
-            f"[b]{self.deck.name}[/b]  [dim]due {counts.total}[/dim]  "
-            f"[#68a8df]{counts.new}[/]/"
-            f"[#dc6b72]{counts.learning}[/]/"
-            f"[#79c98b]{counts.review}[/]"
+    def _folded_sections(self) -> tuple[PresentationSection, ...]:
+        if self.card is None:
+            return ()
+        identity = self.card.presentation.identity
+        return tuple(
+            section
+            for section in self.card.presentation.back.sections
+            if self.repetui.preferences.mode(identity, section.id) is SectionMode.FOLD
         )
+
+    def _section_states(self) -> tuple[SectionState, ...]:
+        assert self.card is not None
+        identity = self.card.presentation.identity
+        folded = self._folded_sections()
+        folded_ids = [section.id for section in folded]
+        if folded_ids:
+            self.selected_folded %= len(folded_ids)
+        else:
+            self.selected_folded = 0
+
+        states: list[SectionState] = []
+        for section in self.card.presentation.back.sections:
+            mode = self.repetui.preferences.mode(identity, section.id)
+            states.append(
+                SectionState(
+                    section=section,
+                    mode=mode,
+                    expanded=section.id in self.expanded_sections,
+                    selected=(
+                        mode is SectionMode.FOLD
+                        and folded_ids.index(section.id) == self.selected_folded
+                    ),
+                )
+            )
+        return tuple(states)
+
+    def _refresh_view(self, *, reset_scroll: bool = True) -> None:
+        counts = self.repetui.backend.counts()
         content = self.query_one("#card", Static)
         actions = self.query_one("#review-actions", Static)
         if self.card is None:
             content.update(Text("✓  Nothing due. You showed up."))
-            actions.update("[dim]esc  decks    s  sync    ?  help[/dim]")
+            actions.display = False
             return
 
+        flow = compose_review(
+            self.card.presentation,
+            self.deck.name,
+            counts,
+            self.size.width,
+            revealed=self.revealed,
+            sections=self._section_states() if self.revealed else (),
+        )
         if self.revealed:
-            content.update(
-                Text(
-                    f"{self.card.presentation.front.text}\n\n────────\n\n"
-                    f"{self.card.presentation.back.text}"
-                )
-            )
-            actions.update(
-                "[#dc6b72][b]1[/b] again[/]   "
-                "[#d7b85a][b]2[/b] hard[/]   "
-                "[#79c98b][b]3[/b] good[/]   "
-                "[#68a8df][b]4[/b] easy[/]   [dim]?[/dim]"
-            )
+            actions.update(compose_ratings(self.size.width))
+            actions.display = True
         else:
-            content.update(Text(self.card.presentation.front.text))
-            actions.update("[reverse] enter [/reverse] reveal   [dim]?[/dim]")
-        self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+            actions.display = False
+        content.update(flow)
+        if reset_scroll:
+            self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._refresh_view(reset_scroll=False)
 
     def backend_refreshed(self) -> None:
         self.repetui.backend.begin_review(self.deck.id)
         self.load_next()
+
+    def preferences_changed(self) -> None:
+        """Apply saved choices after the settings screen returns."""
+        self.expanded_sections.clear()
+        self.selected_folded = 0
+        self._refresh_view(reset_scroll=False)
 
     def action_back(self) -> None:
         if not self._busy():
@@ -239,6 +432,20 @@ class ReviewScreen(Screen[None]):
         if not self._busy() and self.card is not None and not self.revealed:
             self.revealed = True
             self._refresh_view()
+
+    def action_toggle_fold(self) -> None:
+        if not self.revealed:
+            self.action_reveal()
+            return
+        folded = self._folded_sections()
+        if not folded:
+            return
+        section = folded[self.selected_folded % len(folded)]
+        if section.id in self.expanded_sections:
+            self.expanded_sections.remove(section.id)
+        else:
+            self.expanded_sections.add(section.id)
+        self._refresh_view(reset_scroll=False)
 
     def _rate(self, rating: int) -> None:
         if self._busy() or self.card is None or not self.revealed:
@@ -262,9 +469,17 @@ class ReviewScreen(Screen[None]):
         self._rate(4)
 
     def action_scroll_down(self) -> None:
+        folded = self._folded_sections()
+        if self.revealed and folded:
+            self.selected_folded = (self.selected_folded + 1) % len(folded)
+            self._refresh_view(reset_scroll=False)
         self.query_one(VerticalScroll).scroll_down(animate=False)
 
     def action_scroll_up(self) -> None:
+        folded = self._folded_sections()
+        if self.revealed and folded:
+            self.selected_folded = (self.selected_folded - 1) % len(folded)
+            self._refresh_view(reset_scroll=False)
         self.query_one(VerticalScroll).scroll_up(animate=False)
 
     def action_scroll_top(self) -> None:
@@ -285,11 +500,16 @@ class RepetuiApp(App[None]):
         color: #e7e1d8;
     }
 
-    #deck-layout, #review-layout {
+    #deck-layout {
         width: 100%;
         height: 100%;
         max-width: 96;
         align-horizontal: center;
+    }
+
+    #review-layout {
+        width: 100%;
+        height: 100%;
     }
 
     #logo {
@@ -328,18 +548,10 @@ class RepetuiApp(App[None]):
         padding: 0 2;
     }
 
-    #review-header {
-        height: 1;
-        background: #1d2225;
-        padding: 0 1;
-    }
-
     #card-scroll {
         height: 1fr;
-        border: round #394145;
-        background: #161a1c;
-        margin: 1;
-        padding: 1 2;
+        background: #111416;
+        scrollbar-size-vertical: 1;
     }
 
     #card {
@@ -347,14 +559,62 @@ class RepetuiApp(App[None]):
         min-height: 1;
     }
 
-    #action-row {
-        height: 2;
-        align-horizontal: center;
+    #review-actions {
+        width: 100%;
+        height: 1;
+        text-align: center;
     }
 
-    #review-actions {
-        width: auto;
+    #settings-layout {
+        width: 100%;
+        height: 100%;
+        background: #111416;
+    }
+
+    #settings-header {
         height: 1;
+        color: #eee9e0;
+    }
+
+    #settings-tabs {
+        height: 1;
+        color: #aaa49b;
+    }
+
+    #settings-sections, #settings-keys {
+        height: 1fr;
+        background: #111416;
+        scrollbar-size-vertical: 1;
+    }
+
+    SectionSettingItem {
+        height: 1;
+        layout: horizontal;
+    }
+
+    SectionSettingItem.-highlight {
+        background: #293034;
+    }
+
+    .setting-label {
+        width: 1fr;
+        height: 1;
+    }
+
+    .setting-mode {
+        width: 5;
+        height: 1;
+        text-align: right;
+    }
+
+    #settings-key-text {
+        height: auto;
+        color: #d9d5ce;
+    }
+
+    #settings-footer {
+        height: 1;
+        color: #817d76;
     }
 
     HelpScreen {
@@ -398,10 +658,16 @@ class RepetuiApp(App[None]):
         Binding("question_mark", "help", "Help", show=False, priority=True),
     ]
 
-    def __init__(self, backend: AnkiBackend, profile: ProfilePaths) -> None:
+    def __init__(
+        self,
+        backend: AnkiBackend,
+        profile: ProfilePaths,
+        preferences: Preferences | None = None,
+    ) -> None:
         super().__init__()
         self.backend = backend
         self.profile = profile
+        self.preferences = preferences if preferences is not None else SectionPreferences()
         self.syncing = False
 
     def on_mount(self) -> None:
@@ -415,7 +681,11 @@ class RepetuiApp(App[None]):
         self.backend.close()
 
     def action_help(self) -> None:
-        if not isinstance(self.screen, HelpScreen):
+        if isinstance(self.screen, TemplateSettingsScreen):
+            self.screen.action_back()
+        elif isinstance(self.screen, ReviewScreen) and self.screen.card is not None:
+            self.push_screen(TemplateSettingsScreen(self.screen))
+        elif not isinstance(self.screen, HelpScreen):
             self.push_screen(HelpScreen())
 
     def action_sync(self) -> None:
