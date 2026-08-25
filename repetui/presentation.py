@@ -563,6 +563,6 @@ def present_card(raw: RawCardContent) -> CardPresentation:
 
 
 def html_to_text(html: str, *, answer: bool = False) -> str:
-    """Compatibility renderer backed by the card-presentation implementation."""
+    """Render standalone Anki HTML with the card-presentation policy."""
     source = _strip_answer_html(html)[0] if answer else html
     return _render_document(source).text or "(empty card)"

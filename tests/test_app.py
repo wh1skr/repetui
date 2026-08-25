@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -5,12 +6,14 @@ from textual.widgets import Input
 
 from repetui.app import (
     DeckScreen,
+    ErrorScreen,
     HelpScreen,
     RepetuiApp,
     ReviewScreen,
     TemplateSettingsScreen,
+    compose_deck_row,
 )
-from repetui.backend import Deck, DueCounts, ReviewCard
+from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
 from repetui.preferences import SectionMode, SectionPreferences
 from repetui.presentation import (
@@ -19,14 +22,20 @@ from repetui.presentation import (
     SourceField,
     present_card,
 )
+from repetui.sync import SyncOutcome
 
 
 class FakeBackend:
-    def __init__(self, card_content: RawCardContent | None = None) -> None:
+    def __init__(
+        self,
+        card_content: RawCardContent | None = None,
+        decks: list[Deck] | None = None,
+    ) -> None:
         self.is_open = False
         self.rating = None
         self.card_available = True
         self.card_content = card_content
+        self._decks = decks or [Deck(1, "Japanese", 0, DueCounts(2, 1, 7))]
 
     def open(self) -> None:
         self.is_open = True
@@ -35,7 +44,7 @@ class FakeBackend:
         self.is_open = False
 
     def decks(self) -> list[Deck]:
-        return [Deck(1, "Japanese", 0, DueCounts(2, 1, 7))]
+        return self._decks
 
     def begin_review(self, deck_id: int) -> None:
         assert deck_id == 1
@@ -62,13 +71,20 @@ def make_app(
     tmp_path: Path | None = None,
     card_content: RawCardContent | None = None,
     preferences: SectionPreferences | None = None,
+    decks: list[Deck] | None = None,
+    syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
-    backend = FakeBackend(card_content)
+    backend = FakeBackend(card_content, decks)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
     store = preferences or SectionPreferences(
         (tmp_path or Path("/tmp")) / "preferences.json"
     )
-    return RepetuiApp(backend, profile, store), backend
+    app = (
+        RepetuiApp(backend, profile, store)
+        if syncer is None
+        else RepetuiApp(backend, profile, store, syncer)
+    )
+    return app, backend
 
 
 def rendered_text(screen: ReviewScreen) -> str:
@@ -124,6 +140,54 @@ def real_kanji_card() -> RawCardContent:
 
 
 @pytest.mark.asyncio
+async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
+    tmp_path,
+) -> None:
+    decks = [
+        Deck(
+            1,
+            "完全な統計::日本語::ＷＫ漢字と単語::漢字",
+            3,
+            DueCounts(8, 17, 213),
+        ),
+        Deck(2, "AWS::SAA-C03", 1, DueCounts(3, 0, 12)),
+    ]
+    app, _ = make_app(tmp_path, decks=decks)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DeckScreen)
+        assert str(screen.query_one("#deck-header").render()) == "decks"
+        assert screen.query_one("#deck-header").region.y == 0
+        assert len(screen.query("#logo")) == 0
+        assert len(screen.query(".quiet-footer")) == 0
+
+        items = list(screen.query("DeckItem"))
+        assert len(items) == 2
+        first = items[0]
+        row = str(first.query_one(".deck-row").render())
+        assert row == compose_deck_row(decks[0], 40).plain
+        assert "ＷＫ漢字と単語 › 漢字" in row
+        assert "238" in row
+        assert "8/17/213" in row
+        assert first.region.y == 1
+
+        await pilot.resize_terminal(14, 6)
+        row = str(first.query_one(".deck-row").render())
+        assert row == compose_deck_row(decks[0], 14).plain
+        assert "漢字" in row
+        assert "238" in row
+        assert "8/17/213" not in row
+
+        await pilot.resize_terminal(8, 6)
+        assert str(first.query_one(".deck-row").render()) == "… › 漢字"
+
+        await pilot.resize_terminal(4, 6)
+        assert str(first.query_one(".deck-row").render()) == "漢字"
+
+
+@pytest.mark.asyncio
 async def test_complete_keyboard_review_loop(tmp_path) -> None:
     app, backend = make_app(tmp_path)
 
@@ -146,6 +210,7 @@ async def test_complete_keyboard_review_loop(tmp_path) -> None:
         await pilot.press("enter")
         assert backend.rating == 3
         assert "Nothing due" in str(review.query_one("#card").render())
+        assert str(review.query_one("#card").render()).startswith("done · Japanese")
 
 
 @pytest.mark.asyncio
@@ -281,6 +346,62 @@ async def test_long_prompt_and_back_are_complete_and_vim_scrollable_in_tiny_pane
         assert scroll.scroll_y > 0
         await pilot.press("k")
         assert scroll.scroll_y == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "front_fragment", "back_fragments", "scrolls"),
+    [
+        (
+            RawCardContent(
+                CardTemplateIdentity(301, "AWS SAA-C03", 0, "Architecture choice"),
+                "Which service decouples producers from consumers?",
+                """<hr id=answer>
+                <h2>Answer</h2><p>Amazon SQS</p>
+                <h2>Why</h2><p>A durable queue buffers messages while consumers
+                scale independently.</p>
+                <h2>Exam trap</h2><p>SNS fans out notifications; it does not retain
+                a queue for a slow consumer.</p>
+                """,
+            ),
+            "Which service decouples",
+            ("Amazon SQS", "scale independently", "SNS fans out"),
+            True,
+        ),
+        (
+            RawCardContent(
+                CardTemplateIdentity(302, "Custom", 0, "Unsupported markup"),
+                "<question-shell>What survives unknown markup?</question-shell>",
+                """<hr id=answer><answer-shell>
+                <mystery-box>All visible answer text survives safely.</mystery-box>
+                </answer-shell>""",
+            ),
+            "What survives unknown markup?",
+            ("All visible answer text survives safely.",),
+            False,
+        ),
+    ],
+)
+async def test_aws_and_unknown_templates_remain_complete_in_tiny_flow(
+    tmp_path,
+    content,
+    front_fragment,
+    back_fragments,
+    scrolls,
+) -> None:
+    app, _ = make_app(tmp_path, content)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert front_fragment in rendered_text(review)
+        assert all(fragment not in rendered_text(review) for fragment in back_fragments)
+
+        await pilot.press("enter")
+        flow = rendered_text(review)
+        assert all(fragment in flow for fragment in back_fragments)
+        assert (review.query_one("#card-scroll").max_scroll_y > 0) is scrolls
 
 
 @pytest.mark.asyncio
@@ -439,4 +560,99 @@ async def test_help_is_hidden_until_requested(tmp_path) -> None:
         await pilot.press("?")
         assert isinstance(app.screen, HelpScreen)
         await pilot.press("escape")
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_help_is_full_screen_scrollable_and_tiny_pane_safe(tmp_path) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(20, 6)) as pilot:
+        await pilot.press("?")
+        help_screen = app.screen
+        assert isinstance(help_screen, HelpScreen)
+        assert help_screen.query_one("#help-layout").region.size == help_screen.size
+        assert help_screen.query_one("#help-header").region == (0, 0, 20, 1)
+        assert help_screen.query_one("#help-scroll").region == (0, 1, 20, 4)
+        assert help_screen.query_one(".surface-footer").region == (0, 5, 20, 1)
+        assert len(help_screen.query("#help-dialog")) == 0
+        scroll = help_screen.query_one("#help-scroll")
+        assert scroll.max_scroll_y > 0
+        await pilot.press("G")
+        assert scroll.scroll_y == scroll.max_scroll_y
+        await pilot.press("g")
+        assert scroll.scroll_y == 0
+        await pilot.press("?")
+        assert isinstance(app.screen, DeckScreen)
+
+
+class FailingBackend(FakeBackend):
+    def open(self) -> None:
+        raise BackendError("Close Anki Desktop before starting repetui.")
+
+
+@pytest.mark.asyncio
+async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
+    backend = FailingBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(backend, profile, SectionPreferences(tmp_path / "prefs.json"))
+
+    async with app.run_test(size=(20, 6)):
+        screen = app.screen
+        assert isinstance(screen, ErrorScreen)
+        assert screen.query_one("#error-layout").region.size == screen.size
+        assert screen.query_one("#error-header").region == (0, 0, 20, 1)
+        assert screen.query_one("#error-scroll").region == (0, 1, 20, 4)
+        assert screen.query_one(".surface-footer").region == (0, 5, 20, 1)
+        assert "unable to start" in str(screen.query_one("#error-header").render())
+        assert "Close Anki Desktop" in str(
+            screen.query_one("#error-scroll Static").render()
+        )
+        assert len(screen.query("#error-box")) == 0
+        assert len(screen.query("#error-logo")) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_review", [False, True])
+async def test_sync_is_available_from_decks_and_review_without_persistent_chrome(
+    tmp_path,
+    from_review,
+) -> None:
+    calls: list[ProfilePaths] = []
+
+    def fake_sync(profile: ProfilePaths) -> SyncOutcome:
+        calls.append(profile)
+        return SyncOutcome(True, "Synced.")
+
+    app, backend = make_app(tmp_path, syncer=fake_sync)
+    async with app.run_test(size=(40, 6)) as pilot:
+        if from_review:
+            await pilot.press("enter")
+            assert isinstance(app.screen, ReviewScreen)
+
+        assert any(binding.key == "s" for binding in app.screen.BINDINGS)
+        app.syncing = True
+        app._finish_sync(app._run_sync())
+        await pilot.pause()
+
+        assert calls == [app.profile]
+        assert backend.is_open is True
+        assert app.syncing is False
+        assert isinstance(app.screen, ReviewScreen if from_review else DeckScreen)
+        assert len(app.screen.query("#sync-status")) == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_sync_reopens_collection_and_clears_busy_state(tmp_path) -> None:
+    def fail_sync(_profile: ProfilePaths) -> SyncOutcome:
+        raise RuntimeError("offline")
+
+    app, backend = make_app(tmp_path, syncer=fail_sync)
+    async with app.run_test(size=(40, 6)) as pilot:
+        app.syncing = True
+        app._finish_sync(app._run_sync())
+        await pilot.pause()
+
+        assert backend.is_open is True
+        assert app.syncing is False
         assert isinstance(app.screen, DeckScreen)

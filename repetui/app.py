@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, cast
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Vertical, VerticalScroll
-from textual.screen import ModalScreen, Screen
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import ListItem, ListView, Static
 
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
@@ -19,49 +21,69 @@ from .preferences import Preferences, SectionMode, SectionPreferences
 from .presentation import CardTemplateIdentity, PresentationSection
 from .sync import SyncOutcome, sync_profile
 
-LOGO = """\
-       ↻
-  ╭────────╮
-  │        │╮
-  ╰────────╯│
-   ╰────────╯  repetui"""
-
 
 class Refreshable(Protocol):
     def backend_refreshed(self) -> None: ...
 
 
-class HelpScreen(ModalScreen[None]):
+class HelpScreen(Screen[None]):
     """One quiet place for shortcuts instead of persistent UI noise."""
 
     BINDINGS = [
-        Binding("escape", "dismiss", "Close", show=False),
-        Binding("question_mark", "dismiss", "Close", show=False),
+        Binding("escape", "back", "Close", show=False),
+        Binding("j", "down", "Down", show=False),
+        Binding("k", "up", "Up", show=False),
+        Binding("g", "top", "Top", show=False),
+        Binding("G", "bottom", "Bottom", show=False),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Container(
-            Static(
-                "[b]repetui[/b]\n\n"
-                "[b]Everywhere[/b]\n"
-                "  ?       this help\n"
-                "  s       sync\n"
-                "  q       quit\n\n"
-                "[b]Decks[/b]\n"
-                "  j / k   move\n"
-                "  enter   review\n\n"
-                "[b]Review[/b]\n"
-                "  enter   reveal / Good\n"
-                "  space   reveal\n"
-                "  1–4     Again / Hard / Good / Easy\n"
-                "  j / k   scroll\n"
-                "  g / G   top / bottom\n"
-                "  esc     decks\n\n"
-                "[dim]Press ? or esc to close.[/dim]",
-                markup=True,
+        yield Vertical(
+            Static("help · repetui", id="help-header"),
+            VerticalScroll(
+                Static(
+                    "everywhere\n"
+                    "  ?        help / template settings\n"
+                    "  q        quit\n\n"
+                    "decks\n"
+                    "  j / k    move\n"
+                    "  enter    review\n"
+                    "  s        sync\n"
+                    "  counts   total  new/learning/review\n\n"
+                    "review\n"
+                    "  enter    reveal / Good\n"
+                    "  space    reveal / open selected fold\n"
+                    "  1–4      Again / Hard / Good / Easy\n"
+                    "  j / k    scroll and select folds\n"
+                    "  g / G    top / bottom\n"
+                    "  s        sync\n"
+                    "  esc      decks\n\n"
+                    "template settings\n"
+                    "  h / l    sections / keys\n"
+                    "  j / k    select / scroll\n"
+                    "  space    show → fold → hide\n"
+                    "  esc      review"
+                ),
+                id="help-scroll",
             ),
-            id="help-dialog",
+            Static("j/k scroll · esc return", classes="surface-footer"),
+            id="help-layout",
         )
+
+    def action_down(self) -> None:
+        self.query_one("#help-scroll", VerticalScroll).scroll_down(animate=False)
+
+    def action_up(self) -> None:
+        self.query_one("#help-scroll", VerticalScroll).scroll_up(animate=False)
+
+    def action_top(self) -> None:
+        self.query_one("#help-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def action_bottom(self) -> None:
+        self.query_one("#help-scroll", VerticalScroll).scroll_end(animate=False)
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
 
 
 class ErrorScreen(Screen[None]):
@@ -70,12 +92,57 @@ class ErrorScreen(Screen[None]):
         self.message = message
 
     def compose(self) -> ComposeResult:
-        yield Container(
-            Static(LOGO, id="error-logo"),
-            Static(Text(self.message), id="error-message"),
-            Static("[dim]Press q to leave.[/dim]", markup=True, classes="quiet-footer"),
-            id="error-box",
+        yield Vertical(
+            Static("repetui · unable to start", id="error-header"),
+            VerticalScroll(Static(Text(self.message)), id="error-scroll"),
+            Static("q quit · ? help", classes="surface-footer"),
+            id="error-layout",
         )
+
+
+def _deck_identity(name: str, width: int) -> Text:
+    """Keep the most specific end of a hierarchical deck path visible."""
+    parts = name.split("::")
+    candidates = [" › ".join(parts)]
+    candidates.extend(
+        f"… › {' › '.join(parts[-tail:])}" for tail in range(len(parts) - 1, 0, -1)
+    )
+    for candidate in candidates:
+        if cell_len(candidate) <= width:
+            return Text(candidate, style="#e7e1d8", no_wrap=True)
+
+    leaf = Text(parts[-1], style="#e7e1d8", no_wrap=True)
+    leaf.truncate(max(width, 0), overflow="ellipsis")
+    return leaf
+
+
+def compose_deck_row(deck: Deck, width: int) -> Text:
+    """Compose one exact-width-aware deck row with predictably shed metadata."""
+    counts = deck.counts
+    total = Text(str(counts.total), style="bold #d8d3ca", no_wrap=True)
+    full_counts = total.copy()
+    full_counts.append("  ")
+    full_counts.append(str(counts.new), style="#68a8df")
+    full_counts.append("/", style="#817d76")
+    full_counts.append(str(counts.learning), style="#dc6b72")
+    full_counts.append("/", style="#817d76")
+    full_counts.append(str(counts.review), style="#79c98b")
+
+    leaf_width = cell_len(deck.leaf_name)
+    useful_identity = min(8, max(4, leaf_width))
+    right = Text()
+    if width >= useful_identity + 2 + full_counts.cell_len:
+        right = full_counts
+    elif width >= useful_identity + 2 + total.cell_len:
+        right = total
+
+    identity_width = max(0, width - right.cell_len - (2 if right else 0))
+    identity = _deck_identity(deck.name, identity_width)
+    result = identity.copy()
+    if right:
+        result.append(" " * max(2, width - identity.cell_len - right.cell_len))
+        result.append_text(right)
+    return result
 
 
 class DeckItem(ListItem):
@@ -84,16 +151,16 @@ class DeckItem(ListItem):
         self.deck = deck
 
     def compose(self) -> ComposeResult:
-        indent = "  " * self.deck.depth
-        counts = self.deck.counts
-        yield Static(
-            f"{indent}[b]{self.deck.leaf_name}[/b]"
-            f"  [dim]due {counts.total}[/dim]  "
-            f"[#68a8df]{counts.new}[/]/"
-            f"[#dc6b72]{counts.learning}[/]/"
-            f"[#79c98b]{counts.review}[/]",
-            markup=True,
-        )
+        yield Static(classes="deck-row")
+
+    def on_mount(self) -> None:
+        self._refresh_counts(self.size.width)
+
+    def on_resize(self) -> None:
+        self._refresh_counts(self.size.width)
+
+    def _refresh_counts(self, width: int) -> None:
+        self.query_one(".deck-row", Static).update(compose_deck_row(self.deck, width))
 
 
 class DeckScreen(Screen[None]):
@@ -105,10 +172,8 @@ class DeckScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static(LOGO, id="logo"),
-            Static("your decks", classes="section-title"),
+            Static("decks", id="deck-header"),
             ListView(id="decks"),
-            Static("[b]?[/b]  help", markup=True, classes="quiet-footer"),
             id="deck-layout",
         )
 
@@ -176,6 +241,8 @@ class TemplateSettingsScreen(Screen[None]):
         Binding("escape", "back", "Back", show=False),
         Binding("j", "down", "Down", show=False),
         Binding("k", "up", "Up", show=False),
+        Binding("g", "top", "Top", show=False),
+        Binding("G", "bottom", "Bottom", show=False),
         Binding("space", "cycle", "Change", show=False),
         Binding("enter", "cycle", "Change", show=False),
         Binding("h", "sections", "Sections", show=False),
@@ -198,7 +265,11 @@ class TemplateSettingsScreen(Screen[None]):
         identity = self.card.presentation.identity
         yield Vertical(
             Static(
-                f"settings · {identity.note_type_name} / {identity.template_name}",
+                Text(
+                    f"settings · {identity.note_type_name} / {identity.template_name}",
+                    overflow="ellipsis",
+                    no_wrap=True,
+                ),
                 id="settings-header",
             ),
             Static(id="settings-tabs"),
@@ -225,7 +296,11 @@ class TemplateSettingsScreen(Screen[None]):
                 ),
                 id="settings-keys",
             ),
-            Static("j/k move · space mode · h/l tabs · esc", id="settings-footer"),
+            Static(
+                "j/k move · space mode · h/l tabs · esc",
+                id="settings-footer",
+                classes="surface-footer",
+            ),
             id="settings-layout",
         )
 
@@ -270,6 +345,22 @@ class TemplateSettingsScreen(Screen[None]):
             self.query_one("#settings-sections", ListView).action_cursor_up()
         else:
             self.query_one("#settings-keys", VerticalScroll).scroll_up(animate=False)
+
+    def action_top(self) -> None:
+        if self.tab == "sections":
+            view = self.query_one("#settings-sections", ListView)
+            if view.children:
+                view.index = 0
+        else:
+            self.query_one("#settings-keys", VerticalScroll).scroll_home(animate=False)
+
+    def action_bottom(self) -> None:
+        if self.tab == "sections":
+            view = self.query_one("#settings-sections", ListView)
+            if view.children:
+                view.index = len(view.children) - 1
+        else:
+            self.query_one("#settings-keys", VerticalScroll).scroll_end(animate=False)
 
     def action_cycle(self) -> None:
         if self.tab != "sections":
@@ -383,7 +474,10 @@ class ReviewScreen(Screen[None]):
         content = self.query_one("#card", Static)
         actions = self.query_one("#review-actions", Static)
         if self.card is None:
-            content.update(Text("✓  Nothing due. You showed up."))
+            complete = Text("done · ", style="#79c98b")
+            complete.append(self.deck.leaf_name, style="bold #eee9e0")
+            complete.append("\nNothing due. You showed up.", style="#aaa49b")
+            content.update(complete)
             actions.display = False
             return
 
@@ -503,8 +597,6 @@ class RepetuiApp(App[None]):
     #deck-layout {
         width: 100%;
         height: 100%;
-        max-width: 96;
-        align-horizontal: center;
     }
 
     #review-layout {
@@ -512,40 +604,28 @@ class RepetuiApp(App[None]):
         height: 100%;
     }
 
-    #logo {
-        height: 6;
-        color: #9fb8ae;
-        text-align: center;
-        margin-top: 1;
-    }
-
-    .section-title {
-        height: 2;
-        color: #aaa49b;
-        padding: 0 1;
+    #deck-header, #help-header, #error-header {
+        height: 1;
+        color: #eee9e0;
     }
 
     #decks {
         height: 1fr;
-        border: round #394145;
-        background: #161a1c;
-        margin: 0 1;
+        background: #111416;
     }
 
     DeckItem {
         height: 1;
-        padding: 0 1;
     }
 
     DeckItem:hover, DeckItem.-highlight {
         background: #293034;
     }
 
-    .quiet-footer {
+    .deck-row {
+        width: 100%;
         height: 1;
-        color: #817d76;
-        text-align: right;
-        padding: 0 2;
+        overflow: hidden;
     }
 
     #card-scroll {
@@ -612,44 +692,25 @@ class RepetuiApp(App[None]):
         color: #d9d5ce;
     }
 
-    #settings-footer {
+    .surface-footer {
         height: 1;
         color: #817d76;
+        overflow: hidden;
     }
 
-    HelpScreen {
-        align: center middle;
-        background: #0008;
+    #help-layout, #error-layout {
+        width: 100%;
+        height: 100%;
+        background: #111416;
     }
 
-    #help-dialog {
-        width: 58;
-        height: auto;
-        max-height: 90%;
-        border: round #586268;
-        background: #171b1d;
-        color: #e7e1d8;
-        padding: 1 2;
+    #help-scroll, #error-scroll {
+        height: 1fr;
+        scrollbar-size-vertical: 1;
     }
 
-    #error-box {
-        width: 70;
-        height: auto;
-        align: center middle;
-        border: round #9d5459;
-        padding: 1 2;
-    }
-
-    #error-logo {
-        height: 6;
-        text-align: center;
-        color: #9fb8ae;
-    }
-
-    #error-message {
-        height: auto;
+    #error-header, #error-scroll {
         color: #dc6b72;
-        margin: 1 0;
     }
     """
 
@@ -663,11 +724,13 @@ class RepetuiApp(App[None]):
         backend: AnkiBackend,
         profile: ProfilePaths,
         preferences: Preferences | None = None,
+        syncer: Callable[[ProfilePaths], SyncOutcome] = sync_profile,
     ) -> None:
         super().__init__()
         self.backend = backend
         self.profile = profile
         self.preferences = preferences if preferences is not None else SectionPreferences()
+        self.syncer = syncer
         self.syncing = False
 
     def on_mount(self) -> None:
@@ -681,11 +744,12 @@ class RepetuiApp(App[None]):
         self.backend.close()
 
     def action_help(self) -> None:
-        if isinstance(self.screen, TemplateSettingsScreen):
-            self.screen.action_back()
-        elif isinstance(self.screen, ReviewScreen) and self.screen.card is not None:
-            self.push_screen(TemplateSettingsScreen(self.screen))
-        elif not isinstance(self.screen, HelpScreen):
+        screen = self.screen
+        if isinstance(screen, (TemplateSettingsScreen, HelpScreen)):
+            screen.action_back()
+        elif isinstance(screen, ReviewScreen) and screen.card is not None:
+            self.push_screen(TemplateSettingsScreen(screen))
+        else:
             self.push_screen(HelpScreen())
 
     def action_sync(self) -> None:
@@ -698,13 +762,21 @@ class RepetuiApp(App[None]):
 
     @work(thread=True, exclusive=True, group="sync")
     def _sync_worker(self) -> None:
+        outcome = self._run_sync()
+        self.call_from_thread(self._finish_sync, outcome)
+
+    def _run_sync(self) -> SyncOutcome:
+        """Run the blocking close/sync/reopen sequence without UI mutation."""
         self.backend.close()
-        outcome = sync_profile(self.profile)
+        try:
+            outcome = self.syncer(self.profile)
+        except Exception as exc:
+            outcome = SyncOutcome(False, f"Sync failed: {exc}")
         try:
             self.backend.open()
         except Exception as exc:
             outcome = SyncOutcome(False, f"{outcome.message} Could not reopen collection: {exc}")
-        self.call_from_thread(self._finish_sync, outcome)
+        return outcome
 
     def _finish_sync(self, outcome: SyncOutcome) -> None:
         self.syncing = False

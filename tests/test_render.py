@@ -1,4 +1,4 @@
-from repetui.render import html_to_text
+from repetui.presentation import html_to_text
 
 
 def test_renders_blocks_lists_and_ruby_without_browser_noise() -> None:

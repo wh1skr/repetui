@@ -8,7 +8,7 @@ Anki collection.
 
 ## MVP
 
-- Browse decks and current due counts.
+- Browse decks and current due counts in panes as small as roughly 40×6.
 - Review cards with Anki's Again, Hard, Good, and Easy ratings.
 - Show, fold, or hide answer sections per card template.
 - Scroll long cards without a mouse.
@@ -17,11 +17,30 @@ Anki collection.
 Card creation, editing, statistics, and media playback are deliberately outside
 the first release.
 
+## Terminal-first interface
+
+The deck list keeps each deck path, total due count, and the familiar coloured
+New/Learning/Review split on one row. As a pane narrows, the split disappears
+before the total so the deck identity remains useful.
+
+During review, `Enter` reveals a card and then answers Good. Use `1`–`4` for
+Again, Hard, Good, and Easy; `j`/`k` and `g`/`G` scroll long cards. Press `?` on
+a card for its full-screen template settings. Every answer section is shown by
+default, and each section can be changed to show, fold, or hide. Press `?` from
+the deck list for the complete keyboard reference.
+
+repetui translates rendered Anki HTML into terminal-native text rather than
+running a browser. It preserves ordered text, headings, ruby readings, lists,
+tables, code, math labels, and media references where possible. Unknown markup
+falls back to its visible text without truncating it. Template JavaScript,
+typed-answer grading, CSS layout, and media playback are not executed.
+
 ## Development
 
 Anki Desktop must already be installed, signed in, and synchronized once. Close
 Anki Desktop before opening `repetui`, because both applications use the same
-collection database.
+collection database. Press `s` from the deck list or review to sync; progress is
+shown only as a temporary status message.
 
 Install the current development release directly from GitHub:
 
