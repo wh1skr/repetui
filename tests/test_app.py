@@ -9,7 +9,9 @@ from textual.widgets import Input
 from repetui.app import (
     DeckScreen,
     ErrorScreen,
+    FlagSelectionPill,
     HelpScreen,
+    OperationStatusPill,
     RepetuiApp,
     ReviewScreen,
     SyncPopup,
@@ -41,6 +43,13 @@ class FakeBackend:
         self.card_content = card_content
         self._decks = decks or [Deck(1, "Japanese", 0, DueCounts(2, 1, 7))]
         self.begun_deck_ids: list[int] = []
+        self.count_calls = 0
+        self.undo_calls = 0
+        self.undo_available = True
+        self.operations: list[str] = []
+        self.flags: list[int] = []
+        self.fail_operation: str | None = None
+        self.fail_refresh_after_operation = False
 
     def open(self) -> None:
         self.is_open = True
@@ -56,6 +65,11 @@ class FakeBackend:
         self.begun_deck_ids.append(deck_id)
 
     def counts(self) -> DueCounts:
+        self.count_calls += 1
+        if self.fail_refresh_after_operation and (
+            self.undo_calls or self.operations or self.flags
+        ):
+            raise BackendError("private refresh detail")
         return DueCounts(2, 1, 7) if self.card_available else DueCounts(0, 0, 0)
 
     def next_card(self) -> ReviewCard | None:
@@ -71,6 +85,32 @@ class FakeBackend:
     def answer(self, rating: int) -> None:
         self.rating = rating
         self.card_available = False
+
+    def undo(self) -> bool:
+        self.undo_calls += 1
+        if self.fail_operation == "undo":
+            raise BackendError("private undo detail")
+        if not self.undo_available:
+            return False
+        self.card_available = True
+        return True
+
+    def bury_current(self) -> None:
+        if self.fail_operation == "bury":
+            raise BackendError("private bury detail")
+        self.operations.append("bury")
+        self.card_available = False
+
+    def suspend_current(self) -> None:
+        if self.fail_operation == "suspend":
+            raise BackendError("private suspend detail")
+        self.operations.append("suspend")
+        self.card_available = False
+
+    def set_current_flag(self, flag: int) -> None:
+        if self.fail_operation == "flag":
+            raise BackendError("private flag detail")
+        self.flags.append(flag)
 
 
 def make_app(
@@ -91,6 +131,35 @@ def make_app(
         else RepetuiApp(backend, profile, store, syncer)
     )
     return app, backend
+
+
+class TwoCardBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.card_ids = [42, 43]
+
+    def counts(self) -> DueCounts:
+        self.count_calls += 1
+        return DueCounts(0, 0, len(self.card_ids))
+
+    def next_card(self) -> ReviewCard | None:
+        if not self.card_ids:
+            return None
+        identity = CardTemplateIdentity(1, "Basic", 0, "Card 1")
+        content = RawCardContent(
+            identity,
+            f"question {self.card_ids[0]}",
+            f"answer {self.card_ids[0]}",
+        )
+        return ReviewCard(self.card_ids[0], present_card(content))
+
+    def bury_current(self) -> None:
+        self.operations.append("bury")
+        self.card_ids.pop(0)
+
+    def suspend_current(self) -> None:
+        self.operations.append("suspend")
+        self.card_ids.pop(0)
 
 
 def rendered_text(screen: ReviewScreen) -> str:
@@ -384,6 +453,234 @@ async def test_complete_keyboard_review_loop(tmp_path) -> None:
         assert backend.rating == 3
         assert "Nothing due" in str(review.query_one("#card").render())
         assert str(review.query_one("#card").render()).startswith("done · Japanese")
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_the_final_rated_card_and_refreshes_counts(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        count_calls_before = backend.count_calls
+
+        await pilot.press("u")
+
+        assert isinstance(app.screen, OperationStatusPill)
+        assert str(app.screen.query_one(".status-pill").render()) == "[ok] undone"
+        assert app.screen_stack[-2] is review
+        assert backend.undo_calls == 1
+        assert review.card is not None
+        assert review.revealed is False
+        assert backend.count_calls > count_calls_before
+
+
+@pytest.mark.asyncio
+async def test_unavailable_undo_shows_concise_feedback_without_changing_card(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+    backend.undo_available = False
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        current_card = review.card
+
+        await pilot.press("u")
+
+        assert isinstance(app.screen, OperationStatusPill)
+        assert str(app.screen.query_one(".status-pill").render()) == (
+            "[err] nothing to undo"
+        )
+        assert review.card is current_card
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "operation", "message"),
+    (("b", "bury", "[ok] buried"), ("x", "suspend", "[ok] suspended")),
+)
+@pytest.mark.parametrize("revealed", [False, True])
+async def test_bury_and_suspend_advance_and_refresh_before_or_after_reveal(
+    tmp_path, key, operation, message, revealed
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        if revealed:
+            await pilot.press("enter")
+        count_calls_before = backend.count_calls
+
+        await pilot.press(key)
+
+        assert isinstance(app.screen, OperationStatusPill)
+        assert str(app.screen.query_one(".status-pill").render()) == message
+        assert backend.operations == [operation]
+        assert review.card is None
+        assert backend.count_calls > count_calls_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "operation"), (("b", "bury"), ("x", "suspend")))
+async def test_bury_and_suspend_advance_to_the_next_queued_card(
+    tmp_path, key, operation
+) -> None:
+    backend = TwoCardBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None and review.card.id == 42
+
+        await pilot.press(key)
+
+        assert backend.operations == [operation]
+        assert review.card is not None and review.card.id == 43
+        assert "question 43" in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_operation_status_dismisses_after_roughly_one_second(tmp_path) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        await pilot.press("b")
+        popup = app.screen
+        assert isinstance(popup, OperationStatusPill)
+
+        await pilot.pause(0.75)
+        assert app.screen is popup
+        await pilot.pause(0.3)
+        assert app.screen is review
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "message"), (("0", "[ok] flag clear"), ("3", "[ok] flag 3")))
+@pytest.mark.parametrize("revealed", [False, True])
+async def test_flag_clear_and_set_keep_the_current_card_and_reveal_state(
+    tmp_path, key, message, revealed
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        if revealed:
+            await pilot.press("enter")
+        current_card = review.card
+        count_calls_before = backend.count_calls
+
+        await pilot.press("f")
+        assert isinstance(app.screen, FlagSelectionPill)
+        surface = app.screen.query_one(".status-pill")
+        assert str(surface.render()) == "[?] flag 0–7 · esc"
+        assert surface.region.height == 1
+        await pilot.press(key)
+        await pilot.pause()
+
+        assert isinstance(app.screen, OperationStatusPill)
+        assert str(app.screen.query_one(".status-pill").render()) == message
+        assert backend.flags == [int(key)]
+        assert review.card is current_card
+        assert review.revealed is revealed
+        assert backend.count_calls > count_calls_before
+
+
+@pytest.mark.asyncio
+async def test_escape_cancels_flag_selection_without_changing_or_advancing(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "f")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        current_card = review.card
+
+        await pilot.press("escape")
+
+        assert app.screen is review
+        assert review.card is current_card
+        assert review.revealed is True
+        assert backend.flags == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "keys", "message"),
+    (
+        ("undo", ("u",), "[err] undo failed"),
+        ("bury", ("b",), "[err] bury failed"),
+        ("suspend", ("x",), "[err] suspend failed"),
+        ("flag", ("f", "3"), "[err] flag failed"),
+    ),
+)
+async def test_backend_operation_failures_keep_the_current_revealed_card(
+    tmp_path, operation, keys, message
+) -> None:
+    app, backend = make_app(tmp_path)
+    backend.fail_operation = operation
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        current_card = review.card
+
+        await pilot.press(*keys)
+        await pilot.pause()
+
+        assert isinstance(app.screen, OperationStatusPill)
+        rendered = str(app.screen.query_one(".status-pill").render())
+        assert rendered == message
+        assert "private" not in rendered
+        assert review.card is current_card
+        assert review.revealed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["undo", "bury", "flag"])
+async def test_refresh_failure_is_not_misreported_as_an_operation_failure(
+    tmp_path, operation
+) -> None:
+    app, backend = make_app(tmp_path)
+    backend.fail_refresh_after_operation = True
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        current_card = review.card
+
+        keys = {"undo": ("u",), "bury": ("b",), "flag": ("f", "3")}[operation]
+        await pilot.press(*keys)
+        await pilot.pause()
+
+        assert isinstance(app.screen, OperationStatusPill)
+        assert str(app.screen.query_one(".status-pill").render()) == (
+            "[err] refresh failed"
+        )
+        if operation == "flag":
+            assert review.card is current_card
+            assert review.revealed is True
+        else:
+            assert review.card is None
+            assert "question" not in rendered_text(review)
+            assert "Could not refresh cards" in rendered_text(review)
 
 
 @pytest.mark.asyncio
@@ -757,6 +1054,19 @@ async def test_help_is_full_screen_scrollable_and_tiny_pane_safe(tmp_path) -> No
         assert scroll.scroll_y == 0
         await pilot.press("?")
         assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_help_lists_the_review_card_operations(tmp_path) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 10)) as pilot:
+        await pilot.press("?")
+        help_text = str(app.screen.query_one("#help-scroll Static").render())
+        assert "u        undo" in help_text
+        assert "b        bury" in help_text
+        assert "x        suspend" in help_text
+        assert "f        flag" in help_text
 
 
 class FailingBackend(FakeBackend):

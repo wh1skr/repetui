@@ -68,6 +68,8 @@ class FakeScheduler:
         self.tree = SimpleNamespace(name="", children=[parent])
         self.fake_card = FakeCard()
         self.answered = None
+        self.buried = None
+        self.suspended = None
         self.queue_calls = 0
 
     def deck_due_tree(self):
@@ -87,6 +89,12 @@ class FakeScheduler:
     def answer_card(self, answer) -> None:
         self.answered = answer
 
+    def bury_cards(self, card_ids) -> None:
+        self.buried = list(card_ids)
+
+    def suspend_cards(self, card_ids) -> None:
+        self.suspended = list(card_ids)
+
 
 class FakeDecks:
     def __init__(self) -> None:
@@ -103,10 +111,22 @@ class FakeCollection:
     def __init__(self) -> None:
         self.sched = FakeScheduler()
         self.decks = FakeDecks()
+        self.undo_calls = 0
+        self.undo_available = True
+        self.flagged = None
 
     def get_card(self, card_id: int) -> FakeCard:
         assert card_id == 99
         return self.sched.fake_card
+
+    def undo_status(self):
+        return SimpleNamespace(undo="Review" if self.undo_available else "")
+
+    def undo(self) -> None:
+        self.undo_calls += 1
+
+    def set_user_flag_for_cards(self, flag: int, card_ids) -> None:
+        self.flagged = (flag, list(card_ids))
 
 
 def backend() -> tuple[AnkiBackend, FakeCollection]:
@@ -153,3 +173,61 @@ def test_review_uses_anki_rendering_and_scheduler() -> None:
     assert collection.sched.fake_card.timer_started is True
     assert collection.sched.answered is not None
     assert service.next_card() is None
+
+
+def test_undo_routes_through_anki_and_invalidates_the_displayed_card() -> None:
+    service, collection = backend()
+    service.begin_review(2)
+    assert service.next_card() is not None
+
+    assert service.undo() is True
+
+    assert collection.undo_calls == 1
+    assert service._current is None
+
+
+def test_unavailable_undo_is_reported_without_touching_the_current_card() -> None:
+    service, collection = backend()
+    service.begin_review(2)
+    assert service.next_card() is not None
+    current = service._current
+    collection.undo_available = False
+
+    assert service.undo() is False
+
+    assert collection.undo_calls == 0
+    assert service._current is current
+
+
+def test_bury_routes_the_current_card_through_anki() -> None:
+    service, collection = backend()
+    service.begin_review(2)
+    assert service.next_card() is not None
+
+    service.bury_current()
+
+    assert collection.sched.buried == [99]
+    assert service._current is None
+
+
+def test_suspend_routes_the_current_card_through_anki() -> None:
+    service, collection = backend()
+    service.begin_review(2)
+    assert service.next_card() is not None
+
+    service.suspend_current()
+
+    assert collection.sched.suspended == [99]
+    assert service._current is None
+
+
+def test_flag_routes_the_current_card_without_advancing_it() -> None:
+    service, collection = backend()
+    service.begin_review(2)
+    assert service.next_card() is not None
+    current = service._current
+
+    service.set_current_flag(3)
+
+    assert collection.flagged == (3, [99])
+    assert service._current is current

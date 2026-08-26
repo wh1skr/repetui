@@ -203,3 +203,36 @@ class AnkiBackend:
         )
         collection.sched.answer_card(answer)
         self._current = None
+
+    def undo(self) -> bool:
+        collection = self._require_collection()
+        if not collection.undo_status().undo:
+            return False
+        collection.undo()
+        self._current = None
+        return True
+
+    def bury_current(self) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to bury.")
+        card, _states = self._current
+        collection.sched.bury_cards([card.id])
+        self._current = None
+
+    def suspend_current(self) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to suspend.")
+        card, _states = self._current
+        collection.sched.suspend_cards([card.id])
+        self._current = None
+
+    def set_current_flag(self, flag: int) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to flag.")
+        if flag not in range(8):
+            raise ValueError("Flag must be between 0 and 7.")
+        card, _states = self._current
+        collection.set_user_flag_for_cards(flag, [card.id])
