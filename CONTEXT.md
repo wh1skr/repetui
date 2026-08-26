@@ -65,6 +65,13 @@ after reveal.
   type and card template.
 - Opening a fold during a review is temporary and never changes its saved mode.
 
+### Settings
+
+`?` opens one full-screen, small-pane-safe settings surface from decks or
+review. Help and profile-scoped review controls are always available. Sections
+configures the active card template during review and otherwise explains that
+a card must be opened first. `h`/`l` and `Tab` move between tabs.
+
 ### Deck Tree
 
 The main menu is a compact tree rather than a flat deck path list. Parent decks

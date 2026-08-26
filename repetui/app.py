@@ -53,69 +53,35 @@ class SyncFinished(Message):
         self.result = result
 
 
-class HelpScreen(Screen[None]):
-    """One quiet place for shortcuts instead of persistent UI noise."""
-
-    BINDINGS = [
-        Binding("escape", "back", "Close", show=False),
-        Binding("j", "down", "Down", show=False),
-        Binding("k", "up", "Up", show=False),
-        Binding("g", "top", "Top", show=False),
-        Binding("G", "bottom", "Bottom", show=False),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Static("help · repetui", id="help-header"),
-            VerticalScroll(
-                Static(
-                    "everywhere\n"
-                    "  ?        help / template settings\n"
-                    "  q        quit\n\n"
-                    "decks\n"
-                    "  j / k    move\n"
-                    "  tab      expand / collapse\n"
-                    "  enter    review\n"
-                    "  s        sync\n"
-                    "  counts   total  new/learning/review\n\n"
-                    "review\n"
-                    "  enter    reveal / Good\n"
-                    "  space    reveal / open selected fold\n"
-                    "  1–4      Again / Hard / Good / Easy\n"
-                    "  u        undo\n"
-                    "  b        bury\n"
-                    "  x        suspend\n"
-                    "  f        flag (then 0–7)\n"
-                    "  j / k    scroll and select folds\n"
-                    "  g / G    top / bottom\n"
-                    "  s        sync\n"
-                    "  esc      decks\n\n"
-                    "template settings\n"
-                    "  h / l    sections / controls\n"
-                    "  j / k    select / scroll\n"
-                    "  space    show → fold → hide\n"
-                    "  esc      review"
-                ),
-                id="help-scroll",
-            ),
-            Static("j/k scroll · esc return", classes="surface-footer"),
-            id="help-layout",
-        )
-
-    def action_down(self) -> None:
-        self.query_one("#help-scroll", VerticalScroll).scroll_down(animate=False)
-
-    def action_up(self) -> None:
-        self.query_one("#help-scroll", VerticalScroll).scroll_up(animate=False)
-
-    def action_top(self) -> None:
-        self.query_one("#help-scroll", VerticalScroll).scroll_home(animate=False)
-
-    def action_bottom(self) -> None:
-        self.query_one("#help-scroll", VerticalScroll).scroll_end(animate=False)
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
+_HELP_TEXT = (
+    "everywhere\n"
+    "  ?        settings\n"
+    "  q        quit\n\n"
+    "decks\n"
+    "  j / k    move\n"
+    "  tab      expand / collapse\n"
+    "  enter    review\n"
+    "  s        sync\n"
+    "  counts   total  new/learning/review\n\n"
+    "review\n"
+    "  enter    reveal / Good\n"
+    "  space    reveal / open selected fold\n"
+    "  1–4      Again / Hard / Good / Easy\n"
+    "  u        undo\n"
+    "  b        bury\n"
+    "  x        suspend\n"
+    "  f        flag (then 0–7)\n"
+    "  j / k    scroll and select folds\n"
+    "  g / G    top / bottom\n"
+    "  s        sync\n"
+    "  esc      decks\n\n"
+    "settings\n"
+    "  h / l    previous / next tab\n"
+    "  tab      next tab\n"
+    "  j / k    select / scroll\n"
+    "  space    show → fold → hide\n"
+    "  esc      return"
+)
 
 
 class ErrorScreen(Screen[None]):
@@ -352,8 +318,10 @@ class PendingControlBinding:
     conflict: ReviewAction
 
 
-class TemplateSettingsScreen(Screen[None]):
-    """A full-screen, tiny-pane-safe surface for one card template."""
+class SettingsScreen(Screen[None]):
+    """One tiny-pane-safe home for help, controls, and card sections."""
+
+    TABS = ("help", "controls", "sections")
 
     BINDINGS = [
         Binding("escape", "back", "Back", show=False),
@@ -363,17 +331,26 @@ class TemplateSettingsScreen(Screen[None]):
         Binding("G", "bottom", "Bottom", show=False),
         Binding("space", "cycle", "Change", show=False),
         Binding("enter", "cycle", "Change", show=False),
-        Binding("h", "sections", "Sections", show=False),
-        Binding("l", "controls", "Controls", show=False),
-        Binding("tab", "toggle_tab", "Next tab", show=False),
+        Binding("h", "previous_tab", "Previous tab", show=False),
+        Binding("l", "next_tab", "Next tab", show=False),
+        Binding("tab", "next_tab", "Next tab", show=False),
     ]
 
-    def __init__(self, review: ReviewScreen) -> None:
+    def __init__(
+        self,
+        review: ReviewScreen | None = None,
+        *,
+        initial_tab: str = "help",
+    ) -> None:
         super().__init__()
         self.review = review
-        assert review.card is not None
-        self.card = review.card
-        self.tab = "sections"
+        self.card = review.card if review is not None else None
+        if initial_tab not in self.TABS:
+            raise ValueError(f"Unknown settings tab: {initial_tab}")
+        if initial_tab == "sections" and self.card is None:
+            initial_tab = "help"
+        self.initial_tab = initial_tab
+        self.tab = initial_tab
         self.capturing: ReviewAction | None = None
         self.pending_binding: PendingControlBinding | None = None
 
@@ -382,20 +359,21 @@ class TemplateSettingsScreen(Screen[None]):
         return cast("RepetuiApp", self.app)
 
     def compose(self) -> ComposeResult:
-        identity = self.card.presentation.identity
+        sections = self.card.presentation.back.sections if self.card is not None else ()
         yield Vertical(
-            Static(
-                Text(
-                    f"settings · {identity.note_type_name} / {identity.template_name}",
-                    overflow="ellipsis",
-                    no_wrap=True,
-                ),
-                id="settings-header",
-            ),
+            Static("settings", id="settings-header"),
             Static(id="settings-tabs"),
+            VerticalScroll(
+                Static(_HELP_TEXT),
+                id="settings-help",
+            ),
             ListView(
-                *(SectionSettingItem(section) for section in self.card.presentation.back.sections),
+                *(SectionSettingItem(section) for section in sections),
                 id="settings-sections",
+            ),
+            Static(
+                "review a card to configure its sections",
+                id="settings-sections-empty",
             ),
             ListView(
                 *(ControlSettingItem(action) for action in ReviewAction),
@@ -410,65 +388,93 @@ class TemplateSettingsScreen(Screen[None]):
         )
 
     def on_mount(self) -> None:
-        for item in self.query(SectionSettingItem):
-            item.refresh_mode(self.repetui.preferences, self.card.presentation.identity)
+        if self.card is not None:
+            for item in self.query(SectionSettingItem):
+                item.refresh_mode(
+                    self.repetui.preferences, self.card.presentation.identity
+                )
         for item in self.query(ControlSettingItem):
             item.refresh_binding(self.repetui.review_controls)
         sections = self.query_one("#settings-sections", ListView)
         if sections.children:
             sections.index = 0
-        self._show_tab("sections")
+        self._show_tab(self.initial_tab)
 
     def _show_tab(self, tab: str) -> None:
         self.tab = tab
+        help_scroll = self.query_one("#settings-help", VerticalScroll)
         sections = self.query_one("#settings-sections", ListView)
+        sections_empty = self.query_one("#settings-sections-empty", Static)
         controls = self.query_one("#settings-controls", ListView)
-        sections.display = tab == "sections"
+        help_scroll.display = tab == "help"
+        sections.display = tab == "sections" and self.card is not None
+        sections_empty.display = tab == "sections" and self.card is None
         controls.display = tab == "controls"
         self.query_one("#settings-tabs", Static).update(
-            "[reverse] sections [/reverse]  controls"
-            if tab == "sections"
-            else "sections  [reverse] controls [/reverse]"
+            "  ".join(
+                f"[reverse] {name} [/reverse]" if name == tab else name
+                for name in self.TABS
+            )
         )
-        target = sections if tab == "sections" else controls
-        if target.children and target.index is None:
-            target.index = 0
-        target.focus()
+        if tab == "help":
+            help_scroll.focus()
+        elif tab == "controls":
+            if controls.children and controls.index is None:
+                controls.index = 0
+            controls.focus()
+        elif self.card is not None:
+            if sections.children and sections.index is None:
+                sections.index = 0
+            sections.focus()
+        self._show_default_footer()
 
-    def action_sections(self) -> None:
-        self._show_tab("sections")
+    def action_previous_tab(self) -> None:
+        index = self.TABS.index(self.tab)
+        self._show_tab(self.TABS[(index - 1) % len(self.TABS)])
 
-    def action_controls(self) -> None:
-        self._show_tab("controls")
-
-    def action_toggle_tab(self) -> None:
-        self._show_tab("controls" if self.tab == "sections" else "sections")
+    def action_next_tab(self) -> None:
+        index = self.TABS.index(self.tab)
+        self._show_tab(self.TABS[(index + 1) % len(self.TABS)])
 
     def action_down(self) -> None:
-        if self.tab == "sections":
+        if self.tab == "help":
+            self.query_one("#settings-help", VerticalScroll).scroll_down(animate=False)
+        elif self.tab == "sections" and self.card is not None:
             self.query_one("#settings-sections", ListView).action_cursor_down()
-        else:
+        elif self.tab == "controls":
             self.query_one("#settings-controls", ListView).action_cursor_down()
 
     def action_up(self) -> None:
-        if self.tab == "sections":
+        if self.tab == "help":
+            self.query_one("#settings-help", VerticalScroll).scroll_up(animate=False)
+        elif self.tab == "sections" and self.card is not None:
             self.query_one("#settings-sections", ListView).action_cursor_up()
-        else:
+        elif self.tab == "controls":
             self.query_one("#settings-controls", ListView).action_cursor_up()
 
     def action_top(self) -> None:
-        if self.tab == "sections":
+        if self.tab == "help":
+            self.query_one("#settings-help", VerticalScroll).scroll_home(animate=False)
+            return
+        if self.tab == "sections" and self.card is not None:
             view = self.query_one("#settings-sections", ListView)
-        else:
+        elif self.tab == "controls":
             view = self.query_one("#settings-controls", ListView)
+        else:
+            return
         if view.children:
             view.index = 0
 
     def action_bottom(self) -> None:
-        if self.tab == "sections":
+        if self.tab == "help":
+            self.query_one("#settings-help", VerticalScroll).scroll_end(animate=False)
+            return
+        if self.tab == "sections" and self.card is not None:
             view = self.query_one("#settings-sections", ListView)
-        else:
+        elif self.tab == "controls":
             view = self.query_one("#settings-controls", ListView)
+        else:
+            return
         if view.children:
             view.index = len(view.children) - 1
 
@@ -479,7 +485,7 @@ class TemplateSettingsScreen(Screen[None]):
                 self.capturing = action
                 self._show_footer(f"[?] {action.label} · press key · esc cancel")
             return
-        if self.tab != "sections":
+        if self.tab != "sections" or self.card is None:
             return
         view = self.query_one("#settings-sections", ListView)
         if view.index is None or not (0 <= view.index < len(view.children)):
@@ -503,7 +509,16 @@ class TemplateSettingsScreen(Screen[None]):
         self.query_one("#settings-footer", Static).update(Text(message, no_wrap=True))
 
     def _show_default_footer(self) -> None:
-        self._show_footer("j/k · enter bind · bs default · esc")
+        message = {
+            "help": "j/k scroll · h/l tabs · esc",
+            "controls": "j/k · enter bind · bs default · esc",
+            "sections": (
+                "j/k · space mode · h/l tabs · esc"
+                if self.card is not None
+                else "h/l tabs · esc"
+            ),
+        }[self.tab]
+        self._show_footer(message)
 
     def _refresh_control_bindings(self) -> None:
         for item in self.query(ControlSettingItem):
@@ -594,7 +609,8 @@ class TemplateSettingsScreen(Screen[None]):
             self._show_default_footer()
             return
         self.app.pop_screen()
-        self.review.preferences_changed()
+        if self.review is not None:
+            self.review.preferences_changed()
 
 
 class ReviewContent(Static):
@@ -1131,7 +1147,7 @@ class RepetuiApp(App[None]):
         height: 100%;
     }
 
-    #deck-header, #help-header, #error-header {
+    #deck-header, #error-header {
         height: 1;
         color: #eee9e0;
     }
@@ -1192,10 +1208,14 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    #settings-sections, #settings-controls {
+    #settings-help, #settings-sections, #settings-sections-empty, #settings-controls {
         height: 1fr;
         background: #111416;
         scrollbar-size-vertical: 1;
+    }
+
+    #settings-sections-empty {
+        color: #aaa49b;
     }
 
     SectionSettingItem, ControlSettingItem {
@@ -1235,13 +1255,13 @@ class RepetuiApp(App[None]):
         overflow: hidden;
     }
 
-    #help-layout, #error-layout {
+    #error-layout {
         width: 100%;
         height: 100%;
         background: #111416;
     }
 
-    #help-scroll, #error-scroll {
+    #error-scroll {
         height: 1fr;
         scrollbar-size-vertical: 1;
     }
@@ -1326,12 +1346,12 @@ class RepetuiApp(App[None]):
         if self.syncing:
             return
         screen = self.screen
-        if isinstance(screen, (TemplateSettingsScreen, HelpScreen)):
+        if isinstance(screen, SettingsScreen):
             screen.action_back()
         elif isinstance(screen, ReviewScreen) and screen.card is not None:
-            self.push_screen(TemplateSettingsScreen(screen))
+            self.push_screen(SettingsScreen(screen, initial_tab="sections"))
         else:
-            self.push_screen(HelpScreen())
+            self.push_screen(SettingsScreen(initial_tab="help"))
 
     def action_quit(self) -> None:
         if not self.syncing:

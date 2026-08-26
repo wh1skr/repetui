@@ -10,12 +10,11 @@ from repetui.app import (
     DeckScreen,
     ErrorScreen,
     FlagSelectionPill,
-    HelpScreen,
     OperationStatusPill,
     RepetuiApp,
     ReviewScreen,
+    SettingsScreen,
     SyncPopup,
-    TemplateSettingsScreen,
     compose_deck_row,
 )
 from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
@@ -813,7 +812,7 @@ async def test_review_counts_stay_on_first_rendered_row_when_answer_adds_scrollb
         await pilot.resize_terminal(40, 6)
         first_row = rendered_card_row(review, 0)
         await pilot.press("G", "?")
-        assert isinstance(app.screen, TemplateSettingsScreen)
+        assert isinstance(app.screen, SettingsScreen)
         await pilot.press("escape")
         assert app.screen is review
         assert rendered_card_row(review, 0) == first_row
@@ -1003,19 +1002,17 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
         await pilot.press("?")
 
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
         assert settings.size.width == 40
         assert settings.size.height == 6
-        assert "Japanese / Recognition" in str(
-            settings.query_one("#settings-header").render()
-        )
+        assert str(settings.query_one("#settings-header").render()) == "settings"
 
         await pilot.press("space")
         assert preferences.mode(
             content.identity, "back:heading:reading"
         ) is SectionMode.FOLD
 
-        await pilot.press("l")
+        await pilot.press("h")
         assert settings.query_one("#settings-sections").display is False
         assert settings.query_one("#settings-controls").display is True
         first_control = settings.query_one("#settings-controls").children[0]
@@ -1034,9 +1031,9 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
     app, _ = make_app(tmp_path)
 
     async with app.run_test(size=(40, 6)) as pilot:
-        await pilot.press("enter", "?", "l")
+        await pilot.press("enter", "?", "h")
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
 
         controls = settings.query_one("#settings-controls")
         assert controls.display is True
@@ -1071,9 +1068,9 @@ async def test_non_conflicting_control_rebind_saves_and_routes_immediately(tmp_p
     app, backend = make_app(tmp_path, preferences=preferences)
 
     async with app.run_test(size=(40, 6)) as pilot:
-        await pilot.press("enter", "?", "l")
+        await pilot.press("enter", "?", "h")
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
         await pilot.press("j", "j", "j", "j", "j", "enter")
         assert str(settings.query_one("#settings-footer").render()).startswith(
             "[?] Undo · press key"
@@ -1098,9 +1095,9 @@ async def test_control_conflict_requires_confirmation_and_leaves_displaced_unbou
     app, backend = make_app(tmp_path, preferences=preferences)
 
     async with app.run_test(size=(40, 6)) as pilot:
-        await pilot.press("enter", "?", "l")
+        await pilot.press("enter", "?", "h")
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
         await pilot.press("j", "j", "j", "j", "j", "enter", "b")
 
         assert "b = Bury" in str(settings.query_one("#settings-footer").render())
@@ -1132,9 +1129,9 @@ async def test_backspace_restores_selected_control_default_immediately(tmp_path)
     app, backend = make_app(tmp_path, preferences=preferences)
 
     async with app.run_test(size=(40, 6)) as pilot:
-        await pilot.press("enter", "?", "l", "j", "j", "j", "j", "j")
+        await pilot.press("enter", "?", "h", "j", "j", "j", "j", "j")
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
         await pilot.press("backspace")
 
         assert app.review_controls.binding(ReviewAction.UNDO) == "u"
@@ -1158,10 +1155,10 @@ async def test_capture_rejects_fixed_navigation_and_escape_cancels_it(
 
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press(
-            "enter", "?", "l", "j", "j", "j", "j", "j", "enter", fixed_key
+            "enter", "?", "h", "j", "j", "j", "j", "j", "enter", fixed_key
         )
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
         assert str(settings.query_one("#settings-footer").render()) == (
             f"[fixed] {fixed_key} stays navigation"
         )
@@ -1188,9 +1185,9 @@ async def test_failed_control_write_preserves_the_active_mapping(
     app, _ = make_app(tmp_path, preferences=preferences)
 
     async with app.run_test(size=(40, 6)) as pilot:
-        await pilot.press("enter", "?", "l", "j", "j", "j", "j", "j", "enter")
+        await pilot.press("enter", "?", "h", "j", "j", "j", "j", "j", "enter")
         settings = app.screen
-        assert isinstance(settings, TemplateSettingsScreen)
+        assert isinstance(settings, SettingsScreen)
 
         def fail_replace(_source, _destination):
             raise OSError("disk unavailable")
@@ -1284,31 +1281,63 @@ async def test_typed_answer_marker_uses_safe_reveal_without_inventing_an_answer(
 
 
 @pytest.mark.asyncio
-async def test_help_is_hidden_until_requested(tmp_path) -> None:
+async def test_settings_are_hidden_until_requested(tmp_path) -> None:
     app, _ = make_app(tmp_path)
 
     async with app.run_test(size=(70, 20)) as pilot:
         assert isinstance(app.screen, DeckScreen)
         await pilot.press("?")
-        assert isinstance(app.screen, HelpScreen)
+        assert isinstance(app.screen, SettingsScreen)
         await pilot.press("escape")
         assert isinstance(app.screen, DeckScreen)
 
 
 @pytest.mark.asyncio
-async def test_help_is_full_screen_scrollable_and_tiny_pane_safe(tmp_path) -> None:
+async def test_deck_settings_exposes_controls_and_explains_sections_scope(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "help"
+
+        await pilot.press("l")
+        assert settings.tab == "controls"
+        assert settings.query_one("#settings-controls").display is True
+
+        await pilot.press("l")
+        assert settings.tab == "sections"
+        empty = settings.query_one("#settings-sections-empty")
+        assert empty.display is True
+        assert str(empty.render()) == "review a card to configure its sections"
+
+        await pilot.press("h", "j", "j", "j", "j", "j", "enter", "z")
+        assert app.review_controls.binding(ReviewAction.UNDO) == "z"
+        assert preferences.review_controls(app.profile).binding(ReviewAction.UNDO) == "z"
+
+        await pilot.press("?")
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_settings_help_is_full_screen_scrollable_and_tiny_pane_safe(tmp_path) -> None:
     app, _ = make_app(tmp_path)
 
     async with app.run_test(size=(20, 6)) as pilot:
         await pilot.press("?")
-        help_screen = app.screen
-        assert isinstance(help_screen, HelpScreen)
-        assert help_screen.query_one("#help-layout").region.size == help_screen.size
-        assert help_screen.query_one("#help-header").region == (0, 0, 20, 1)
-        assert help_screen.query_one("#help-scroll").region == (0, 1, 20, 4)
-        assert help_screen.query_one(".surface-footer").region == (0, 5, 20, 1)
-        assert len(help_screen.query("#help-dialog")) == 0
-        scroll = help_screen.query_one("#help-scroll")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.query_one("#settings-layout").region.size == settings.size
+        assert settings.query_one("#settings-header").region == (0, 0, 20, 1)
+        assert str(settings.query_one("#settings-header").render()) == "settings"
+        assert settings.query_one("#settings-tabs").region == (0, 1, 20, 1)
+        assert settings.query_one("#settings-help").region == (0, 2, 20, 3)
+        assert settings.query_one(".surface-footer").region == (0, 5, 20, 1)
+        scroll = settings.query_one("#settings-help")
         assert scroll.max_scroll_y > 0
         await pilot.press("G")
         assert scroll.scroll_y == scroll.max_scroll_y
@@ -1324,7 +1353,7 @@ async def test_help_lists_the_review_card_operations(tmp_path) -> None:
 
     async with app.run_test(size=(40, 10)) as pilot:
         await pilot.press("?")
-        help_text = str(app.screen.query_one("#help-scroll Static").render())
+        help_text = str(app.screen.query_one("#settings-help Static").render())
         assert "u        undo" in help_text
         assert "b        bury" in help_text
         assert "x        suspend" in help_text

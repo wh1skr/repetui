@@ -28,10 +28,11 @@ familiar coloured New/Learning/Review split. As a pane narrows, the split
 disappears before the total so the selected deck identity remains useful.
 
 During review, `Enter` reveals a card and then answers Good. Use `1`–`4` for
-Again, Hard, Good, and Easy; `j`/`k` and `g`/`G` scroll long cards. Press `?` on
-a card for its full-screen template settings. Every answer section is shown by
-default, and each section can be changed to show, fold, or hide. Press `?` from
-the deck list for the complete keyboard reference.
+Again, Hard, Good, and Easy; `j`/`k` and `g`/`G` scroll long cards. Press `?`
+from decks or review for one full-screen settings surface containing Help,
+Controls, and Sections. Controls are available everywhere; Sections configures
+the current card template during review. Every answer section is shown by
+default, and each section can be changed to show, fold, or hide.
 
 repetui translates rendered Anki HTML into terminal-native text rather than
 running a browser. It preserves ordered text, headings, ruby readings, lists,
@@ -68,8 +69,7 @@ If more than one Anki profile exists:
 uv run repetui --profile PROFILE_NAME
 ```
 
-Inside the application, press `?` for help. During review it opens the current
-template's section settings and keyboard reference.
+Inside the application, press `?` for Help, Controls, and Sections settings.
 
 ## Licence and relationship to Anki
 

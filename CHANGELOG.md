@@ -4,6 +4,8 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+- Unified Help, Controls, and Sections in one settings screen available from decks and review.
+
 ## 0.1.2 - 2026-08-26
 
 - Replaced generic sync notifications with a compact, terminal-native status popup.
