@@ -74,54 +74,60 @@ def _header(
 ) -> Text:
     """Build the first Flow line, shedding metadata before card content."""
     front, multiple_front_blocks = _front_content(presentation)
+    first_front, _, remaining_front = front.partition("\n")
+    split = f"{counts.new}/{counts.learning}/{counts.review}"
     optional = {
         "deck": deck_name,
-        "split": f"{counts.new}/{counts.learning}/{counts.review}",
-        "total": str(counts.total),
         "template": "" if multiple_front_blocks else presentation.identity.template_name,
+        "total": str(counts.total),
     }
 
-    def lengths() -> int:
-        left = front + (f"  · {optional['template']}" if optional["template"] else "")
-        right = "  ".join(
-            value for key in ("deck", "total", "split") if (value := optional[key])
+    def right_text() -> Text:
+        result = Text()
+        if visible_deck := optional["deck"]:
+            result.append(visible_deck, style="#817d76")
+            result.append("  ")
+        if total := optional["total"]:
+            result.append(total, style="#aaa49b")
+            result.append(" ")
+        new, learning, review = split.split("/")
+        result.append(new, style="#68a8df")
+        result.append("/", style="#817d76")
+        result.append(learning, style="#dc6b72")
+        result.append("/", style="#817d76")
+        result.append(review, style="#79c98b")
+        return result
+
+    def first_row_width() -> int:
+        left = first_front + (
+            f"  · {optional['template']}" if optional["template"] else ""
         )
-        return cell_len(left) + (2 + cell_len(right) if right else 0)
+        right = right_text()
+        return cell_len(left) + (2 + right.cell_len if left else right.cell_len)
 
-    if "\n" in front:
-        optional = dict.fromkeys(optional, "")
-    else:
-        for name in ("deck", "split", "total", "template"):
-            if lengths() <= max(width, 1):
-                break
-            optional[name] = ""
+    width = max(width, 1)
+    for name in ("deck", "template", "total"):
+        if first_row_width() <= width:
+            break
+        optional[name] = ""
 
-    result = Text(front, style="bold #eee9e0", overflow="fold")
+    if first_row_width() > width:
+        remaining_front = front
+        first_front = ""
+
+    result = Text(first_front, style="bold #eee9e0", overflow="fold")
     if template := optional["template"]:
         result.append(f"  · {template}", style="#817d76")
 
-    right_parts: list[Text] = []
-    if visible_deck := optional["deck"]:
-        right_parts.append(Text(visible_deck, style="#817d76"))
-    if total := optional["total"]:
-        right_parts.append(Text(total, style="bold #d8d3ca"))
-    if split := optional["split"]:
-        split_text = Text()
-        new, learning, review = split.split("/")
-        split_text.append(new, style="#68a8df")
-        split_text.append("/", style="#817d76")
-        split_text.append(learning, style="#dc6b72")
-        split_text.append("/", style="#817d76")
-        split_text.append(review, style="#79c98b")
-        right_parts.append(split_text)
-    if right_parts:
-        right_width = sum(cell_len(part.plain) for part in right_parts)
-        right_width += 2 * (len(right_parts) - 1)
-        result.append(" " * max(2, width - cell_len(result.plain) - right_width))
-        for index, part in enumerate(right_parts):
-            if index:
-                result.append("  ")
-            result.append_text(part)
+    right = right_text()
+    right_width = right.cell_len
+    minimum_gap = 2 if result.plain else 0
+    result.append(" " * max(minimum_gap, width - cell_len(result.plain) - right_width))
+    result.append_text(right)
+
+    if remaining_front:
+        result.append("\n")
+        result.append(remaining_front, style="bold #eee9e0")
     return result
 
 

@@ -65,7 +65,7 @@ def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
         sections=states,
     ).plain
 
-    assert front == "粋 · Kanji Meaning         238  8/17/213"
+    assert front == "粋 · Kanji Meaning          238 8/17/213"
     assert "[type answer]" not in front
     assert "Recognition" not in front
     assert "\n" not in front
@@ -76,6 +76,25 @@ def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
     assert "cross)\nMeaning Mnemonic · mnemonic paragraph" in revealed
     assert "meaning info\nReading Mnemonic · reading paragraph" in revealed
     assert "reading info" in revealed
+
+
+def test_review_count_cluster_keeps_neutral_total_and_anki_split_colours() -> None:
+    result = compose_review(
+        real_kanji_presentation(),
+        "Japanese",
+        DueCounts(9, 5, 114),
+        40,
+        revealed=False,
+    )
+    styled_fragments = {
+        (result.plain[span.start : span.end], span.style) for span in result.spans
+    }
+
+    assert result.plain.endswith("128 9/5/114")
+    assert ("128", "#aaa49b") in styled_fragments
+    assert ("9", "#68a8df") in styled_fragments
+    assert ("5", "#dc6b72") in styled_fragments
+    assert ("114", "#79c98b") in styled_fragments
 
 
 def test_expanded_inline_label_does_not_repeat_its_heading() -> None:
