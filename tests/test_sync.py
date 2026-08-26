@@ -8,7 +8,13 @@ import pytest
 from anki.sync_pb2 import SyncCollectionResponse, SyncStatusResponse
 
 from repetui.config import ProfilePaths
-from repetui.sync import _auth, _profile_data, sync_profile
+from repetui.sync import (
+    SyncStatus,
+    _auth,
+    _profile_data,
+    failed_sync_outcome,
+    sync_profile,
+)
 
 
 def profile_with_prefs(tmp_path: Path, data: dict) -> ProfilePaths:
@@ -41,6 +47,33 @@ def test_builds_auth_using_ankis_current_endpoint(tmp_path: Path) -> None:
 
     assert auth.hkey == "secret"
     assert auth.endpoint == "https://sync9.example/sync/"
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (ConnectionError("host unavailable"), SyncStatus.OFFLINE),
+        (RuntimeError("401 unauthorized"), SyncStatus.AUTH_REQUIRED),
+        (RuntimeError("collection database locked"), SyncStatus.COLLECTION_UNAVAILABLE),
+        (RuntimeError("unexpected detail"), SyncStatus.FAILED),
+    ],
+)
+def test_sync_failures_are_classified_at_the_backend_boundary(
+    error: Exception,
+    status: SyncStatus,
+) -> None:
+    outcome = failed_sync_outcome(error)
+
+    assert outcome.status is status
+    assert outcome.detail == str(error)
+
+
+def test_missing_ankiweb_credentials_require_sign_in(tmp_path: Path) -> None:
+    profile = profile_with_prefs(tmp_path, {})
+
+    outcome = sync_profile(profile)
+
+    assert outcome.status is SyncStatus.AUTH_REQUIRED
 
 
 class FakeSyncCollection:

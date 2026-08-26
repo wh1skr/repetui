@@ -1,5 +1,7 @@
+import asyncio
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
 
 import pytest
 from textual.widgets import Input
@@ -10,6 +12,7 @@ from repetui.app import (
     HelpScreen,
     RepetuiApp,
     ReviewScreen,
+    SyncPopup,
     TemplateSettingsScreen,
     compose_deck_row,
 )
@@ -23,7 +26,7 @@ from repetui.presentation import (
     SourceField,
     present_card,
 )
-from repetui.sync import SyncOutcome
+from repetui.sync import SyncOutcome, SyncStatus
 
 
 class FakeBackend:
@@ -339,7 +342,7 @@ async def test_sync_reload_keeps_expansion_and_selected_deck(tmp_path) -> None:
     app, backend = make_app(
         tmp_path,
         decks=decks,
-        syncer=lambda _profile: SyncOutcome(True, "Synced."),
+        syncer=lambda _profile: SyncOutcome(SyncStatus.SYNCED),
     )
 
     async with app.run_test(size=(40, 6)) as pilot:
@@ -347,11 +350,11 @@ async def test_sync_reload_keeps_expansion_and_selected_deck(tmp_path) -> None:
         assert isinstance(screen, DeckScreen)
         await pilot.press("tab", "j")
 
-        app.syncing = True
-        app._finish_sync(app._run_sync())
-        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause(1.2)
 
         assert backend.is_open is True
+        assert app.screen is screen
         assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3]
         view = screen.query_one("#decks")
         assert screen.query("DeckItem")[view.index].deck.id == 2
@@ -784,32 +787,387 @@ async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("from_review", [False, True])
-async def test_sync_is_available_from_decks_and_review_without_persistent_chrome(
+async def test_sync_opens_the_same_centered_one_line_popup_from_decks_and_review(
     tmp_path,
     from_review,
+    monkeypatch,
 ) -> None:
-    calls: list[ProfilePaths] = []
+    started = Event()
+    release = Event()
 
     def fake_sync(profile: ProfilePaths) -> SyncOutcome:
-        calls.append(profile)
-        return SyncOutcome(True, "Synced.")
+        assert profile.name == "test"
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
 
     app, backend = make_app(tmp_path, syncer=fake_sync)
+    notifications = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            if from_review:
+                await pilot.press("enter")
+                assert isinstance(app.screen, ReviewScreen)
+
+            origin = app.screen
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            await pilot.pause()
+
+            popup = app.screen
+            assert isinstance(popup, SyncPopup)
+            assert app.screen_stack[-2] is origin
+            surface = popup.query_one("#sync-popup")
+            assert str(surface.render()) in {
+                "[|] syncing...",
+                "[/] syncing...",
+                "[-] syncing...",
+                "[\\] syncing...",
+            }
+            assert surface.region.height == 1
+            assert surface.region.y == 2
+            assert surface.region.x >= 1
+            assert surface.region.right <= popup.size.width - 1
+            assert popup.styles.background.a == 0
+            assert backend.is_open is False
+            assert notifications == []
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome_status", "visible_message"),
+    [
+        (SyncStatus.SYNCED, "[ok] synced"),
+        (SyncStatus.UP_TO_DATE, "[ok] up to date"),
+    ],
+)
+async def test_sync_completion_replaces_progress_then_dismisses_after_one_second(
+    tmp_path,
+    outcome_status,
+    visible_message,
+) -> None:
+    app, backend = make_app(
+        tmp_path,
+        syncer=lambda _profile: SyncOutcome(outcome_status),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        origin = app.screen
+        await pilot.press("s")
+        await pilot.pause(0.1)
+
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        assert str(popup.query_one("#sync-popup").render()) == visible_message
+        assert backend.is_open is True
+        await pilot.pause(0.75)
+        assert app.screen is popup
+        await pilot.pause(0.3)
+        assert app.screen is origin
+        assert app.syncing is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "detail", "visible_message", "dismiss_key", "from_review"),
+    [
+        (
+            SyncStatus.OFFLINE,
+            "Network connection timed out",
+            "[err] offline",
+            "enter",
+            False,
+        ),
+        (
+            SyncStatus.AUTH_REQUIRED,
+            "Open Anki Desktop and complete one sync before using repetui sync.",
+            "[err] sign in through Anki",
+            "escape",
+            False,
+        ),
+        (
+            SyncStatus.COLLECTION_UNAVAILABLE,
+            "Collection database is locked",
+            "[err] collection unavailable",
+            "enter",
+            False,
+        ),
+        (
+            SyncStatus.FAILED,
+            "secret internal detail",
+            "[err] sync failed",
+            "escape",
+            True,
+        ),
+    ],
+)
+async def test_sync_failures_use_concise_persistent_messages_and_dismiss_cleanly(
+    tmp_path,
+    status,
+    detail,
+    visible_message,
+    dismiss_key,
+    from_review,
+) -> None:
+    app, backend = make_app(
+        tmp_path,
+        syncer=lambda _profile: SyncOutcome(status, detail),
+    )
+
     async with app.run_test(size=(40, 6)) as pilot:
         if from_review:
             await pilot.press("enter")
             assert isinstance(app.screen, ReviewScreen)
+        origin = app.screen
+        await pilot.press("s")
+        await pilot.pause(0.1)
 
-        assert any(binding.key == "s" for binding in app.screen.BINDINGS)
-        app.syncing = True
-        app._finish_sync(app._run_sync())
-        await pilot.pause()
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        rendered = str(popup.query_one("#sync-popup").render())
+        assert rendered == visible_message
+        assert detail not in rendered
+        await pilot.pause(1.05)
+        assert app.screen is popup
 
-        assert calls == [app.profile]
-        assert backend.is_open is True
+        await pilot.press(dismiss_key)
+        assert app.screen is origin
         assert app.syncing is False
-        assert isinstance(app.screen, ReviewScreen if from_review else DeckScreen)
-        assert len(app.screen.query("#sync-status")) == 0
+        assert backend.is_open is True
+
+
+class ReopenFailingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_count = 0
+
+    def open(self) -> None:
+        self.open_count += 1
+        if self.open_count > 1:
+            raise BackendError("private reopen detail")
+        super().open()
+
+
+class CloseFailingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_close = True
+
+    def close(self) -> None:
+        if self.fail_next_close:
+            self.fail_next_close = False
+            raise BackendError("private close detail")
+        super().close()
+
+
+@pytest.mark.asyncio
+async def test_collection_close_failure_becomes_dismissible_without_running_sync(
+    tmp_path,
+) -> None:
+    backend = CloseFailingBackend()
+    calls = []
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        lambda sync_profile: calls.append(sync_profile),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        origin = app.screen
+        await pilot.press("s")
+        await pilot.pause(0.1)
+
+        assert isinstance(app.screen, SyncPopup)
+        assert str(app.screen.query_one("#sync-popup").render()) == (
+            "[err] collection unavailable"
+        )
+        assert calls == []
+        assert backend.is_open is True
+
+        await pilot.press("escape")
+        assert app.screen is origin
+        assert app.syncing is False
+
+
+@pytest.mark.asyncio
+async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal(
+    tmp_path,
+) -> None:
+    backend = ReopenFailingBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        lambda _profile: SyncOutcome(SyncStatus.OFFLINE, "network problem"),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        assert str(popup.query_one("#sync-popup").render()) == ("[err] collection unavailable")
+        assert "private reopen detail" not in str(popup.query_one("#sync-popup").render())
+        assert backend.is_open is False
+
+        await pilot.press("enter")
+        assert isinstance(app.screen, ErrorScreen)
+        assert "private reopen detail" in str(app.screen.query_one("#error-scroll Static").render())
+        assert app.syncing is False
+
+
+@pytest.mark.asyncio
+async def test_sync_popup_blocks_review_navigation_rating_repeat_sync_help_and_quit(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+    calls = 0
+
+    def fake_sync(_profile: ProfilePaths) -> SyncOutcome:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app, backend = make_app(tmp_path, syncer=fake_sync)
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("enter")
+            review = app.screen
+            assert isinstance(review, ReviewScreen)
+            assert review.revealed is False
+
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            await pilot.press(
+                "enter",
+                "space",
+                "1",
+                "4",
+                "j",
+                "k",
+                "g",
+                "G",
+                "escape",
+                "s",
+                "?",
+                "q",
+            )
+
+            popup = app.screen
+            assert isinstance(popup, SyncPopup)
+            assert calls == 1
+            assert review.revealed is False
+            assert backend.rating is None
+
+            release.set()
+            await pilot.pause(0.1)
+            assert app.screen is popup
+            assert str(popup.query_one("#sync-popup").render()) == "[ok] synced"
+            await pilot.press("enter", "3", "escape")
+            await pilot.pause(1.0)
+
+            assert app.screen is review
+            assert review.revealed is False
+            assert backend.rating is None
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_sync_spinner_sequence_recenters_and_stays_one_row_in_tiny_panes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    started = Event()
+    release = Event()
+    monkeypatch.setattr(SyncPopup, "SPINNER_INTERVAL", 60.0)
+
+    def fake_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app, _ = make_app(tmp_path, syncer=fake_sync)
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            popup = app.screen
+            assert isinstance(popup, SyncPopup)
+            surface = popup.query_one("#sync-popup")
+
+            frames = []
+            for _ in range(4):
+                popup.advance_spinner()
+                frames.append(str(surface.render()))
+            assert frames == [
+                "[/] syncing...",
+                "[-] syncing...",
+                "[\\] syncing...",
+                "[|] syncing...",
+            ]
+
+            await pilot.resize_terminal(20, 6)
+            assert surface.region.height == 1
+            assert surface.region.x == (20 - surface.region.width) // 2
+
+            await pilot.resize_terminal(7, 6)
+            assert surface.region == (1, 2, 5, 1)
+
+            await pilot.resize_terminal(6, 6)
+            assert surface.region == (1, 2, 4, 1)
+
+            await pilot.resize_terminal(5, 6)
+            assert surface.region == (1, 2, 3, 1)
+
+            await pilot.resize_terminal(4, 4)
+            assert surface.region.height == 1
+            assert surface.region.width == 3
+            assert str(surface.render()).startswith("[|]")
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_app_shutdown_during_sync_does_not_hang_or_reopen_collection(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+
+    def slow_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app, backend = make_app(tmp_path, syncer=slow_sync)
+    try:
+        async with app.run_test(size=(40, 6)) as pilot:
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            assert isinstance(app.screen, SyncPopup)
+            assert backend.is_open is False
+    finally:
+        release.set()
+
+    await asyncio.sleep(0.1)
+    assert backend.is_open is False
 
 
 @pytest.mark.asyncio
@@ -819,10 +1177,12 @@ async def test_failed_sync_reopens_collection_and_clears_busy_state(tmp_path) ->
 
     app, backend = make_app(tmp_path, syncer=fail_sync)
     async with app.run_test(size=(40, 6)) as pilot:
-        app.syncing = True
-        app._finish_sync(app._run_sync())
-        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause(0.1)
 
         assert backend.is_open is True
+        assert isinstance(app.screen, SyncPopup)
+        assert str(app.screen.query_one("#sync-popup").render()) == "[err] offline"
+        await pilot.press("enter")
         assert app.syncing is False
         assert isinstance(app.screen, DeckScreen)

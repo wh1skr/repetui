@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from threading import Event, Lock, Thread
 from typing import Protocol, cast
 
 from rich.cells import cell_len
 from rich.text import Text
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.message import Message
+from textual.screen import ModalScreen, Screen
+from textual.timer import Timer
 from textual.widgets import ListItem, ListView, Static
 
 from . import __version__
@@ -21,11 +24,25 @@ from .deck_tree import VisibleDeckRow, visible_deck_rows
 from .flow import SectionState, compose_ratings, compose_review, section_name
 from .preferences import JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
-from .sync import SyncOutcome, sync_profile
+from .sync import SyncOutcome, SyncStatus, failed_sync_outcome, sync_profile
 
 
 class Refreshable(Protocol):
     def backend_refreshed(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class SyncRunResult:
+    outcome: SyncOutcome
+    reopen_error: str | None = None
+
+
+class SyncFinished(Message):
+    """Deliver a blocking sync result back to Textual's UI thread."""
+
+    def __init__(self, result: SyncRunResult) -> None:
+        super().__init__()
+        self.result = result
 
 
 class HelpScreen(Screen[None]):
@@ -649,6 +666,120 @@ class ReviewScreen(Screen[None]):
         self.repetui.action_sync()
 
 
+class SyncPopup(ModalScreen[bool]):
+    """One modal, terminal-native sync message over the originating screen."""
+
+    SPINNER_FRAMES = ("|", "/", "-", "\\")
+    SPINNER_INTERVAL = 0.12
+
+    BINDINGS = [
+        Binding("q", "block", show=False, priority=True),
+        Binding("question_mark", "block", show=False, priority=True),
+        Binding("s", "block", show=False),
+        Binding("escape", "dismiss_failure", show=False),
+        Binding("enter", "dismiss_failure", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._frame_index = 0
+        self._spinner_timer: Timer | None = None
+        self._dismiss_timer: Timer | None = None
+        self._failure_dismissible = False
+        self._fatal = False
+        self._message = "[|] syncing..."
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text(self._message, no_wrap=True), id="sync-popup")
+
+    def on_mount(self) -> None:
+        self._spinner_timer = self.set_interval(self.SPINNER_INTERVAL, self.advance_spinner)
+        self._fit_surface()
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._fit_surface()
+
+    def on_unmount(self) -> None:
+        self._stop_timers()
+
+    def advance_spinner(self) -> None:
+        """Advance the visible ASCII sync frame in its fixed sequence."""
+        self._frame_index = (self._frame_index + 1) % len(self.SPINNER_FRAMES)
+        frame = self.SPINNER_FRAMES[self._frame_index]
+        self._show_message(f"[{frame}] syncing...")
+
+    def finish(self, result: SyncRunResult) -> None:
+        self._stop_spinner()
+        outcome = result.outcome
+        if outcome.ok:
+            message = {
+                SyncStatus.SYNCED: "[ok] synced",
+                SyncStatus.UP_TO_DATE: "[ok] up to date",
+            }[outcome.status]
+            self._show_message(message)
+            self.query_one("#sync-popup").add_class("-success")
+            self._dismiss_timer = self.set_timer(1.0, self._dismiss_success)
+        else:
+            self._failure_dismissible = True
+            self._fatal = result.reopen_error is not None
+            message = (
+                "[err] collection unavailable"
+                if self._fatal
+                else {
+                    SyncStatus.OFFLINE: "[err] offline",
+                    SyncStatus.AUTH_REQUIRED: "[err] sign in through Anki",
+                    SyncStatus.COLLECTION_UNAVAILABLE: "[err] collection unavailable",
+                    SyncStatus.FAILED: "[err] sync failed",
+                }[outcome.status]
+            )
+            self._show_message(message)
+            self.query_one("#sync-popup").add_class("-error")
+
+    def _show_message(self, message: str) -> None:
+        self._message = message
+        self.query_one("#sync-popup", Static).update(Text(message, no_wrap=True))
+        self._fit_surface()
+
+    def _fit_surface(self) -> None:
+        """Keep padding and surroundings until the state marker needs the cells."""
+        surface = self.query_one("#sync-popup", Static)
+        pane_width = max(self.size.width, 1)
+        if pane_width >= 7:
+            horizontal_padding = 1
+            width = min(cell_len(self._message) + 2, pane_width - 2)
+        elif pane_width >= 5:
+            horizontal_padding = 0
+            width = min(cell_len(self._message), pane_width - 2)
+        else:
+            horizontal_padding = 0
+            width = min(cell_len(self._message), pane_width, 3)
+        surface.styles.padding = (0, horizontal_padding)
+        surface.styles.width = max(width, 1)
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+
+    def _stop_timers(self) -> None:
+        self._stop_spinner()
+        if self._dismiss_timer is not None:
+            self._dismiss_timer.stop()
+            self._dismiss_timer = None
+
+    def _dismiss_success(self) -> None:
+        self.dismiss(False)
+
+    def action_block(self) -> None:
+        """Consume keys while sync owns the collection and interaction."""
+
+    def action_dismiss_failure(self) -> None:
+        if self._failure_dismissible:
+            self._stop_timers()
+            self.dismiss(self._fatal)
+
+
 class RepetuiApp(App[None]):
     TITLE = f"repetui {__version__}"
     CSS = """
@@ -779,6 +910,32 @@ class RepetuiApp(App[None]):
     #error-header, #error-scroll {
         color: #dc6b72;
     }
+
+    SyncPopup {
+        align: center middle;
+        overflow: hidden;
+        background: transparent;
+    }
+
+    #sync-popup {
+        width: auto;
+        max-width: 100%;
+        height: 1;
+        padding: 0 1;
+        overflow: hidden;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        background: #293034;
+        color: #e7e1d8;
+    }
+
+    #sync-popup.-success {
+        color: #79c98b;
+    }
+
+    #sync-popup.-error {
+        color: #dc6b72;
+    }
     """
 
     BINDINGS = [
@@ -799,6 +956,12 @@ class RepetuiApp(App[None]):
         self.preferences = preferences if preferences is not None else JsonPreferences()
         self.syncer = syncer
         self.syncing = False
+        self._sync_origin: Screen[None] | None = None
+        self._sync_popup: SyncPopup | None = None
+        self._sync_thread: Thread | None = None
+        self._sync_fatal_error: str | None = None
+        self._shutdown_requested = Event()
+        self._backend_lock = Lock()
 
     def on_mount(self) -> None:
         try:
@@ -808,9 +971,13 @@ class RepetuiApp(App[None]):
             self.push_screen(ErrorScreen(str(exc)))
 
     def on_unmount(self) -> None:
-        self.backend.close()
+        self._shutdown_requested.set()
+        with self._backend_lock:
+            self.backend.close()
 
     def action_help(self) -> None:
+        if self.syncing:
+            return
         screen = self.screen
         if isinstance(screen, (TemplateSettingsScreen, HelpScreen)):
             screen.action_back()
@@ -819,39 +986,72 @@ class RepetuiApp(App[None]):
         else:
             self.push_screen(HelpScreen())
 
+    def action_quit(self) -> None:
+        if not self.syncing:
+            self.exit()
+
     def action_sync(self) -> None:
         if self.syncing:
-            self.notify("Sync is already running.", severity="warning")
             return
         self.syncing = True
-        self.notify("Syncing…", timeout=30)
-        self._sync_worker()
+        self._sync_origin = self.screen
+        self._sync_popup = SyncPopup()
+        self.push_screen(self._sync_popup, self._sync_popup_closed)
+        self.call_after_refresh(self._start_sync_thread)
 
-    @work(thread=True, exclusive=True, group="sync")
-    def _sync_worker(self) -> None:
-        outcome = self._run_sync()
-        self.call_from_thread(self._finish_sync, outcome)
-
-    def _run_sync(self) -> SyncOutcome:
-        """Run the blocking close/sync/reopen sequence without UI mutation."""
-        self.backend.close()
-        try:
-            outcome = self.syncer(self.profile)
-        except Exception as exc:
-            outcome = SyncOutcome(False, f"Sync failed: {exc}")
-        try:
-            self.backend.open()
-        except Exception as exc:
-            outcome = SyncOutcome(False, f"{outcome.message} Could not reopen collection: {exc}")
-        return outcome
-
-    def _finish_sync(self, outcome: SyncOutcome) -> None:
-        self.syncing = False
-        self.notify(
-            outcome.message,
-            severity="information" if outcome.ok else "error",
-            timeout=5,
+    def _start_sync_thread(self) -> None:
+        self._sync_thread = Thread(
+            target=self._sync_in_thread,
+            name="repetui-sync",
+            daemon=True,
         )
-        screen = self.screen
-        if hasattr(screen, "backend_refreshed") and self.backend.is_open:
-            cast(Refreshable, screen).backend_refreshed()
+        self._sync_thread.start()
+
+    def _sync_in_thread(self) -> None:
+        self.post_message(SyncFinished(self._run_sync()))
+
+    def on_sync_finished(self, message: SyncFinished) -> None:
+        self._finish_sync(message.result)
+
+    def _run_sync(self) -> SyncRunResult:
+        """Run the blocking close/sync/reopen sequence without UI mutation."""
+        close_error = None
+        with self._backend_lock:
+            if self._shutdown_requested.is_set():
+                return SyncRunResult(SyncOutcome(SyncStatus.FAILED, "Sync cancelled."))
+            try:
+                self.backend.close()
+            except Exception as exc:
+                close_error = exc
+        if close_error is not None:
+            outcome = SyncOutcome(SyncStatus.COLLECTION_UNAVAILABLE, str(close_error))
+        else:
+            try:
+                outcome = self.syncer(self.profile)
+            except Exception as exc:
+                outcome = failed_sync_outcome(exc)
+        reopen_error = None
+        with self._backend_lock:
+            if not self._shutdown_requested.is_set():
+                try:
+                    self.backend.open()
+                except Exception as exc:
+                    reopen_error = str(exc)
+        return SyncRunResult(outcome, reopen_error)
+
+    def _finish_sync(self, result: SyncRunResult) -> None:
+        origin = self._sync_origin
+        if origin is not None and hasattr(origin, "backend_refreshed") and self.backend.is_open:
+            cast(Refreshable, origin).backend_refreshed()
+        self._sync_fatal_error = result.reopen_error
+        if self._sync_popup is not None:
+            self._sync_popup.finish(result)
+
+    def _sync_popup_closed(self, fatal: bool | None) -> None:
+        fatal_error = self._sync_fatal_error
+        self.syncing = False
+        self._sync_popup = None
+        self._sync_origin = None
+        self._sync_fatal_error = None
+        if fatal and fatal_error is not None:
+            self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))
