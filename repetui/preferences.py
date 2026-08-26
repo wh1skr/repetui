@@ -1,4 +1,4 @@
-"""Persistent, template-scoped presentation preferences."""
+"""Persistent profile and card-template preferences."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from .config import ProfilePaths
 from .presentation import CardTemplateIdentity
 
 
@@ -25,7 +26,13 @@ class SectionMode(str, Enum):
 
 
 class Preferences(Protocol):
-    """Small injectable seam used by the review and settings screens."""
+    """Small injectable seam used by deck, review, and settings screens."""
+
+    def expanded_deck_ids(self, profile: ProfilePaths) -> frozenset[int]: ...
+
+    def set_deck_expanded(
+        self, profile: ProfilePaths, deck_id: int, *, expanded: bool
+    ) -> None: ...
 
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode: ...
 
@@ -44,34 +51,72 @@ def default_preferences_path() -> Path:
     return root / "repetui" / "preferences.json"
 
 
-class SectionPreferences:
-    """JSON-backed preferences keyed by stable Anki model and template IDs."""
+class JsonPreferences:
+    """JSON-backed preferences for profile and card-template behavior."""
 
     VERSION = 1
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_preferences_path()
-        self._templates = self._load()
+        self._templates, self._profiles = self._load()
 
     @staticmethod
     def _template_key(identity: CardTemplateIdentity) -> str:
         return f"{identity.note_type_id}:{identity.template_ordinal}"
 
-    def _load(self) -> dict[str, dict[str, object]]:
+    @staticmethod
+    def _profile_key(profile: ProfilePaths) -> str:
+        return str(profile.collection.expanduser().resolve())
+
+    def _load(
+        self,
+    ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {}
+            return {}, {}
         if not isinstance(document, dict) or document.get("version") != self.VERSION:
-            return {}
+            return {}, {}
         templates = document.get("templates")
-        if not isinstance(templates, dict):
-            return {}
-        return {
+        profiles = document.get("profiles")
+        loaded_templates = {
             str(key): value
-            for key, value in templates.items()
+            for key, value in (templates.items() if isinstance(templates, dict) else ())
             if isinstance(value, dict)
         }
+        loaded_profiles = {
+            str(key): value
+            for key, value in (profiles.items() if isinstance(profiles, dict) else ())
+            if isinstance(value, dict)
+        }
+        return loaded_templates, loaded_profiles
+
+    def expanded_deck_ids(self, profile: ProfilePaths) -> frozenset[int]:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        saved_ids = saved_profile.get("expanded_deck_ids", [])
+        if not isinstance(saved_ids, list):
+            return frozenset()
+        return frozenset(
+            deck_id
+            for deck_id in saved_ids
+            if isinstance(deck_id, int)
+            and not isinstance(deck_id, bool)
+            and deck_id > 0
+        )
+
+    def set_deck_expanded(
+        self, profile: ProfilePaths, deck_id: int, *, expanded: bool
+    ) -> None:
+        expanded_ids = set(self.expanded_deck_ids(profile))
+        if expanded:
+            expanded_ids.add(deck_id)
+        else:
+            expanded_ids.discard(deck_id)
+        saved_profile = self._profiles.setdefault(
+            self._profile_key(profile), {"name": profile.name}
+        )
+        saved_profile["expanded_deck_ids"] = sorted(expanded_ids)
+        self._save()
 
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode:
         template = self._templates.get(self._template_key(identity), {})
@@ -110,7 +155,11 @@ class SectionPreferences:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        document = {"version": self.VERSION, "templates": self._templates}
+        document = {
+            "version": self.VERSION,
+            "profiles": self._profiles,
+            "templates": self._templates,
+        }
         temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
         temporary.write_text(
             json.dumps(document, indent=2, sort_keys=True) + "\n",

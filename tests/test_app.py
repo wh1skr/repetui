@@ -15,7 +15,8 @@ from repetui.app import (
 )
 from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
-from repetui.preferences import SectionMode, SectionPreferences
+from repetui.deck_tree import VisibleDeckRow
+from repetui.preferences import JsonPreferences, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -36,6 +37,7 @@ class FakeBackend:
         self.card_available = True
         self.card_content = card_content
         self._decks = decks or [Deck(1, "Japanese", 0, DueCounts(2, 1, 7))]
+        self.begun_deck_ids: list[int] = []
 
     def open(self) -> None:
         self.is_open = True
@@ -47,7 +49,8 @@ class FakeBackend:
         return self._decks
 
     def begin_review(self, deck_id: int) -> None:
-        assert deck_id == 1
+        assert any(deck.id == deck_id for deck in self._decks)
+        self.begun_deck_ids.append(deck_id)
 
     def counts(self) -> DueCounts:
         return DueCounts(2, 1, 7) if self.card_available else DueCounts(0, 0, 0)
@@ -70,13 +73,13 @@ class FakeBackend:
 def make_app(
     tmp_path: Path | None = None,
     card_content: RawCardContent | None = None,
-    preferences: SectionPreferences | None = None,
+    preferences: JsonPreferences | None = None,
     decks: list[Deck] | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
     backend = FakeBackend(card_content, decks)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
-    store = preferences or SectionPreferences(
+    store = preferences or JsonPreferences(
         (tmp_path or Path("/tmp")) / "preferences.json"
     )
     app = (
@@ -146,11 +149,12 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
     decks = [
         Deck(
             1,
-            "完全な統計::日本語::ＷＫ漢字と単語::漢字",
-            3,
+            "完全な統計",
+            0,
             DueCounts(8, 17, 213),
         ),
-        Deck(2, "AWS::SAA-C03", 1, DueCounts(3, 0, 12)),
+        Deck(2, "完全な統計::日本語", 1, DueCounts(3, 4, 20)),
+        Deck(3, "AWS", 0, DueCounts(3, 0, 12)),
     ]
     app, _ = make_app(tmp_path, decks=decks)
 
@@ -158,7 +162,7 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, DeckScreen)
-        assert str(screen.query_one("#deck-header").render()) == "decks"
+        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.1"
         assert screen.query_one("#deck-header").region.y == 0
         assert len(screen.query("#logo")) == 0
         assert len(screen.query(".quiet-footer")) == 0
@@ -167,24 +171,190 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         assert len(items) == 2
         first = items[0]
         row = str(first.query_one(".deck-row").render())
-        assert row == compose_deck_row(decks[0], 40).plain
-        assert "ＷＫ漢字と単語 › 漢字" in row
+        assert row == compose_deck_row(VisibleDeckRow(decks[0], True, False), 40).plain
+        assert row.startswith("▸ 完全な統計")
         assert "238" in row
         assert "8/17/213" in row
         assert first.region.y == 1
 
+        await pilot.press("tab")
+        child = list(screen.query("DeckItem"))[1]
+        assert str(child.query_one(".deck-row").render()).startswith("> 日本語")
+
         await pilot.resize_terminal(14, 6)
-        row = str(first.query_one(".deck-row").render())
-        assert row == compose_deck_row(decks[0], 14).plain
-        assert "漢字" in row
-        assert "238" in row
-        assert "8/17/213" not in row
+        row = str(child.query_one(".deck-row").render())
+        assert "日本語" in row
+        assert "27" in row
+        assert "3/4/20" not in row
+
+        await pilot.resize_terminal(11, 6)
+        row = str(child.query_one(".deck-row").render())
+        assert row.startswith("> 日本語")
+        assert "27" not in row
 
         await pilot.resize_terminal(8, 6)
-        assert str(first.query_one(".deck-row").render()) == "… › 漢字"
+        assert "日本語" in str(child.query_one(".deck-row").render())
 
         await pilot.resize_terminal(4, 6)
-        assert str(first.query_one(".deck-row").render()) == "漢字"
+        narrow = str(child.query_one(".deck-row").render())
+        assert narrow.startswith("日")
+        assert "…" in narrow
+
+
+@pytest.mark.asyncio
+async def test_tab_expands_and_collapses_selected_parent_without_moving_it(
+    tmp_path,
+) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(4, 1, 9)),
+        Deck(2, "Japanese::Kanji", 1, DueCounts(2, 0, 3)),
+        Deck(3, "Japanese::Kanji::N5", 2, DueCounts(1, 0, 1)),
+        Deck(4, "Japanese::Vocabulary", 1, DueCounts(2, 1, 6)),
+        Deck(5, "AWS", 0, DueCounts(1, 0, 2)),
+    ]
+    app, _ = make_app(tmp_path, decks=decks)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DeckScreen)
+        view = screen.query_one("#decks")
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 5]
+        assert str(screen.query("DeckItem")[0].query_one(".deck-row").render()).startswith(
+            "▸ Japanese"
+        )
+
+        await pilot.press("tab")
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 4, 5]
+        assert view.index == 0
+        rendered_rows = [
+            str(item.query_one(".deck-row").render())
+            for item in screen.query("DeckItem")
+        ]
+        assert rendered_rows[0].startswith("▾ Japanese")
+        assert rendered_rows[1].startswith("> ▸ Kanji")
+        assert rendered_rows[2].startswith("> Vocabulary")
+        assert "▸" not in rendered_rows[2]
+        assert "▾" not in rendered_rows[2]
+
+        await pilot.press("j", "tab")
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3, 4, 5]
+        assert screen.query("DeckItem")[view.index].deck.id == 2
+
+        await pilot.press("tab")
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 4, 5]
+        assert screen.query("DeckItem")[view.index].deck.id == 2
+
+
+@pytest.mark.asyncio
+async def test_leaf_tab_only_flashes_the_selected_row(tmp_path, monkeypatch) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(4, 1, 9)),
+        Deck(2, "Japanese::語彙", 1, DueCounts(2, 1, 6)),
+    ]
+    app, _ = make_app(tmp_path, decks=decks)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DeckScreen)
+        await pilot.press("tab", "j")
+        view = screen.query_one("#decks")
+        leaf = screen.query("DeckItem")[view.index]
+        notifications = []
+        monkeypatch.setattr(app, "notify", lambda *args, **kwargs: notifications.append(args))
+
+        screen.action_toggle_deck()
+
+        assert leaf.has_class("-leaf-feedback")
+        assert view.index == 1
+        assert len(app.screen_stack) == 2
+        assert notifications == []
+        await pilot.pause(0.25)
+        assert not leaf.has_class("-leaf-feedback")
+
+
+@pytest.mark.asyncio
+async def test_enter_reviews_selected_parent_and_leaf(tmp_path) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(4, 1, 9)),
+        Deck(2, "Japanese::Kanji", 1, DueCounts(2, 0, 3)),
+    ]
+    app, backend = make_app(tmp_path, decks=decks)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert backend.begun_deck_ids[-1] == 1
+
+        await pilot.press("escape", "tab", "j", "enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert backend.begun_deck_ids[-1] == 2
+
+
+@pytest.mark.asyncio
+async def test_tree_state_survives_review_return_restart_and_backend_refresh(
+    tmp_path,
+) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(4, 1, 9)),
+        Deck(2, "Japanese::Kanji", 1, DueCounts(2, 0, 3)),
+        Deck(3, "AWS", 0, DueCounts(1, 0, 2)),
+    ]
+    preferences_path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(preferences_path)
+    app, backend = make_app(tmp_path, preferences=preferences, decks=decks)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DeckScreen)
+        await pilot.press("tab", "j", "enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert backend.begun_deck_ids[-1] == 2
+
+        await pilot.press("escape")
+        assert app.screen is screen
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3]
+
+        screen.backend_refreshed()
+        await pilot.pause()
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3]
+        assert screen.query("DeckItem")[screen.query_one("#decks").index].deck.id == 2
+
+    restarted, _ = make_app(
+        tmp_path,
+        preferences=JsonPreferences(preferences_path),
+        decks=decks,
+    )
+    async with restarted.run_test(size=(40, 6)):
+        assert [item.deck.id for item in restarted.screen.query("DeckItem")] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_sync_reload_keeps_expansion_and_selected_deck(tmp_path) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(4, 1, 9)),
+        Deck(2, "Japanese::Kanji", 1, DueCounts(2, 0, 3)),
+        Deck(3, "AWS", 0, DueCounts(1, 0, 2)),
+    ]
+    app, backend = make_app(
+        tmp_path,
+        decks=decks,
+        syncer=lambda _profile: SyncOutcome(True, "Synced."),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DeckScreen)
+        await pilot.press("tab", "j")
+
+        app.syncing = True
+        app._finish_sync(app._run_sync())
+        await pilot.pause()
+
+        assert backend.is_open is True
+        assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3]
+        view = screen.query_one("#decks")
+        assert screen.query("DeckItem")[view.index].deck.id == 2
 
 
 @pytest.mark.asyncio
@@ -406,7 +576,7 @@ async def test_aws_and_unknown_templates_remain_complete_in_tiny_flow(
 
 @pytest.mark.asyncio
 async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> None:
-    preferences = SectionPreferences(tmp_path / "preferences.json")
+    preferences = JsonPreferences(tmp_path / "preferences.json")
     identity = japanese_card().identity
     preferences.set_mode(identity, "back:heading:mnemonic", SectionMode.FOLD)
     preferences.set_mode(identity, "back:heading:examples", SectionMode.HIDE)
@@ -441,7 +611,7 @@ async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> 
 
 @pytest.mark.asyncio
 async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_path) -> None:
-    preferences = SectionPreferences(tmp_path / "preferences.json")
+    preferences = JsonPreferences(tmp_path / "preferences.json")
     content = japanese_card()
     app, _ = make_app(tmp_path, content, preferences)
 
@@ -479,7 +649,7 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
 async def test_jk_select_folded_rows_and_space_expands_only_the_selected_one(
     tmp_path,
 ) -> None:
-    preferences = SectionPreferences(tmp_path / "preferences.json")
+    preferences = JsonPreferences(tmp_path / "preferences.json")
     content = japanese_card()
     preferences.set_mode(
         content.identity, "back:heading:mnemonic", SectionMode.FOLD
@@ -595,7 +765,7 @@ class FailingBackend(FakeBackend):
 async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
     backend = FailingBackend()
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
-    app = RepetuiApp(backend, profile, SectionPreferences(tmp_path / "prefs.json"))
+    app = RepetuiApp(backend, profile, JsonPreferences(tmp_path / "prefs.json"))
 
     async with app.run_test(size=(20, 6)):
         screen = app.screen

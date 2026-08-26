@@ -60,9 +60,9 @@ class FakeScheduler:
         parent = SimpleNamespace(
             name="Languages",
             deck_id=1,
-            new_count=0,
-            learn_count=0,
-            review_count=0,
+            new_count=3,
+            learn_count=4,
+            review_count=5,
             children=[child],
         )
         self.tree = SimpleNamespace(name="", children=[parent])
@@ -119,7 +119,7 @@ def backend() -> tuple[AnkiBackend, FakeCollection]:
     return service, collection
 
 
-def test_flattens_nested_decks_with_counts() -> None:
+def test_flattens_nested_decks_with_aggregate_parent_counts() -> None:
     service, _ = backend()
 
     decks = service.decks()
@@ -128,6 +128,8 @@ def test_flattens_nested_decks_with_counts() -> None:
         ("Languages", 0),
         ("Languages::Japanese", 1),
     ]
+    assert decks[0].counts == DueCounts(new=3, learning=4, review=5)
+    assert decks[0].counts.total == 12
     assert decks[1].counts == DueCounts(new=3, learning=4, review=5)
     assert decks[1].counts.total == 12
 
