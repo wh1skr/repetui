@@ -6,6 +6,8 @@ Anki collection.
 > Early development: the interface and installation flow may change before the
 > first public release.
 
+See the [changelog](CHANGELOG.md) for brief release updates.
+
 ## MVP
 
 - Browse decks and current due counts in panes as small as roughly 40×6.
@@ -19,9 +21,11 @@ the first release.
 
 ## Terminal-first interface
 
-The deck list keeps each deck path, total due count, and the familiar coloured
-New/Learning/Review split on one row. As a pane narrows, the split disappears
-before the total so the deck identity remains useful.
+The deck list is a persistent compact tree. Parent decks start collapsed; use
+`Tab` to expand or collapse the selected parent, `j`/`k` to move, and `Enter`
+to review either a parent or leaf. Each row keeps its total due count and the
+familiar coloured New/Learning/Review split. As a pane narrows, the split
+disappears before the total so the selected deck identity remains useful.
 
 During review, `Enter` reveals a card and then answers Good. Use `1`–`4` for
 Again, Hard, Good, and Easy; `j`/`k` and `g`/`G` scroll long cards. Press `?` on

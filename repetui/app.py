@@ -14,10 +14,12 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import ListItem, ListView, Static
 
+from . import __version__
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
 from .config import ProfilePaths
+from .deck_tree import VisibleDeckRow, visible_deck_rows
 from .flow import SectionState, compose_ratings, compose_review, section_name
-from .preferences import Preferences, SectionMode, SectionPreferences
+from .preferences import JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
 from .sync import SyncOutcome, sync_profile
 
@@ -47,6 +49,7 @@ class HelpScreen(Screen[None]):
                     "  q        quit\n\n"
                     "decks\n"
                     "  j / k    move\n"
+                    "  tab      expand / collapse\n"
                     "  enter    review\n"
                     "  s        sync\n"
                     "  counts   total  new/learning/review\n\n"
@@ -100,24 +103,34 @@ class ErrorScreen(Screen[None]):
         )
 
 
-def _deck_identity(name: str, width: int) -> Text:
-    """Keep the most specific end of a hierarchical deck path visible."""
-    parts = name.split("::")
-    candidates = [" › ".join(parts)]
-    candidates.extend(
-        f"… › {' › '.join(parts[-tail:])}" for tail in range(len(parts) - 1, 0, -1)
-    )
-    for candidate in candidates:
+def _deck_identity_candidates(row: VisibleDeckRow) -> tuple[str, ...]:
+    marker = "▾ " if row.expanded else "▸ " if row.is_parent else ""
+    trail = "> " * row.deck.depth
+    leaf_name = row.deck.leaf_name
+    candidates = [f"{trail}{marker}{leaf_name}"]
+    if marker:
+        candidates.append(f"{marker}{leaf_name}")
+    if trail:
+        candidates.append(f"… {leaf_name}")
+    candidates.append(leaf_name)
+    return tuple(candidates)
+
+
+def _deck_identity(row: VisibleDeckRow, width: int) -> Text:
+    """Keep the tree state and leaf identity useful as width disappears."""
+    leaf_name = row.deck.leaf_name
+    for candidate in _deck_identity_candidates(row):
         if cell_len(candidate) <= width:
             return Text(candidate, style="#e7e1d8", no_wrap=True)
 
-    leaf = Text(parts[-1], style="#e7e1d8", no_wrap=True)
+    leaf = Text(leaf_name, style="#e7e1d8", no_wrap=True)
     leaf.truncate(max(width, 0), overflow="ellipsis")
     return leaf
 
 
-def compose_deck_row(deck: Deck, width: int) -> Text:
+def compose_deck_row(row: VisibleDeckRow, width: int) -> Text:
     """Compose one exact-width-aware deck row with predictably shed metadata."""
+    deck = row.deck
     counts = deck.counts
     total = Text(str(counts.total), style="bold #d8d3ca", no_wrap=True)
     full_counts = total.copy()
@@ -128,16 +141,15 @@ def compose_deck_row(deck: Deck, width: int) -> Text:
     full_counts.append("/", style="#817d76")
     full_counts.append(str(counts.review), style="#79c98b")
 
-    leaf_width = cell_len(deck.leaf_name)
-    useful_identity = min(8, max(4, leaf_width))
+    complete_identity_width = cell_len(_deck_identity_candidates(row)[0])
     right = Text()
-    if width >= useful_identity + 2 + full_counts.cell_len:
+    if width >= complete_identity_width + 2 + full_counts.cell_len:
         right = full_counts
-    elif width >= useful_identity + 2 + total.cell_len:
+    elif width >= complete_identity_width + 2 + total.cell_len:
         right = total
 
     identity_width = max(0, width - right.cell_len - (2 if right else 0))
-    identity = _deck_identity(deck.name, identity_width)
+    identity = _deck_identity(row, identity_width)
     result = identity.copy()
     if right:
         result.append(" " * max(2, width - identity.cell_len - right.cell_len))
@@ -146,9 +158,13 @@ def compose_deck_row(deck: Deck, width: int) -> Text:
 
 
 class DeckItem(ListItem):
-    def __init__(self, deck: Deck) -> None:
+    def __init__(self, row: VisibleDeckRow) -> None:
         super().__init__()
-        self.deck = deck
+        self.row = row
+
+    @property
+    def deck(self) -> Deck:
+        return self.row.deck
 
     def compose(self) -> ComposeResult:
         yield Static(classes="deck-row")
@@ -160,19 +176,29 @@ class DeckItem(ListItem):
         self._refresh_counts(self.size.width)
 
     def _refresh_counts(self, width: int) -> None:
-        self.query_one(".deck-row", Static).update(compose_deck_row(self.deck, width))
+        self.query_one(".deck-row", Static).update(compose_deck_row(self.row, width))
+
+    def flash_selection(self) -> None:
+        """Give a leaf brief row-only feedback without adding interface chrome."""
+        self.add_class("-leaf-feedback")
+        self.set_timer(0.15, lambda: self.remove_class("-leaf-feedback"))
 
 
 class DeckScreen(Screen[None]):
     BINDINGS = [
         Binding("j", "down", "Down", show=False),
         Binding("k", "up", "Up", show=False),
+        Binding("tab", "toggle_deck", "Expand/collapse", show=False),
         Binding("s", "sync", "Sync", show=False),
     ]
 
+    @property
+    def repetui(self) -> RepetuiApp:
+        return cast("RepetuiApp", self.app)
+
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static("decks", id="deck-header"),
+            Static(f"decks · repetui {__version__}", id="deck-header"),
             ListView(id="decks"),
             id="deck-layout",
         )
@@ -181,13 +207,33 @@ class DeckScreen(Screen[None]):
         self.reload()
         self.query_one(ListView).focus()
 
-    def reload(self) -> None:
+    def reload(self, selected_deck_id: int | None = None) -> None:
         view = self.query_one("#decks", ListView)
+        old_index = view.index or 0
+        if selected_deck_id is None and view.index is not None:
+            children = list(view.children)
+            if 0 <= view.index < len(children) and isinstance(
+                children[view.index], DeckItem
+            ):
+                selected_deck_id = children[view.index].deck.id
+
+        rows = visible_deck_rows(
+            self.repetui.backend.decks(),
+            self.repetui.preferences.expanded_deck_ids(self.repetui.profile),
+        )
         view.clear()
-        for deck in cast("RepetuiApp", self.app).backend.decks():
-            view.append(DeckItem(deck))
-        if view.children:
-            view.index = 0
+        for row in rows:
+            view.append(DeckItem(row))
+        if rows:
+            selected_index = next(
+                (
+                    index
+                    for index, row in enumerate(rows)
+                    if row.deck.id == selected_deck_id
+                ),
+                min(old_index, len(rows) - 1),
+            )
+            view.index = selected_index
 
     def backend_refreshed(self) -> None:
         self.reload()
@@ -197,6 +243,23 @@ class DeckScreen(Screen[None]):
 
     def action_up(self) -> None:
         self.query_one(ListView).action_cursor_up()
+
+    def action_toggle_deck(self) -> None:
+        view = self.query_one(ListView)
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return
+        item = view.children[view.index]
+        if not isinstance(item, DeckItem):
+            return
+        if not item.row.is_parent:
+            item.flash_selection()
+            return
+        self.repetui.preferences.set_deck_expanded(
+            self.repetui.profile,
+            item.deck.id,
+            expanded=not item.row.expanded,
+        )
+        self.reload(selected_deck_id=item.deck.id)
 
     def action_sync(self) -> None:
         cast("RepetuiApp", self.app).action_sync()
@@ -587,7 +650,7 @@ class ReviewScreen(Screen[None]):
 
 
 class RepetuiApp(App[None]):
-    TITLE = "repetui"
+    TITLE = f"repetui {__version__}"
     CSS = """
     Screen {
         background: #111416;
@@ -620,6 +683,10 @@ class RepetuiApp(App[None]):
 
     DeckItem:hover, DeckItem.-highlight {
         background: #293034;
+    }
+
+    DeckItem.-leaf-feedback {
+        background: #465158;
     }
 
     .deck-row {
@@ -729,7 +796,7 @@ class RepetuiApp(App[None]):
         super().__init__()
         self.backend = backend
         self.profile = profile
-        self.preferences = preferences if preferences is not None else SectionPreferences()
+        self.preferences = preferences if preferences is not None else JsonPreferences()
         self.syncer = syncer
         self.syncing = False
 

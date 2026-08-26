@@ -63,3 +63,12 @@ after reveal.
 - A user may explicitly show, fold, or hide sections for one stable Anki note
   type and card template.
 - Opening a fold during a review is temporary and never changes its saved mode.
+
+### Deck Tree
+
+The main menu is a compact tree rather than a flat deck path list. Parent decks
+start collapsed for each profile, and expanded parent IDs persist by stable
+Anki deck ID. `Tab` toggles the selected parent without moving the selection;
+leaf decks give only a brief selection flash. Depth uses a spaced `>` trail,
+with `▸` and `▾` indicating collapsed and expanded parents. Counts degrade
+before deck identity when the terminal narrows.
