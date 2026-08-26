@@ -1,5 +1,6 @@
 from repetui.backend import DueCounts
-from repetui.flow import SectionState, compose_review
+from repetui.controls import ReviewAction, ReviewControls
+from repetui.flow import SectionState, compose_ratings, compose_review
 from repetui.preferences import SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
@@ -100,3 +101,13 @@ def test_expanded_inline_label_does_not_repeat_its_heading() -> None:
 
     assert "▾ Meaning\nStylish" in revealed
     assert "▾ Meaning\nMeaning:" not in revealed
+
+
+def test_rating_row_uses_current_bindings_and_marks_unbound_actions() -> None:
+    controls = ReviewControls.defaults().with_binding(
+        ReviewAction.AGAIN, "2", replace=True
+    )
+
+    result = compose_ratings(40, controls)
+
+    assert result.plain == "2 again  - hard  3 good  4 easy"

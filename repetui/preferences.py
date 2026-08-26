@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import ProfilePaths
+from .controls import ReviewControls
 from .presentation import CardTemplateIdentity
 
 
@@ -32,6 +33,12 @@ class Preferences(Protocol):
 
     def set_deck_expanded(
         self, profile: ProfilePaths, deck_id: int, *, expanded: bool
+    ) -> None: ...
+
+    def review_controls(self, profile: ProfilePaths) -> ReviewControls: ...
+
+    def set_review_controls(
+        self, profile: ProfilePaths, controls: ReviewControls
     ) -> None: ...
 
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode: ...
@@ -118,6 +125,24 @@ class JsonPreferences:
         saved_profile["expanded_deck_ids"] = sorted(expanded_ids)
         self._save()
 
+    def review_controls(self, profile: ProfilePaths) -> ReviewControls:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        return ReviewControls.from_saved(saved_profile.get("review_controls", {}))
+
+    def set_review_controls(
+        self, profile: ProfilePaths, controls: ReviewControls
+    ) -> None:
+        profiles = {key: dict(value) for key, value in self._profiles.items()}
+        profile_key = self._profile_key(profile)
+        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
+        overrides = controls.saved_overrides()
+        if overrides:
+            saved_profile["review_controls"] = overrides
+        else:
+            saved_profile.pop("review_controls", None)
+        self._write_document(self._templates, profiles)
+        self._profiles = profiles
+
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode:
         template = self._templates.get(self._template_key(identity), {})
         sections = template.get("sections", {})
@@ -154,11 +179,18 @@ class JsonPreferences:
         self._save()
 
     def _save(self) -> None:
+        self._write_document(self._templates, self._profiles)
+
+    def _write_document(
+        self,
+        templates: dict[str, dict[str, object]],
+        profiles: dict[str, dict[str, object]],
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         document = {
             "version": self.VERSION,
-            "profiles": self._profiles,
-            "templates": self._templates,
+            "profiles": profiles,
+            "templates": templates,
         }
         temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
         temporary.write_text(
