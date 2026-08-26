@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from rich.cells import cell_len
 from rich.text import Text
 
-from .backend import DueCounts
+from .backend import DueCounts, ReviewQueue
+from .controls import ReviewAction, ReviewControls
 from .preferences import SectionMode
 from .presentation import CardPresentation, PresentationSection
 
@@ -71,57 +72,85 @@ def _header(
     deck_name: str,
     counts: DueCounts,
     width: int,
+    current_queue: ReviewQueue | None,
 ) -> Text:
     """Build the first Flow line, shedding metadata before card content."""
     front, multiple_front_blocks = _front_content(presentation)
+    first_front, _, remaining_front = front.partition("\n")
+    split = f"{counts.new}/{counts.learning}/{counts.review}"
     optional = {
         "deck": deck_name,
-        "split": f"{counts.new}/{counts.learning}/{counts.review}",
-        "total": str(counts.total),
         "template": "" if multiple_front_blocks else presentation.identity.template_name,
+        "total": str(counts.total),
     }
 
-    def lengths() -> int:
-        left = front + (f"  · {optional['template']}" if optional["template"] else "")
-        right = "  ".join(
-            value for key in ("deck", "total", "split") if (value := optional[key])
+    def right_text() -> Text:
+        result = Text()
+        if visible_deck := optional["deck"]:
+            result.append(visible_deck, style="#817d76")
+            result.append("  ")
+        if total := optional["total"]:
+            result.append(total, style="#aaa49b")
+            result.append(" ")
+        new, learning, review = split.split("/")
+        result.append(
+            new,
+            style=(
+                "#68a8df underline"
+                if current_queue is ReviewQueue.NEW
+                else "#68a8df"
+            ),
         )
-        return cell_len(left) + (2 + cell_len(right) if right else 0)
+        result.append("/", style="#817d76")
+        result.append(
+            learning,
+            style=(
+                "#dc6b72 underline"
+                if current_queue is ReviewQueue.LEARNING
+                else "#dc6b72"
+            ),
+        )
+        result.append("/", style="#817d76")
+        result.append(
+            review,
+            style=(
+                "#79c98b underline"
+                if current_queue is ReviewQueue.REVIEW
+                else "#79c98b"
+            ),
+        )
+        return result
 
-    if "\n" in front:
-        optional = dict.fromkeys(optional, "")
-    else:
-        for name in ("deck", "split", "total", "template"):
-            if lengths() <= max(width, 1):
-                break
-            optional[name] = ""
+    def first_row_width() -> int:
+        left = first_front + (
+            f"  · {optional['template']}" if optional["template"] else ""
+        )
+        right = right_text()
+        return cell_len(left) + (2 + right.cell_len if left else right.cell_len)
 
-    result = Text(front, style="bold #eee9e0", overflow="fold")
+    width = max(width, 1)
+    for name in ("deck", "template", "total"):
+        if first_row_width() <= width:
+            break
+        optional[name] = ""
+
+    if first_row_width() > width:
+        remaining_front = front
+        first_front = ""
+
+    result = Text(first_front, style="bold #eee9e0", overflow="fold")
     if template := optional["template"]:
         result.append(f"  · {template}", style="#817d76")
 
-    right_parts: list[Text] = []
-    if visible_deck := optional["deck"]:
-        right_parts.append(Text(visible_deck, style="#817d76"))
-    if total := optional["total"]:
-        right_parts.append(Text(total, style="bold #d8d3ca"))
-    if split := optional["split"]:
-        split_text = Text()
-        new, learning, review = split.split("/")
-        split_text.append(new, style="#68a8df")
-        split_text.append("/", style="#817d76")
-        split_text.append(learning, style="#dc6b72")
-        split_text.append("/", style="#817d76")
-        split_text.append(review, style="#79c98b")
-        right_parts.append(split_text)
-    if right_parts:
-        right_width = sum(cell_len(part.plain) for part in right_parts)
-        right_width += 2 * (len(right_parts) - 1)
-        result.append(" " * max(2, width - cell_len(result.plain) - right_width))
-        for index, part in enumerate(right_parts):
-            if index:
-                result.append("  ")
-            result.append_text(part)
+    right = right_text()
+    right_width = right.cell_len
+    minimum_gap = 2 if result.plain else 0
+    result.append(" " * max(minimum_gap, width - cell_len(result.plain) - right_width))
+    result.append_text(right)
+
+    if remaining_front:
+        result.append("\n")
+        result.append(remaining_front, style="bold #eee9e0")
     return result
 
 
@@ -198,27 +227,49 @@ def compose_review(
     *,
     revealed: bool,
     sections: tuple[SectionState, ...] = (),
+    current_queue: ReviewQueue | None = None,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
-    result = _header(presentation, deck_name, counts, width)
+    result = _header(presentation, deck_name, counts, width, current_queue)
     if revealed:
         result.append("\n")
         result.append_text(_back(sections))
     return result
 
 
-def compose_ratings(width: int) -> Text:
+def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:
     """Keep all four Anki choices on one row at normal and tiny widths."""
-    compact = width < 34
-    labels = ("1A", "2H", "3G", "4E") if compact else (
-        "1 again",
-        "2 hard",
-        "3 good",
-        "4 easy",
+    controls = controls or ReviewControls.defaults()
+    choices = (
+        (ReviewAction.AGAIN, "again", "A", "#dc6b72"),
+        (ReviewAction.HARD, "hard", "H", "#d7b85a"),
+        (ReviewAction.GOOD, "good", "G", "#79c98b"),
+        (ReviewAction.EASY, "easy", "E", "#68a8df"),
+    )
+    keys = [
+        controls.binding(action) or "-"
+        for action, _label, _short, _colour in choices
+    ]
+    full_labels = [
+        f"{key} {label}"
+        for key, (_action, label, _short, _colour) in zip(
+            keys, choices, strict=True
+        )
+    ]
+    compact = sum(cell_len(label) for label in full_labels) + 6 > width
+    labels = (
+        [
+            f"{key[:3]}{short}"
+            for key, (_action, _label, short, _colour) in zip(
+                keys, choices, strict=True
+            )
+        ]
+        if compact
+        else full_labels
     )
     result = Text()
     for index, (label, colour) in enumerate(
-        zip(labels, ("#dc6b72", "#d7b85a", "#79c98b", "#68a8df"), strict=True)
+        zip(labels, (choice[3] for choice in choices), strict=True)
     ):
         if index:
             result.append("  ")

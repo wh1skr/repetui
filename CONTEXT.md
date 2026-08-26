@@ -57,8 +57,9 @@ permanent help line competes with card content. Ratings consume one row only
 after reveal.
 
 - Card content always wraps and remains scrollable.
-- Metadata disappears in this order as width shrinks: deck, split counts,
-  total due, then template name. Prompt content then wraps without truncation.
+- Metadata disappears in this order as width shrinks: deck, template name,
+  then total due. The coloured split stays on row one whenever it physically
+  fits, and prompt content then wraps below without truncation.
 - Every detected answer section is shown by default.
 - A user may explicitly show, fold, or hide sections for one stable Anki note
   type and card template.

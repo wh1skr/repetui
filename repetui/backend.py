@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -56,10 +57,26 @@ class Deck:
         return self.name.rsplit("::", 1)[-1]
 
 
+class ReviewQueue(str, Enum):
+    """The Anki scheduler queue that supplied the current review card."""
+
+    NEW = "new"
+    LEARNING = "learning"
+    REVIEW = "review"
+
+
+_ANKI_REVIEW_QUEUES = {
+    0: ReviewQueue.NEW,
+    1: ReviewQueue.LEARNING,
+    2: ReviewQueue.REVIEW,
+}
+
+
 @dataclass(frozen=True)
 class ReviewCard:
     id: int
     presentation: CardPresentation
+    queue: ReviewQueue | None = None
 
     @property
     def identity(self) -> CardTemplateIdentity:
@@ -173,7 +190,11 @@ class AnkiBackend:
             back_av=_av_references(rendered.answer_av_tags),
         )
         self._current = (card, queued_card.states)
-        return ReviewCard(id=card.id, presentation=present_card(raw_content))
+        return ReviewCard(
+            id=card.id,
+            presentation=present_card(raw_content),
+            queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
+        )
 
     def answer(self, rating: int) -> None:
         collection = self._require_collection()
@@ -203,3 +224,36 @@ class AnkiBackend:
         )
         collection.sched.answer_card(answer)
         self._current = None
+
+    def undo(self) -> bool:
+        collection = self._require_collection()
+        if not collection.undo_status().undo:
+            return False
+        collection.undo()
+        self._current = None
+        return True
+
+    def bury_current(self) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to bury.")
+        card, _states = self._current
+        collection.sched.bury_cards([card.id])
+        self._current = None
+
+    def suspend_current(self) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to suspend.")
+        card, _states = self._current
+        collection.sched.suspend_cards([card.id])
+        self._current = None
+
+    def set_current_flag(self, flag: int) -> None:
+        collection = self._require_collection()
+        if self._current is None:
+            raise BackendError("There is no current card to flag.")
+        if flag not in range(8):
+            raise ValueError("Flag must be between 0 and 7.")
+        card, _states = self._current
+        collection.set_user_flag_for_cards(flag, [card.id])
