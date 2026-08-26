@@ -1,4 +1,6 @@
-from repetui.backend import DueCounts
+import pytest
+
+from repetui.backend import DueCounts, ReviewQueue
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.flow import SectionState, compose_ratings, compose_review
 from repetui.preferences import SectionMode
@@ -96,6 +98,34 @@ def test_review_count_cluster_keeps_neutral_total_and_anki_split_colours() -> No
     assert ("9", "#68a8df") in styled_fragments
     assert ("5", "#dc6b72") in styled_fragments
     assert ("114", "#79c98b") in styled_fragments
+
+
+@pytest.mark.parametrize(
+    ("queue", "underlined_count"),
+    [
+        (ReviewQueue.NEW, "9"),
+        (ReviewQueue.LEARNING, "5"),
+        (ReviewQueue.REVIEW, "114"),
+    ],
+)
+def test_current_queue_underlines_only_its_count(
+    queue: ReviewQueue, underlined_count: str
+) -> None:
+    result = compose_review(
+        real_kanji_presentation(),
+        "Japanese",
+        DueCounts(9, 5, 114),
+        40,
+        revealed=False,
+        current_queue=queue,
+    )
+    underlined = [
+        result.plain[span.start : span.end]
+        for span in result.spans
+        if "underline" in str(span.style)
+    ]
+
+    assert underlined == [underlined_count]
 
 
 def test_expanded_inline_label_does_not_repeat_its_heading() -> None:

@@ -726,6 +726,7 @@ class ReviewScreen(Screen[None]):
             self._rendered_card_width,
             revealed=self.revealed,
             sections=self._section_states() if self.revealed else (),
+            current_queue=self.card.queue,
         )
         if self.revealed:
             actions.update(

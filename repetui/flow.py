@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from rich.cells import cell_len
 from rich.text import Text
 
-from .backend import DueCounts
+from .backend import DueCounts, ReviewQueue
 from .controls import ReviewAction, ReviewControls
 from .preferences import SectionMode
 from .presentation import CardPresentation, PresentationSection
@@ -72,6 +72,7 @@ def _header(
     deck_name: str,
     counts: DueCounts,
     width: int,
+    current_queue: ReviewQueue | None,
 ) -> Text:
     """Build the first Flow line, shedding metadata before card content."""
     front, multiple_front_blocks = _front_content(presentation)
@@ -92,11 +93,32 @@ def _header(
             result.append(total, style="#aaa49b")
             result.append(" ")
         new, learning, review = split.split("/")
-        result.append(new, style="#68a8df")
+        result.append(
+            new,
+            style=(
+                "#68a8df underline"
+                if current_queue is ReviewQueue.NEW
+                else "#68a8df"
+            ),
+        )
         result.append("/", style="#817d76")
-        result.append(learning, style="#dc6b72")
+        result.append(
+            learning,
+            style=(
+                "#dc6b72 underline"
+                if current_queue is ReviewQueue.LEARNING
+                else "#dc6b72"
+            ),
+        )
         result.append("/", style="#817d76")
-        result.append(review, style="#79c98b")
+        result.append(
+            review,
+            style=(
+                "#79c98b underline"
+                if current_queue is ReviewQueue.REVIEW
+                else "#79c98b"
+            ),
+        )
         return result
 
     def first_row_width() -> int:
@@ -205,9 +227,10 @@ def compose_review(
     *,
     revealed: bool,
     sections: tuple[SectionState, ...] = (),
+    current_queue: ReviewQueue | None = None,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
-    result = _header(presentation, deck_name, counts, width)
+    result = _header(presentation, deck_name, counts, width, current_queue)
     if revealed:
         result.append("\n")
         result.append_text(_back(sections))

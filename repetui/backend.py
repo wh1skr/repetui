@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -56,10 +57,26 @@ class Deck:
         return self.name.rsplit("::", 1)[-1]
 
 
+class ReviewQueue(str, Enum):
+    """The Anki scheduler queue that supplied the current review card."""
+
+    NEW = "new"
+    LEARNING = "learning"
+    REVIEW = "review"
+
+
+_ANKI_REVIEW_QUEUES = {
+    0: ReviewQueue.NEW,
+    1: ReviewQueue.LEARNING,
+    2: ReviewQueue.REVIEW,
+}
+
+
 @dataclass(frozen=True)
 class ReviewCard:
     id: int
     presentation: CardPresentation
+    queue: ReviewQueue | None = None
 
     @property
     def identity(self) -> CardTemplateIdentity:
@@ -173,7 +190,11 @@ class AnkiBackend:
             back_av=_av_references(rendered.answer_av_tags),
         )
         self._current = (card, queued_card.states)
-        return ReviewCard(id=card.id, presentation=present_card(raw_content))
+        return ReviewCard(
+            id=card.id,
+            presentation=present_card(raw_content),
+            queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
+        )
 
     def answer(self, rating: int) -> None:
         collection = self._require_collection()

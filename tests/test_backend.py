@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from repetui.backend import AnkiBackend, DueCounts
+from repetui.backend import AnkiBackend, DueCounts, ReviewQueue
 
 
 class FakeRendered:
@@ -80,7 +80,9 @@ class FakeScheduler:
         self.queue_calls += 1
         if self.queue_calls > 1:
             return SimpleNamespace(cards=[])
-        queued = SimpleNamespace(card=SimpleNamespace(id=99), states="states")
+        queued = SimpleNamespace(
+            card=SimpleNamespace(id=99), states="states", queue=1
+        )
         return SimpleNamespace(cards=[queued])
 
     def build_answer(self, *, card, states, rating):
@@ -167,6 +169,7 @@ def test_review_uses_anki_rendering_and_scheduler() -> None:
     assert card.identity.note_type_name == "Basic"
     assert card.identity.template_ordinal == 0
     assert card.identity.template_name == "Card 1"
+    assert card.queue is ReviewQueue.LEARNING
 
     service.answer(3)
 
