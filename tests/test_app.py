@@ -20,6 +20,7 @@ from repetui.app import (
 )
 from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
+from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
 from repetui.preferences import JsonPreferences, SectionMode
 from repetui.presentation import (
@@ -482,6 +483,29 @@ async def test_undo_restores_the_final_rated_card_and_refreshes_counts(tmp_path)
         assert review.card is not None
         assert review.revealed is False
         assert backend.count_calls > count_calls_before
+
+
+@pytest.mark.asyncio
+async def test_saved_review_binding_routes_immediately_after_app_start(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    controls = ReviewControls.defaults().with_binding(ReviewAction.UNDO, "z")
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    preferences.set_review_controls(profile, controls)
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+
+        await pilot.press("u")
+        assert app.screen is review
+        assert backend.undo_calls == 0
+
+        await pilot.press("z")
+        assert isinstance(app.screen, OperationStatusPill)
+        assert backend.undo_calls == 1
 
 
 @pytest.mark.asyncio
@@ -993,8 +1017,9 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
 
         await pilot.press("l")
         assert settings.query_one("#settings-sections").display is False
-        assert settings.query_one("#settings-keys").display is True
-        assert "enter" in str(settings.query_one("#settings-key-text").render())
+        assert settings.query_one("#settings-controls").display is True
+        first_control = settings.query_one("#settings-controls").children[0]
+        assert str(first_control.query_one(".control-binding").render()) == "enter"
 
         await pilot.press("escape")
         review = app.screen
@@ -1002,6 +1027,184 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
         await pilot.press("enter")
         assert "› Reading" in rendered_text(review)
         assert "そう" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_path) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "l")
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+
+        controls = settings.query_one("#settings-controls")
+        assert controls.display is True
+        assert controls.region == (0, 2, 40, 3)
+        rows = list(controls.children)
+        assert len(rows) == 10
+        rendered_rows = [
+            (
+                str(row.query_one(".control-label").render()),
+                str(row.query_one(".control-binding").render()),
+            )
+            for row in rows
+        ]
+        assert rendered_rows == [
+            ("Reveal / Good", "enter"),
+            ("Again", "1"),
+            ("Hard", "2"),
+            ("Good", "3"),
+            ("Easy", "4"),
+            ("Undo", "u"),
+            ("Bury", "b"),
+            ("Suspend", "x"),
+            ("Flag", "f"),
+            ("Sync", "s"),
+        ]
+        assert settings.query_one("#settings-footer").region == (0, 5, 40, 1)
+
+
+@pytest.mark.asyncio
+async def test_non_conflicting_control_rebind_saves_and_routes_immediately(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "l")
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+        await pilot.press("j", "j", "j", "j", "j", "enter")
+        assert str(settings.query_one("#settings-footer").render()).startswith(
+            "[?] Undo · press key"
+        )
+
+        await pilot.press("z")
+
+        undo_row = settings.query_one("#settings-controls").children[5]
+        assert str(undo_row.query_one(".control-binding").render()) == "z"
+        assert preferences.review_controls(app.profile).binding(ReviewAction.UNDO) == "z"
+
+        await pilot.press("escape", "enter", "3", "z")
+        assert isinstance(app.screen, OperationStatusPill)
+        assert backend.undo_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_control_conflict_requires_confirmation_and_leaves_displaced_unbound(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "l")
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+        await pilot.press("j", "j", "j", "j", "j", "enter", "b")
+
+        assert "b = Bury" in str(settings.query_one("#settings-footer").render())
+        assert app.review_controls == ReviewControls.defaults()
+
+        await pilot.press("n")
+        assert app.review_controls == ReviewControls.defaults()
+
+        await pilot.press("enter", "b", "y")
+
+        assert app.review_controls.binding(ReviewAction.UNDO) == "b"
+        assert app.review_controls.binding(ReviewAction.BURY) is None
+        rows = settings.query_one("#settings-controls").children
+        assert str(rows[5].query_one(".control-binding").render()) == "b"
+        assert str(rows[6].query_one(".control-binding").render()) == "unbound"
+
+        await pilot.press("escape", "b")
+        assert isinstance(app.screen, OperationStatusPill)
+        assert backend.undo_calls == 1
+        assert backend.operations == []
+
+
+@pytest.mark.asyncio
+async def test_backspace_restores_selected_control_default_immediately(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    customized = ReviewControls.defaults().with_binding(ReviewAction.UNDO, "z")
+    preferences.set_review_controls(profile, customized)
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "l", "j", "j", "j", "j", "j")
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+        await pilot.press("backspace")
+
+        assert app.review_controls.binding(ReviewAction.UNDO) == "u"
+        assert preferences.review_controls(profile).binding(ReviewAction.UNDO) == "u"
+
+        await pilot.press("escape", "enter", "3", "z")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert backend.undo_calls == 0
+        await pilot.press("u")
+        assert isinstance(app.screen, OperationStatusPill)
+        assert backend.undo_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fixed_key", ["j", "space"])
+async def test_capture_rejects_fixed_navigation_and_escape_cancels_it(
+    tmp_path, fixed_key
+) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press(
+            "enter", "?", "l", "j", "j", "j", "j", "j", "enter", fixed_key
+        )
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+        assert str(settings.query_one("#settings-footer").render()) == (
+            f"[fixed] {fixed_key} stays navigation"
+        )
+        assert app.review_controls == ReviewControls.defaults()
+
+        await pilot.press("escape")
+        assert app.screen is settings
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "j/k · enter bind · bs default · esc"
+        )
+
+        await pilot.press("escape")
+        assert isinstance(app.screen, ReviewScreen)
+
+
+@pytest.mark.asyncio
+async def test_failed_control_write_preserves_the_active_mapping(
+    tmp_path, monkeypatch
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    original = ReviewControls.defaults().with_binding(ReviewAction.UNDO, "z")
+    preferences.set_review_controls(profile, original)
+    app, _ = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "l", "j", "j", "j", "j", "j", "enter")
+        settings = app.screen
+        assert isinstance(settings, TemplateSettingsScreen)
+
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+        await pilot.press("v")
+
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "[err] controls not saved"
+        )
+        assert app.review_controls == original
+        assert preferences.review_controls(profile) == original
+        undo_row = settings.query_one("#settings-controls").children[5]
+        assert str(undo_row.query_one(".control-binding").render()) == "z"
 
 
 @pytest.mark.asyncio

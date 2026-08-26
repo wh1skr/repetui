@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from repetui.config import ProfilePaths
+from repetui.controls import ReviewAction, ReviewControls
 from repetui.preferences import (
     JsonPreferences,
     SectionMode,
@@ -114,3 +117,71 @@ def test_malformed_saved_deck_ids_are_ignored(tmp_path) -> None:
     preferences = JsonPreferences(path)
 
     assert preferences.expanded_deck_ids(whskr) == frozenset({101})
+
+
+def test_review_controls_survive_restart_and_are_isolated_by_profile(tmp_path) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    work = profile(tmp_path / "Anki2", "work")
+    preferences = JsonPreferences(path)
+    customized = ReviewControls.defaults().with_binding(ReviewAction.UNDO, "z")
+
+    preferences.set_review_controls(whskr, customized)
+
+    restarted = JsonPreferences(path)
+    assert restarted.review_controls(whskr).binding(ReviewAction.UNDO) == "z"
+    assert restarted.review_controls(work) == ReviewControls.defaults()
+
+
+@pytest.mark.parametrize(
+    "saved_controls",
+    (
+        {"undo": "j"},
+        {"undo": "b"},
+        {"unknown": "z"},
+        {"undo": ["z"]},
+    ),
+)
+def test_malformed_or_unsupported_review_controls_fall_back_safely(
+    tmp_path, saved_controls
+) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "templates": {},
+                "profiles": {
+                    str(whskr.collection.resolve()): {
+                        "name": "whskr",
+                        "review_controls": saved_controls,
+                    }
+                },
+            }
+        )
+    )
+
+    assert JsonPreferences(path).review_controls(whskr) == ReviewControls.defaults()
+
+
+def test_failed_review_control_write_preserves_active_and_saved_mapping(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    preferences = JsonPreferences(path)
+    original = ReviewControls.defaults().with_binding(ReviewAction.UNDO, "z")
+    preferences.set_review_controls(whskr, original)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    changed = original.with_binding(ReviewAction.UNDO, "v")
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_review_controls(whskr, changed)
+
+    assert preferences.review_controls(whskr) == original
+    assert JsonPreferences(path).review_controls(whskr) == original

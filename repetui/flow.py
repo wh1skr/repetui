@@ -9,6 +9,7 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from .backend import DueCounts
+from .controls import ReviewAction, ReviewControls
 from .preferences import SectionMode
 from .presentation import CardPresentation, PresentationSection
 
@@ -213,18 +214,39 @@ def compose_review(
     return result
 
 
-def compose_ratings(width: int) -> Text:
+def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:
     """Keep all four Anki choices on one row at normal and tiny widths."""
-    compact = width < 34
-    labels = ("1A", "2H", "3G", "4E") if compact else (
-        "1 again",
-        "2 hard",
-        "3 good",
-        "4 easy",
+    controls = controls or ReviewControls.defaults()
+    choices = (
+        (ReviewAction.AGAIN, "again", "A", "#dc6b72"),
+        (ReviewAction.HARD, "hard", "H", "#d7b85a"),
+        (ReviewAction.GOOD, "good", "G", "#79c98b"),
+        (ReviewAction.EASY, "easy", "E", "#68a8df"),
+    )
+    keys = [
+        controls.binding(action) or "-"
+        for action, _label, _short, _colour in choices
+    ]
+    full_labels = [
+        f"{key} {label}"
+        for key, (_action, label, _short, _colour) in zip(
+            keys, choices, strict=True
+        )
+    ]
+    compact = sum(cell_len(label) for label in full_labels) + 6 > width
+    labels = (
+        [
+            f"{key[:3]}{short}"
+            for key, (_action, _label, short, _colour) in zip(
+                keys, choices, strict=True
+            )
+        ]
+        if compact
+        else full_labels
     )
     result = Text()
     for index, (label, colour) in enumerate(
-        zip(labels, ("#dc6b72", "#d7b85a", "#79c98b", "#68a8df"), strict=True)
+        zip(labels, (choice[3] for choice in choices), strict=True)
     ):
         if index:
             result.append("  ")

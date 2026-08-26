@@ -10,6 +10,7 @@ from typing import Protocol, cast
 
 from rich.cells import cell_len
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -21,6 +22,12 @@ from textual.widgets import ListItem, ListView, Static
 from . import __version__
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
 from .config import ProfilePaths
+from .controls import (
+    DEFAULT_REVIEW_BINDINGS,
+    BindingConflict,
+    ReviewAction,
+    ReviewControls,
+)
 from .deck_tree import VisibleDeckRow, visible_deck_rows
 from .flow import SectionState, compose_ratings, compose_review, section_name
 from .preferences import JsonPreferences, Preferences, SectionMode
@@ -84,7 +91,7 @@ class HelpScreen(Screen[None]):
                     "  s        sync\n"
                     "  esc      decks\n\n"
                     "template settings\n"
-                    "  h / l    sections / keys\n"
+                    "  h / l    sections / controls\n"
                     "  j / k    select / scroll\n"
                     "  space    show → fold → hide\n"
                     "  esc      review"
@@ -319,6 +326,32 @@ class SectionSettingItem(ListItem):
         self.query_one(".setting-mode", Static).update(Text(mode.value, style=colour))
 
 
+class ControlSettingItem(ListItem):
+    """One keyboard-editable review action and its current binding."""
+
+    def __init__(self, action: ReviewAction) -> None:
+        super().__init__()
+        self.action = action
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.action.label, classes="control-label")
+        yield Static(classes="control-binding")
+
+    def refresh_binding(self, controls: ReviewControls) -> None:
+        key = controls.binding(self.action)
+        style = "#d9d5ce" if key is not None else "#dc6b72"
+        self.query_one(".control-binding", Static).update(
+            Text(key or "unbound", style=style, no_wrap=True)
+        )
+
+
+@dataclass(frozen=True)
+class PendingControlBinding:
+    action: ReviewAction
+    key: str
+    conflict: ReviewAction
+
+
 class TemplateSettingsScreen(Screen[None]):
     """A full-screen, tiny-pane-safe surface for one card template."""
 
@@ -331,7 +364,7 @@ class TemplateSettingsScreen(Screen[None]):
         Binding("space", "cycle", "Change", show=False),
         Binding("enter", "cycle", "Change", show=False),
         Binding("h", "sections", "Sections", show=False),
-        Binding("l", "keys", "Keys", show=False),
+        Binding("l", "controls", "Controls", show=False),
         Binding("tab", "toggle_tab", "Next tab", show=False),
     ]
 
@@ -341,6 +374,8 @@ class TemplateSettingsScreen(Screen[None]):
         assert review.card is not None
         self.card = review.card
         self.tab = "sections"
+        self.capturing: ReviewAction | None = None
+        self.pending_binding: PendingControlBinding | None = None
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -362,31 +397,12 @@ class TemplateSettingsScreen(Screen[None]):
                 *(SectionSettingItem(section) for section in self.card.presentation.back.sections),
                 id="settings-sections",
             ),
-            VerticalScroll(
-                Static(
-                    "review\n"
-                    "  enter    reveal / Good\n"
-                    "  1–4      Again / Hard / Good / Easy\n"
-                    "  u        undo\n"
-                    "  b        bury\n"
-                    "  x        suspend\n"
-                    "  f        flag (then 0–7)\n"
-                    "  space    reveal / open selected fold\n"
-                    "  j / k    scroll and select folds\n"
-                    "  g / G    top / bottom\n"
-                    "  s        sync\n"
-                    "  esc      decks\n\n"
-                    "settings\n"
-                    "  h / l    sections / keys\n"
-                    "  j / k    select section\n"
-                    "  space    show → fold → hide\n"
-                    "  esc      return",
-                    id="settings-key-text",
-                ),
-                id="settings-keys",
+            ListView(
+                *(ControlSettingItem(action) for action in ReviewAction),
+                id="settings-controls",
             ),
             Static(
-                "j/k move · space mode · h/l tabs · esc",
+                "j/k · enter bind · bs default · esc",
                 id="settings-footer",
                 classes="surface-footer",
             ),
@@ -396,6 +412,8 @@ class TemplateSettingsScreen(Screen[None]):
     def on_mount(self) -> None:
         for item in self.query(SectionSettingItem):
             item.refresh_mode(self.repetui.preferences, self.card.presentation.identity)
+        for item in self.query(ControlSettingItem):
+            item.refresh_binding(self.repetui.review_controls)
         sections = self.query_one("#settings-sections", ListView)
         if sections.children:
             sections.index = 0
@@ -404,54 +422,63 @@ class TemplateSettingsScreen(Screen[None]):
     def _show_tab(self, tab: str) -> None:
         self.tab = tab
         sections = self.query_one("#settings-sections", ListView)
-        keys = self.query_one("#settings-keys", VerticalScroll)
+        controls = self.query_one("#settings-controls", ListView)
         sections.display = tab == "sections"
-        keys.display = tab == "keys"
+        controls.display = tab == "controls"
         self.query_one("#settings-tabs", Static).update(
-            "[reverse] sections [/reverse]  keys"
+            "[reverse] sections [/reverse]  controls"
             if tab == "sections"
-            else "sections  [reverse] keys [/reverse]"
+            else "sections  [reverse] controls [/reverse]"
         )
-        (sections if tab == "sections" else keys).focus()
+        target = sections if tab == "sections" else controls
+        if target.children and target.index is None:
+            target.index = 0
+        target.focus()
 
     def action_sections(self) -> None:
         self._show_tab("sections")
 
-    def action_keys(self) -> None:
-        self._show_tab("keys")
+    def action_controls(self) -> None:
+        self._show_tab("controls")
 
     def action_toggle_tab(self) -> None:
-        self._show_tab("keys" if self.tab == "sections" else "sections")
+        self._show_tab("controls" if self.tab == "sections" else "sections")
 
     def action_down(self) -> None:
         if self.tab == "sections":
             self.query_one("#settings-sections", ListView).action_cursor_down()
         else:
-            self.query_one("#settings-keys", VerticalScroll).scroll_down(animate=False)
+            self.query_one("#settings-controls", ListView).action_cursor_down()
 
     def action_up(self) -> None:
         if self.tab == "sections":
             self.query_one("#settings-sections", ListView).action_cursor_up()
         else:
-            self.query_one("#settings-keys", VerticalScroll).scroll_up(animate=False)
+            self.query_one("#settings-controls", ListView).action_cursor_up()
 
     def action_top(self) -> None:
         if self.tab == "sections":
             view = self.query_one("#settings-sections", ListView)
-            if view.children:
-                view.index = 0
         else:
-            self.query_one("#settings-keys", VerticalScroll).scroll_home(animate=False)
+            view = self.query_one("#settings-controls", ListView)
+        if view.children:
+            view.index = 0
 
     def action_bottom(self) -> None:
         if self.tab == "sections":
             view = self.query_one("#settings-sections", ListView)
-            if view.children:
-                view.index = len(view.children) - 1
         else:
-            self.query_one("#settings-keys", VerticalScroll).scroll_end(animate=False)
+            view = self.query_one("#settings-controls", ListView)
+        if view.children:
+            view.index = len(view.children) - 1
 
     def action_cycle(self) -> None:
+        if self.tab == "controls":
+            action = self._selected_control_action()
+            if action is not None:
+                self.capturing = action
+                self._show_footer(f"[?] {action.label} · press key · esc cancel")
+            return
         if self.tab != "sections":
             return
         view = self.query_one("#settings-sections", ListView)
@@ -465,7 +492,107 @@ class TemplateSettingsScreen(Screen[None]):
         self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
         item.refresh_mode(self.repetui.preferences, identity)
 
+    def _selected_control_action(self) -> ReviewAction | None:
+        view = self.query_one("#settings-controls", ListView)
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return None
+        item = view.children[view.index]
+        return item.action if isinstance(item, ControlSettingItem) else None
+
+    def _show_footer(self, message: str) -> None:
+        self.query_one("#settings-footer", Static).update(Text(message, no_wrap=True))
+
+    def _show_default_footer(self) -> None:
+        self._show_footer("j/k · enter bind · bs default · esc")
+
+    def _refresh_control_bindings(self) -> None:
+        for item in self.query(ControlSettingItem):
+            item.refresh_binding(self.repetui.review_controls)
+
+    def _apply_review_controls(self, controls: ReviewControls) -> bool:
+        try:
+            self.repetui.save_review_controls(controls)
+        except OSError:
+            self.capturing = None
+            self.pending_binding = None
+            self._show_footer("[err] controls not saved")
+            return False
+        self.capturing = None
+        self.pending_binding = None
+        self._refresh_control_bindings()
+        self._show_default_footer()
+        return True
+
+    def _propose_control_binding(self, action: ReviewAction, key: str) -> None:
+        try:
+            controls = self.repetui.review_controls.with_binding(action, key)
+        except BindingConflict as conflict:
+            self.capturing = None
+            self.pending_binding = PendingControlBinding(action, key, conflict.action)
+            self._show_footer(
+                f"[!] {key} = {conflict.action.label} · y replace · n cancel"
+            )
+            return
+        except ValueError:
+            self._show_footer(f"[fixed] {key} stays navigation")
+            return
+        self._apply_review_controls(controls)
+
+    def on_key(self, event: events.Key) -> None:
+        if self.pending_binding is not None:
+            event.stop()
+            event.prevent_default()
+            key = event.character if event.is_printable else event.key
+            if key == "y":
+                pending = self.pending_binding
+                controls = self.repetui.review_controls.with_binding(
+                    pending.action,
+                    pending.key,
+                    replace=True,
+                )
+                self._apply_review_controls(controls)
+            elif key in {"n", "escape"}:
+                self.pending_binding = None
+                self._show_default_footer()
+            return
+        if self.capturing is None:
+            if self.tab == "controls" and event.key == "enter":
+                event.stop()
+                event.prevent_default()
+                self.action_cycle()
+            elif self.tab == "controls" and event.key == "backspace":
+                event.stop()
+                event.prevent_default()
+                action = self._selected_control_action()
+                if action is not None:
+                    self._propose_control_binding(
+                        action, DEFAULT_REVIEW_BINDINGS[action]
+                    )
+            return
+        event.stop()
+        event.prevent_default()
+        action = self.capturing
+        if event.key == "backspace":
+            self.capturing = None
+            self._propose_control_binding(action, DEFAULT_REVIEW_BINDINGS[action])
+            return
+        key = (
+            event.key
+            if event.key == "space"
+            else event.character if event.is_printable else event.key
+        )
+        if key == "escape":
+            self.capturing = None
+            self._show_default_footer()
+            return
+        self._propose_control_binding(action, key)
+
     def action_back(self) -> None:
+        if self.capturing is not None or self.pending_binding is not None:
+            self.capturing = None
+            self.pending_binding = None
+            self._show_default_footer()
+            return
         self.app.pop_screen()
         self.review.preferences_changed()
 
@@ -482,21 +609,27 @@ class ReviewContent(Static):
 class ReviewScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "back", "Decks", show=False),
-        Binding("enter", "primary", "Reveal/Good", show=False),
+        Binding(
+            "enter",
+            "primary",
+            "Reveal/Good",
+            show=False,
+            id="review.reveal_good",
+        ),
         Binding("space", "toggle_fold", "Reveal/expand", show=False),
-        Binding("1", "again", "Again", show=False),
-        Binding("2", "hard", "Hard", show=False),
-        Binding("3", "good", "Good", show=False),
-        Binding("4", "easy", "Easy", show=False),
-        Binding("u", "undo", "Undo", show=False),
-        Binding("b", "bury", "Bury", show=False),
-        Binding("x", "suspend", "Suspend", show=False),
-        Binding("f", "flag", "Flag", show=False),
+        Binding("1", "again", "Again", show=False, id="review.again"),
+        Binding("2", "hard", "Hard", show=False, id="review.hard"),
+        Binding("3", "good", "Good", show=False, id="review.good"),
+        Binding("4", "easy", "Easy", show=False, id="review.easy"),
+        Binding("u", "undo", "Undo", show=False, id="review.undo"),
+        Binding("b", "bury", "Bury", show=False, id="review.bury"),
+        Binding("x", "suspend", "Suspend", show=False, id="review.suspend"),
+        Binding("f", "flag", "Flag", show=False, id="review.flag"),
         Binding("j", "scroll_down", "Scroll down", show=False),
         Binding("k", "scroll_up", "Scroll up", show=False),
         Binding("g", "scroll_top", "Top", show=False),
         Binding("G", "scroll_bottom", "Bottom", show=False),
-        Binding("s", "sync", "Sync", show=False),
+        Binding("s", "sync", "Sync", show=False, id="review.sync"),
     ]
 
     def __init__(self, deck: Deck) -> None:
@@ -595,7 +728,9 @@ class ReviewScreen(Screen[None]):
             sections=self._section_states() if self.revealed else (),
         )
         if self.revealed:
-            actions.update(compose_ratings(self.size.width))
+            actions.update(
+                compose_ratings(self.size.width, self.repetui.review_controls)
+            )
             actions.display = True
         else:
             actions.display = False
@@ -1056,18 +1191,18 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    #settings-sections, #settings-keys {
+    #settings-sections, #settings-controls {
         height: 1fr;
         background: #111416;
         scrollbar-size-vertical: 1;
     }
 
-    SectionSettingItem {
+    SectionSettingItem, ControlSettingItem {
         height: 1;
         layout: horizontal;
     }
 
-    SectionSettingItem.-highlight {
+    SectionSettingItem.-highlight, ControlSettingItem.-highlight {
         background: #293034;
     }
 
@@ -1082,9 +1217,15 @@ class RepetuiApp(App[None]):
         text-align: right;
     }
 
-    #settings-key-text {
-        height: auto;
-        color: #d9d5ce;
+    .control-label {
+        width: 1fr;
+        height: 1;
+    }
+
+    .control-binding {
+        width: 9;
+        height: 1;
+        text-align: right;
     }
 
     .surface-footer {
@@ -1151,6 +1292,8 @@ class RepetuiApp(App[None]):
         self.backend = backend
         self.profile = profile
         self.preferences = preferences if preferences is not None else JsonPreferences()
+        self.review_controls = self.preferences.review_controls(profile)
+        self.set_keymap(self.review_controls.keymap())
         self.syncer = syncer
         self.syncing = False
         self._sync_origin: Screen[None] | None = None
@@ -1159,6 +1302,12 @@ class RepetuiApp(App[None]):
         self._sync_fatal_error: str | None = None
         self._shutdown_requested = Event()
         self._backend_lock = Lock()
+
+    def save_review_controls(self, controls: ReviewControls) -> None:
+        """Persist and activate one complete profile-scoped review keymap."""
+        self.preferences.set_review_controls(self.profile, controls)
+        self.review_controls = controls
+        self.set_keymap(controls.keymap())
 
     def on_mount(self) -> None:
         try:
