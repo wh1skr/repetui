@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
@@ -74,6 +75,10 @@ class HelpScreen(Screen[None]):
                     "  enter    reveal / Good\n"
                     "  space    reveal / open selected fold\n"
                     "  1–4      Again / Hard / Good / Easy\n"
+                    "  u        undo\n"
+                    "  b        bury\n"
+                    "  x        suspend\n"
+                    "  f        flag (then 0–7)\n"
                     "  j / k    scroll and select folds\n"
                     "  g / G    top / bottom\n"
                     "  s        sync\n"
@@ -362,6 +367,10 @@ class TemplateSettingsScreen(Screen[None]):
                     "review\n"
                     "  enter    reveal / Good\n"
                     "  1–4      Again / Hard / Good / Easy\n"
+                    "  u        undo\n"
+                    "  b        bury\n"
+                    "  x        suspend\n"
+                    "  f        flag (then 0–7)\n"
                     "  space    reveal / open selected fold\n"
                     "  j / k    scroll and select folds\n"
                     "  g / G    top / bottom\n"
@@ -470,6 +479,10 @@ class ReviewScreen(Screen[None]):
         Binding("2", "hard", "Hard", show=False),
         Binding("3", "good", "Good", show=False),
         Binding("4", "easy", "Easy", show=False),
+        Binding("u", "undo", "Undo", show=False),
+        Binding("b", "bury", "Bury", show=False),
+        Binding("x", "suspend", "Suspend", show=False),
+        Binding("f", "flag", "Flag", show=False),
         Binding("j", "scroll_down", "Scroll down", show=False),
         Binding("k", "scroll_up", "Scroll up", show=False),
         Binding("g", "scroll_top", "Top", show=False),
@@ -642,6 +655,98 @@ class ReviewScreen(Screen[None]):
     def action_easy(self) -> None:
         self._rate(4)
 
+    def _show_operation_status(self, message: str, *, success: bool) -> None:
+        self.app.push_screen(OperationStatusPill(message, success=success))
+
+    def action_undo(self) -> None:
+        if self._busy():
+            return
+        try:
+            undone = self.repetui.backend.undo()
+        except Exception:
+            self._show_operation_status("[err] undo failed", success=False)
+            return
+        if not undone:
+            self._show_operation_status("[err] nothing to undo", success=False)
+            return
+        try:
+            self.load_next()
+        except Exception:
+            self._show_refresh_failure(clear_card=True)
+            return
+        self._show_operation_status("[ok] undone", success=True)
+
+    def _show_refresh_failure(self, *, clear_card: bool) -> None:
+        if clear_card:
+            with contextlib.suppress(Exception):
+                self.repetui.backend.begin_review(self.deck.id)
+            self.card = None
+            self.revealed = False
+            self.expanded_sections.clear()
+            self.selected_folded = 0
+            content = Text("review · ", style="#dc6b72")
+            content.append(self.deck.leaf_name, style="bold #eee9e0")
+            content.append("\nCould not refresh cards.", style="#aaa49b")
+            self.query_one("#card", Static).update(content)
+            self.query_one("#review-actions", Static).display = False
+        self._show_operation_status("[err] refresh failed", success=False)
+
+    def _advance_after_operation(
+        self,
+        operation: Callable[[], None],
+        *,
+        success_message: str,
+        failure_message: str,
+    ) -> None:
+        if self._busy():
+            return
+        try:
+            operation()
+        except Exception:
+            self._show_operation_status(failure_message, success=False)
+            return
+        try:
+            self.load_next()
+        except Exception:
+            self._show_refresh_failure(clear_card=True)
+            return
+        self._show_operation_status(success_message, success=True)
+
+    def action_bury(self) -> None:
+        self._advance_after_operation(
+            self.repetui.backend.bury_current,
+            success_message="[ok] buried",
+            failure_message="[err] bury failed",
+        )
+
+    def action_suspend(self) -> None:
+        self._advance_after_operation(
+            self.repetui.backend.suspend_current,
+            success_message="[ok] suspended",
+            failure_message="[err] suspend failed",
+        )
+
+    def action_flag(self) -> None:
+        if self._busy() or self.card is None:
+            return
+        self.app.push_screen(FlagSelectionPill(), self._flag_selected)
+
+    def _flag_selected(self, flag: int | None) -> None:
+        if flag is None:
+            return
+        try:
+            self.repetui.backend.set_current_flag(flag)
+        except Exception:
+            self._show_operation_status("[err] flag failed", success=False)
+            return
+        try:
+            self._refresh_view(reset_scroll=False)
+        except Exception:
+            self._show_refresh_failure(clear_card=False)
+            return
+        message = "[ok] flag clear" if flag == 0 else f"[ok] flag {flag}"
+        self._show_operation_status(message, success=True)
+
     def action_scroll_down(self) -> None:
         folded = self._folded_sections()
         if self.revealed and folded:
@@ -666,11 +771,110 @@ class ReviewScreen(Screen[None]):
         self.repetui.action_sync()
 
 
-class SyncPopup(ModalScreen[bool]):
+class StatusPill(ModalScreen[None]):
+    """Reusable centered one-line terminal status surface."""
+
+    SURFACE_ID = "status-pill"
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            Text(self._message, no_wrap=True),
+            id=self.SURFACE_ID,
+            classes="status-pill",
+        )
+
+    def on_mount(self) -> None:
+        self._fit_surface()
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._fit_surface()
+
+    def _show_message(self, message: str) -> None:
+        self._message = message
+        self.query_one(".status-pill", Static).update(Text(message, no_wrap=True))
+        self._fit_surface()
+
+    def _fit_surface(self) -> None:
+        """Keep padding and surroundings until the state marker needs the cells."""
+        surface = self.query_one(".status-pill", Static)
+        pane_width = max(self.size.width, 1)
+        if pane_width >= 7:
+            horizontal_padding = 1
+            width = min(cell_len(self._message) + 2, pane_width - 2)
+        elif pane_width >= 5:
+            horizontal_padding = 0
+            width = min(cell_len(self._message), pane_width - 2)
+        else:
+            horizontal_padding = 0
+            width = min(cell_len(self._message), pane_width, 3)
+        surface.styles.padding = (0, horizontal_padding)
+        surface.styles.width = max(width, 1)
+
+
+class OperationStatusPill(StatusPill):
+    """Brief review-operation result using the shared status surface."""
+
+    BINDINGS = [
+        Binding("q", "block", show=False, priority=True),
+        Binding("question_mark", "block", show=False, priority=True),
+    ]
+
+    def __init__(self, message: str, *, success: bool) -> None:
+        super().__init__(message)
+        self.success = success
+        self._dismiss_timer: Timer | None = None
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one(".status-pill").add_class("-success" if self.success else "-error")
+        self._dismiss_timer = self.set_timer(1.0, self._dismiss_status)
+
+    def on_unmount(self) -> None:
+        if self._dismiss_timer is not None:
+            self._dismiss_timer.stop()
+            self._dismiss_timer = None
+
+    def action_block(self) -> None:
+        """Keep global shortcuts from leaking through the brief status state."""
+
+    def _dismiss_status(self) -> None:
+        self.dismiss()
+
+
+class FlagSelectionPill(StatusPill):
+    """Compact modal state for clearing or selecting an Anki card flag."""
+
+    BINDINGS = [
+        *(Binding(str(flag), f"select_flag({flag})", show=False) for flag in range(8)),
+        Binding("escape", "cancel", show=False),
+        Binding("q", "block", show=False, priority=True),
+        Binding("question_mark", "block", show=False, priority=True),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__("[?] flag 0–7 · esc")
+
+    def action_select_flag(self, flag: int) -> None:
+        self.dismiss(flag)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_block(self) -> None:
+        """Keep global shortcuts inside the flag-selection state."""
+
+
+class SyncPopup(StatusPill):
     """One modal, terminal-native sync message over the originating screen."""
 
     SPINNER_FRAMES = ("|", "/", "-", "\\")
     SPINNER_INTERVAL = 0.12
+    SURFACE_ID = "sync-popup"
 
     BINDINGS = [
         Binding("q", "block", show=False, priority=True),
@@ -681,24 +885,16 @@ class SyncPopup(ModalScreen[bool]):
     ]
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__("[|] syncing...")
         self._frame_index = 0
         self._spinner_timer: Timer | None = None
         self._dismiss_timer: Timer | None = None
         self._failure_dismissible = False
         self._fatal = False
-        self._message = "[|] syncing..."
-
-    def compose(self) -> ComposeResult:
-        yield Static(Text(self._message, no_wrap=True), id="sync-popup")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self._spinner_timer = self.set_interval(self.SPINNER_INTERVAL, self.advance_spinner)
-        self._fit_surface()
-
-    def on_resize(self) -> None:
-        if self.is_mounted:
-            self._fit_surface()
 
     def on_unmount(self) -> None:
         self._stop_timers()
@@ -735,27 +931,6 @@ class SyncPopup(ModalScreen[bool]):
             )
             self._show_message(message)
             self.query_one("#sync-popup").add_class("-error")
-
-    def _show_message(self, message: str) -> None:
-        self._message = message
-        self.query_one("#sync-popup", Static).update(Text(message, no_wrap=True))
-        self._fit_surface()
-
-    def _fit_surface(self) -> None:
-        """Keep padding and surroundings until the state marker needs the cells."""
-        surface = self.query_one("#sync-popup", Static)
-        pane_width = max(self.size.width, 1)
-        if pane_width >= 7:
-            horizontal_padding = 1
-            width = min(cell_len(self._message) + 2, pane_width - 2)
-        elif pane_width >= 5:
-            horizontal_padding = 0
-            width = min(cell_len(self._message), pane_width - 2)
-        else:
-            horizontal_padding = 0
-            width = min(cell_len(self._message), pane_width, 3)
-        surface.styles.padding = (0, horizontal_padding)
-        surface.styles.width = max(width, 1)
 
     def _stop_spinner(self) -> None:
         if self._spinner_timer is not None:
@@ -911,13 +1086,13 @@ class RepetuiApp(App[None]):
         color: #dc6b72;
     }
 
-    SyncPopup {
+    SyncPopup, OperationStatusPill, FlagSelectionPill {
         align: center middle;
         overflow: hidden;
         background: transparent;
     }
 
-    #sync-popup {
+    .status-pill {
         width: auto;
         max-width: 100%;
         height: 1;
@@ -929,11 +1104,11 @@ class RepetuiApp(App[None]):
         color: #e7e1d8;
     }
 
-    #sync-popup.-success {
+    .status-pill.-success {
         color: #79c98b;
     }
 
-    #sync-popup.-error {
+    .status-pill.-error {
         color: #dc6b72;
     }
     """
