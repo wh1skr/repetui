@@ -44,7 +44,9 @@ typed-answer grading, CSS layout, and media playback are not executed.
 Anki Desktop must already be installed, signed in, and synchronized once. Close
 Anki Desktop before opening `repetui`, because both applications use the same
 collection database. Press `s` from the deck list or review to sync; progress is
-shown only as a temporary status message.
+shown in the same centered one-line popup from either screen. The popup blocks
+other actions while the collection is unavailable, then briefly confirms success
+or keeps a concise failure visible until `Enter` or `Esc`.
 
 Install the current development release directly from GitHub:
 
