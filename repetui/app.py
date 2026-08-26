@@ -470,6 +470,15 @@ class TemplateSettingsScreen(Screen[None]):
         self.review.preferences_changed()
 
 
+class ReviewContent(Static):
+    """Card document that reports its gutter-adjusted width to the screen."""
+
+    def on_resize(self) -> None:
+        screen = self.screen
+        if isinstance(screen, ReviewScreen):
+            screen.renderable_width_changed(self.size.width)
+
+
 class ReviewScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "back", "Decks", show=False),
@@ -497,6 +506,7 @@ class ReviewScreen(Screen[None]):
         self.revealed = False
         self.expanded_sections: set[str] = set()
         self.selected_folded = 0
+        self._rendered_card_width = 0
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -504,7 +514,7 @@ class ReviewScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            VerticalScroll(Static(id="card"), id="card-scroll"),
+            VerticalScroll(ReviewContent(id="card"), id="card-scroll"),
             Static(id="review-actions"),
             id="review-layout",
         )
@@ -574,11 +584,13 @@ class ReviewScreen(Screen[None]):
             actions.display = False
             return
 
+        renderable_width = content.size.width or self.size.width
+        self._rendered_card_width = max(renderable_width, 1)
         flow = compose_review(
             self.card.presentation,
             self.deck.name,
             counts,
-            self.size.width,
+            self._rendered_card_width,
             revealed=self.revealed,
             sections=self._section_states() if self.revealed else (),
         )
@@ -590,6 +602,16 @@ class ReviewScreen(Screen[None]):
         content.update(flow)
         if reset_scroll:
             self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def renderable_width_changed(self, actual_width: int) -> None:
+        """Recompose after Textual adds or removes the scrollbar gutter."""
+        if (
+            self.card is not None
+            and self.is_mounted
+            and actual_width > 0
+            and actual_width != self._rendered_card_width
+        ):
+            self._refresh_view(reset_scroll=False)
 
     def on_resize(self) -> None:
         if self.is_mounted:

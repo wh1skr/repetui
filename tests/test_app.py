@@ -36,12 +36,14 @@ class FakeBackend:
         self,
         card_content: RawCardContent | None = None,
         decks: list[Deck] | None = None,
+        counts: DueCounts | None = None,
     ) -> None:
         self.is_open = False
         self.rating = None
         self.card_available = True
         self.card_content = card_content
         self._decks = decks or [Deck(1, "Japanese", 0, DueCounts(2, 1, 7))]
+        self._counts = counts or DueCounts(2, 1, 7)
         self.begun_deck_ids: list[int] = []
         self.count_calls = 0
         self.undo_calls = 0
@@ -70,7 +72,7 @@ class FakeBackend:
             self.undo_calls or self.operations or self.flags
         ):
             raise BackendError("private refresh detail")
-        return DueCounts(2, 1, 7) if self.card_available else DueCounts(0, 0, 0)
+        return self._counts if self.card_available else DueCounts(0, 0, 0)
 
     def next_card(self) -> ReviewCard | None:
         if self.card_available:
@@ -118,9 +120,10 @@ def make_app(
     card_content: RawCardContent | None = None,
     preferences: JsonPreferences | None = None,
     decks: list[Deck] | None = None,
+    counts: DueCounts | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
-    backend = FakeBackend(card_content, decks)
+    backend = FakeBackend(card_content, decks, counts)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
     store = preferences or JsonPreferences(
         (tmp_path or Path("/tmp")) / "preferences.json"
@@ -164,6 +167,10 @@ class TwoCardBackend(FakeBackend):
 
 def rendered_text(screen: ReviewScreen) -> str:
     return str(screen.query_one("#card").render())
+
+
+def rendered_card_row(screen: ReviewScreen, row: int) -> str:
+    return screen.query_one("#card").render_line(row).text.rstrip()
 
 
 def japanese_card() -> RawCardContent:
@@ -744,6 +751,51 @@ async def test_real_kanji_card_flows_and_scrolls_at_40_by_6(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_counts_stay_on_first_rendered_row_when_answer_adds_scrollbar(
+    tmp_path,
+) -> None:
+    long_answer = " ".join("日本語の長い説明。" for _ in range(30))
+    content = RawCardContent(
+        CardTemplateIdentity(204, "Japanese Vocabulary", 0, "Recognition"),
+        "語彙",
+        f"<hr id=answer><h2>Meaning</h2><p>{long_answer}</p>",
+    )
+    app, _ = make_app(tmp_path, content, counts=DueCounts(9, 5, 114))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert rendered_card_row(review, 0).endswith("128 9/5/114")
+
+        await pilot.press("enter")
+
+        scroll = review.query_one("#card-scroll")
+        assert scroll.show_vertical_scrollbar is True
+        assert review.query_one("#card").size.width == 39
+        assert rendered_card_row(review, 0).endswith("128 9/5/114")
+        assert "9/5/114" not in rendered_card_row(review, 1)
+
+        await pilot.resize_terminal(16, 6)
+        assert rendered_card_row(review, 0).endswith("9/5/114")
+        assert "128" not in rendered_card_row(review, 0)
+        assert "語彙" in rendered_card_row(review, 0)
+
+        await pilot.resize_terminal(12, 6)
+        assert rendered_card_row(review, 0).endswith("9/5/114")
+        assert "語彙" not in rendered_card_row(review, 0)
+        assert "語彙" in rendered_card_row(review, 1)
+
+        await pilot.resize_terminal(40, 6)
+        first_row = rendered_card_row(review, 0)
+        await pilot.press("G", "?")
+        assert isinstance(app.screen, TemplateSettingsScreen)
+        await pilot.press("escape")
+        assert app.screen is review
+        assert rendered_card_row(review, 0) == first_row
+
+
+@pytest.mark.asyncio
 async def test_flow_collapses_metadata_in_order_before_card_content(tmp_path) -> None:
     app, _ = make_app(tmp_path)
 
@@ -767,18 +819,20 @@ async def test_flow_collapses_metadata_in_order_before_card_content(tmp_path) ->
         assert "Card 1" in no_deck
 
         await pilot.resize_terminal(25, 6)
-        no_split = rendered_text(review)
-        assert "2/1/7" not in no_split
-        assert "10" in no_split
-        assert "Card 1" in no_split
-
-        await pilot.resize_terminal(20, 6)
-        no_total = rendered_text(review)
-        assert "10" not in no_total
-        assert "Card 1" in no_total
+        no_descriptor = rendered_text(review)
+        assert "2/1/7" in no_descriptor
+        assert "10" in no_descriptor
+        assert "Card 1" not in no_descriptor
 
         await pilot.resize_terminal(16, 6)
-        assert rendered_text(review) == "question"
+        no_total = rendered_text(review)
+        assert "10" not in no_total
+        assert "2/1/7" in no_total
+        assert "question" in rendered_card_row(review, 0)
+
+        await pilot.resize_terminal(14, 6)
+        assert rendered_card_row(review, 0).endswith("2/1/7")
+        assert rendered_card_row(review, 1) == "question"
 
 
 @pytest.mark.asyncio
@@ -798,7 +852,9 @@ async def test_long_prompt_and_back_are_complete_and_vim_scrollable_in_tiny_pane
         await pilot.press("enter")
         review = app.screen
         assert isinstance(review, ReviewScreen)
-        assert rendered_text(review) == prompt
+        front = rendered_text(review)
+        assert front.splitlines()[0].endswith("2/1/7")
+        assert "\n".join(front.splitlines()[1:]) == prompt
         assert "detail line" not in rendered_text(review)
 
         await pilot.press("enter")
@@ -892,6 +948,7 @@ async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> 
         await pilot.press("enter")
 
         flow = rendered_text(review)
+        first_row = rendered_card_row(review, 0)
         assert "Reading · そう" in flow
         assert "Meaning · burial; interment" in flow
         assert "› Mnemonic" in flow
@@ -901,12 +958,14 @@ async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> 
 
         await pilot.press("space")
         assert "▾ Mnemonic\nFlowers laid upon a grave." in rendered_text(review)
+        assert rendered_card_row(review, 0) == first_row
         assert preferences.mode(
             identity, "back:heading:mnemonic"
         ) is SectionMode.FOLD
 
         await pilot.press("space")
         assert "Flowers laid upon a grave." not in rendered_text(review)
+        assert rendered_card_row(review, 0) == first_row
 
 
 @pytest.mark.asyncio
