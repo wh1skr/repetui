@@ -1366,6 +1366,23 @@ class FailingBackend(FakeBackend):
         raise BackendError("Close Anki Desktop before starting repetui.")
 
 
+class CountsChangeWhenReopenedBackend(FakeBackend):
+    """Expose fresh deck counts after the close/sync/reopen lifecycle."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            decks=[Deck(1, "Japanese", 0, DueCounts(0, 0, 1))],
+            counts=DueCounts(0, 0, 1),
+        )
+        self.open_calls = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+        super().open()
+        if self.open_calls > 1:
+            self._decks = [Deck(1, "Japanese", 0, DueCounts(0, 0, 0))]
+
+
 @pytest.mark.asyncio
 async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
     backend = FailingBackend()
@@ -1475,6 +1492,37 @@ async def test_sync_completion_replaces_progress_then_dismisses_after_one_second
         await pilot.pause(0.3)
         assert app.screen is origin
         assert app.syncing is False
+
+
+@pytest.mark.asyncio
+async def test_completed_review_sync_refreshes_decks_before_returning(tmp_path) -> None:
+    backend = CountsChangeWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=lambda _profile: SyncOutcome(SyncStatus.SYNCED),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        assert "0/0/1" in str(decks.query_one(".deck-row").render())
+
+        await pilot.press("enter", "enter", "3")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+
+        await pilot.press("s")
+        await pilot.pause(1.2)
+        assert app.screen is review
+
+        await pilot.press("escape")
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
 
 
 @pytest.mark.asyncio
