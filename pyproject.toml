@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "repetui"
 version = "0.1.2"
-description = "A calm terminal interface for reviewing Anki cards"
+description = "Anki review, built for small terminal panes"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"

@@ -1,78 +1,80 @@
 # repetui
 
-`repetui` is a small, unofficial terminal interface for reviewing an existing
-Anki collection.
+<p align="center">
+  <img src="assets/repetui-hero.gif" alt="Repetui fragments orbit and settle into a star" width="760">
+</p>
 
-> Early development: the interface and installation flow may change before the
-> first public release.
+<p align="center"><strong>Anki review, built for small terminal panes.</strong></p>
 
-See the [changelog](CHANGELOG.md) for brief release updates.
+`repetui` is an unofficial, keyboard-first TUI for reviewing an existing Anki
+collection. It keeps deck context, due counts, and review actions useful at
+roughly 40 columns by 6 rows—small enough to live beside your work.
 
-## MVP
+<p align="center">
+  <img src="assets/repetui-decks.svg" alt="Repetui deck browser in a 40 by 6 terminal" width="49%">
+  <img src="assets/repetui-review.svg" alt="Repetui card review in a 40 by 6 terminal" width="49%">
+</p>
 
-- Browse decks and current due counts in panes as small as roughly 40×6.
-- Review cards with Anki's Again, Hard, Good, and Easy ratings.
-- Show, fold, or hide answer sections per card template.
-- Scroll long cards without a mouse.
-- Synchronize review progress with AnkiWeb.
+<p align="center"><sub>Real app captures at 40×6 using disposable demo data.</sub></p>
 
-Card creation, editing, statistics, and media playback are deliberately outside
-the first release.
+## Quick start
 
-## Terminal-first interface
-
-The deck list is a persistent compact tree. Parent decks start collapsed; use
-`Tab` to expand or collapse the selected parent, `j`/`k` to move, and `Enter`
-to review either a parent or leaf. Each row keeps its total due count and the
-familiar coloured New/Learning/Review split. As a pane narrows, the split
-disappears before the total so the selected deck identity remains useful.
-
-During review, `Enter` reveals a card and then answers Good. Use `1`–`4` for
-Again, Hard, Good, and Easy; `j`/`k` and `g`/`G` scroll long cards. Press `?`
-from decks or review for one full-screen settings surface containing Help,
-Controls, and Sections. Controls are available everywhere; Sections configures
-the current card template during review. Every answer section is shown by
-default, and each section can be changed to show, fold, or hide.
-
-repetui translates rendered Anki HTML into terminal-native text rather than
-running a browser. It preserves ordered text, headings, ruby readings, lists,
-tables, code, math labels, and media references where possible. Unknown markup
-falls back to its visible text without truncating it. Template JavaScript,
-typed-answer grading, CSS layout, and media playback are not executed.
-
-## Development
-
-Anki Desktop must already be installed, signed in, and synchronized once. Close
-Anki Desktop before opening `repetui`, because both applications use the same
-collection database. Press `s` from the deck list or review to sync; progress is
-shown in the same centered one-line popup from either screen. The popup blocks
-other actions while the collection is unavailable, then briefly confirms success
-or keeps a concise failure visible until `Enter` or `Esc`.
-
-Install the current development release directly from GitHub:
+Anki Desktop must already be installed and synchronized with AnkiWeb at least
+once. Close Anki Desktop before starting `repetui`; both applications use the
+same local collection and must not run against it together.
 
 ```bash
 uv tool install git+https://github.com/wh1skr/repetui
 repetui
 ```
 
-For local development:
+If you have more than one Anki profile:
 
 ```bash
-uv sync --extra dev
-uv run repetui
+repetui --profile PROFILE_NAME
 ```
 
-If more than one Anki profile exists:
+## Controls
 
-```bash
-uv run repetui --profile PROFILE_NAME
-```
+| Where | Keys | Action |
+| --- | --- | --- |
+| Decks | `j` / `k` | Move |
+| Decks | `Enter` | Review selected deck |
+| Decks | `Tab` | Expand or collapse |
+| Review | `Enter` | Reveal, then answer Good |
+| Review | `1`–`4` | Again, Hard, Good, Easy |
+| Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
+| Review | `Space` | Open or close the selected folded section |
+| Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
+| Decks / review | `s` | Sync with AnkiWeb |
+| Anywhere | `?` | Help, controls, and section settings |
+| Anywhere | `q` | Quit |
 
-Inside the application, press `?` for Help, Controls, and Sections settings.
+Navigation remains fixed so it is always recoverable. Review actions can be
+rebound under `?` → Controls; conflicts are shown before an existing action is
+unbound.
+
+## Card rendering
+
+Anki cards are HTML documents designed for a browser. `repetui` translates
+their rendered content into terminal-native text while preserving ordered text,
+headings, ruby readings, lists, tables, code, math labels, and media references
+where possible. Unknown markup falls back to its visible text rather than being
+silently discarded.
+
+Template JavaScript, typed-answer grading, CSS layout, and media playback are
+not currently executed. Card creation, editing, and statistics are also outside
+the current scope.
+
+### Acknowledgements
+
+Early development of repetui drew on [Clanki's](https://github.com/alvenw/clanki)
+approach to interfacing with Anki's backend systems. Thank you to Alven Wang and
+the Clanki contributors for their work.
 
 ## Licence and relationship to Anki
 
-repetui is an independent, unofficial project and is not endorsed by Ankitects.
-It uses Anki's AGPL-licensed backend and is therefore distributed under
-AGPL-3.0-or-later. The artwork and interface are original to repetui.
+repetui is an independent, unofficial project and is not affiliated with or
+endorsed by Ankitects. It uses Anki's AGPL-licensed backend and is distributed
+under [AGPL-3.0-or-later](LICENSE). See [NOTICE](NOTICE) for third-party
+attribution.

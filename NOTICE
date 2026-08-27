@@ -1,0 +1,9 @@
+repetui
+Copyright (C) 2026 wskr
+
+Parts of the early Anki backend integration were adapted from Clanki:
+https://github.com/alvenw/clanki
+Copyright (C) 2026 Alven Wang and the Clanki contributors
+
+repetui is distributed under the GNU Affero General Public License,
+version 3 or (at your option) any later version. See LICENSE.
