@@ -4,7 +4,11 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+## 0.1.3 - 2026-08-27
+
 - Unified Help, Controls, and Sections in one settings screen available from decks and review.
+- Refreshed deck due counts immediately after syncing from an active or completed review.
+- Kept the coloured review counts stationary while revealing scrollable answers.
 
 ## 0.1.2 - 2026-08-26
 
