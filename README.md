@@ -11,11 +11,10 @@ collection. It keeps deck context, due counts, and review actions useful at
 roughly 40 columns by 6 rows—small enough to live beside your work.
 
 <p align="center">
-  <img src="assets/repetui-decks.svg" alt="Repetui deck browser in a 40 by 6 terminal" width="49%">
-  <img src="assets/repetui-review.svg" alt="Repetui card review in a 40 by 6 terminal" width="49%">
+  <img src="assets/repetui-tmux-demo.gif" alt="Repetui review flow inside a mock tmux workspace" width="100%">
 </p>
 
-<p align="center"><sub>Real app captures at 40×6 using disposable demo data.</sub></p>
+<p align="center"><sub>Mock workspace and card data; the Repetui pane is rendered by the real app at 63×13.</sub></p>
 
 ## Quick start
 
