@@ -61,6 +61,20 @@ headings, ruby readings, lists, tables, code, math labels, and media references
 where possible. Unknown markup falls back to its visible text rather than being
 silently discarded.
 
+## Sections that fit your pane
+
+Card backs are not equally useful at every size. During review, open
+`?` → `Sections` and choose how each detected section should behave for that
+card template.
+
+| Show | Fold | Hide |
+| :---: | :---: | :---: |
+| <img src="assets/repetui-sections-show.png" alt="Sections settings with Meaning Explanation set to show" width="100%"> | <img src="assets/repetui-sections-fold.png" alt="Sections settings with Meaning Explanation set to fold" width="100%"> | <img src="assets/repetui-sections-hide.png" alt="Sections settings with Meaning Explanation set to hide" width="100%"> |
+| Keep the full section in the answer. | Keep a one-line section you can open with `Space`. | Leave the section out of review. |
+
+Choices are remembered per note type and card template, so long explanations
+and mnemonics can stay one keypress away without taking over every card.
+
 Template JavaScript, typed-answer grading, CSS layout, and media playback are
 not currently executed. Card creation, editing, and statistics are also outside
 the current scope.
