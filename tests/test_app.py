@@ -790,12 +790,13 @@ async def test_review_counts_stay_on_first_rendered_row_when_answer_adds_scrollb
         review = app.screen
         assert isinstance(review, ReviewScreen)
         assert rendered_card_row(review, 0).endswith("128 9/5/114")
+        card_width_before_reveal = review.query_one("#card").size.width
 
         await pilot.press("enter")
 
         scroll = review.query_one("#card-scroll")
         assert scroll.show_vertical_scrollbar is True
-        assert review.query_one("#card").size.width == 39
+        assert review.query_one("#card").size.width == card_width_before_reveal
         assert rendered_card_row(review, 0).endswith("128 9/5/114")
         assert "9/5/114" not in rendered_card_row(review, 1)
 

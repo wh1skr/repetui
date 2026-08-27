@@ -1178,6 +1178,7 @@ class RepetuiApp(App[None]):
     #card-scroll {
         height: 1fr;
         background: #111416;
+        scrollbar-gutter: stable;
         scrollbar-size-vertical: 1;
     }
 
