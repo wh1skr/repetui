@@ -1495,6 +1495,47 @@ async def test_sync_completion_replaces_progress_then_dismisses_after_one_second
 
 
 @pytest.mark.asyncio
+async def test_sync_keeps_background_frozen_until_popup_closes(tmp_path) -> None:
+    started = Event()
+    release = Event()
+
+    def fake_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    backend = CountsChangeWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=fake_sync,
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        before = str(decks.query_one(".deck-row").render())
+        assert "0/0/1" in before
+
+        await pilot.press("s")
+        assert started.wait(timeout=1)
+        release.set()
+        await pilot.pause(0.15)
+
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        assert str(popup.query_one("#sync-popup").render()) == "[ok] synced"
+        assert str(decks.query_one(".deck-row").render()) == before
+
+        await pilot.pause(1.0)
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
+
+
+@pytest.mark.asyncio
 async def test_completed_review_sync_refreshes_decks_before_returning(tmp_path) -> None:
     backend = CountsChangeWhenReopenedBackend()
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))

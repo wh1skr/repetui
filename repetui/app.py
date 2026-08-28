@@ -1408,16 +1408,16 @@ class RepetuiApp(App[None]):
         return SyncRunResult(outcome, reopen_error)
 
     def _finish_sync(self, result: SyncRunResult) -> None:
-        if self.backend.is_open:
-            for screen in self.screen_stack:
-                if hasattr(screen, "backend_refreshed"):
-                    cast(Refreshable, screen).backend_refreshed()
         self._sync_fatal_error = result.reopen_error
         if self._sync_popup is not None:
             self._sync_popup.finish(result)
 
     def _sync_popup_closed(self, fatal: bool | None) -> None:
         fatal_error = self._sync_fatal_error
+        if self.backend.is_open:
+            for screen in self.screen_stack:
+                if hasattr(screen, "backend_refreshed"):
+                    cast(Refreshable, screen).backend_refreshed()
         self.syncing = False
         self._sync_popup = None
         self._sync_origin = None
