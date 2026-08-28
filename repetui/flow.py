@@ -275,3 +275,21 @@ def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:
             result.append("  ")
         result.append(label, style=colour)
     return result
+
+
+def compose_rating_feedback(rating: int) -> Text:
+    """Identify the rating Anki accepted without echoing its triggering key."""
+    choices = {
+        1: ("again", "#dc6b72"),
+        2: ("hard", "#d7b85a"),
+        3: ("good", "#79c98b"),
+        4: ("easy", "#68a8df"),
+    }
+    try:
+        label, colour = choices[rating]
+    except KeyError as exc:
+        raise ValueError("Rating must be between 1 and 4.") from exc
+
+    result = Text("rated · ", style="#817d76", no_wrap=True)
+    result.append(f"{rating} {label}", style=f"bold {colour}")
+    return result
