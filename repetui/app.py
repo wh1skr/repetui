@@ -30,7 +30,7 @@ from .controls import (
 )
 from .deck_tree import VisibleDeckRow, visible_deck_rows
 from .flow import SectionState, compose_ratings, compose_review, section_name
-from .preferences import JsonPreferences, Preferences, SectionMode
+from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
 from .sync import SyncOutcome, SyncStatus, failed_sync_outcome, sync_profile
 
@@ -292,6 +292,23 @@ class SectionSettingItem(ListItem):
         self.query_one(".setting-mode", Static).update(Text(mode.value, style=colour))
 
 
+class AnswerLayoutSettingItem(ListItem):
+    """The current template's compact or left-aligned answer flow."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("answer layout", classes="setting-label")
+        yield Static(classes="setting-mode")
+
+    def refresh_layout(
+        self, preferences: Preferences, identity: CardTemplateIdentity
+    ) -> None:
+        layout = preferences.answer_layout(identity)
+        colour = "#79c98b" if layout is AnswerLayout.STACKED else "#aaa49b"
+        self.query_one(".setting-mode", Static).update(
+            Text(layout.value, style=colour, no_wrap=True)
+        )
+
+
 class ControlSettingItem(ListItem):
     """One keyboard-editable review action and its current binding."""
 
@@ -368,6 +385,7 @@ class SettingsScreen(Screen[None]):
                 id="settings-help",
             ),
             ListView(
+                *(AnswerLayoutSettingItem(),) if self.card is not None else (),
                 *(SectionSettingItem(section) for section in sections),
                 id="settings-sections",
             ),
@@ -389,6 +407,9 @@ class SettingsScreen(Screen[None]):
 
     def on_mount(self) -> None:
         if self.card is not None:
+            self.query_one(AnswerLayoutSettingItem).refresh_layout(
+                self.repetui.preferences, self.card.presentation.identity
+            )
             for item in self.query(SectionSettingItem):
                 item.refresh_mode(
                     self.repetui.preferences, self.card.presentation.identity
@@ -491,9 +512,14 @@ class SettingsScreen(Screen[None]):
         if view.index is None or not (0 <= view.index < len(view.children)):
             return
         item = view.children[view.index]
+        identity = self.card.presentation.identity
+        if isinstance(item, AnswerLayoutSettingItem):
+            layout = self.repetui.preferences.answer_layout(identity)
+            self.repetui.preferences.set_answer_layout(identity, layout.next)
+            item.refresh_layout(self.repetui.preferences, identity)
+            return
         if not isinstance(item, SectionSettingItem):
             return
-        identity = self.card.presentation.identity
         mode = self.repetui.preferences.mode(identity, item.section.id)
         self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
         item.refresh_mode(self.repetui.preferences, identity)
@@ -513,7 +539,7 @@ class SettingsScreen(Screen[None]):
             "help": "j/k scroll · h/l tabs · esc",
             "controls": "j/k · enter bind · bs default · esc",
             "sections": (
-                "j/k · space mode · h/l tabs · esc"
+                "j/k · space change · h/l tabs · esc"
                 if self.card is not None
                 else "h/l tabs · esc"
             ),
@@ -743,6 +769,9 @@ class ReviewScreen(Screen[None]):
             revealed=self.revealed,
             sections=self._section_states() if self.revealed else (),
             current_queue=self.card.queue,
+            answer_layout=self.repetui.preferences.answer_layout(
+                self.card.presentation.identity
+            ),
         )
         if self.revealed:
             actions.update(
@@ -1219,12 +1248,14 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    SectionSettingItem, ControlSettingItem {
+    AnswerLayoutSettingItem, SectionSettingItem, ControlSettingItem {
         height: 1;
         layout: horizontal;
     }
 
-    SectionSettingItem.-highlight, ControlSettingItem.-highlight {
+    AnswerLayoutSettingItem.-highlight,
+    SectionSettingItem.-highlight,
+    ControlSettingItem.-highlight {
         background: #293034;
     }
 
@@ -1234,7 +1265,7 @@ class RepetuiApp(App[None]):
     }
 
     .setting-mode {
-        width: 5;
+        width: 7;
         height: 1;
         text-align: right;
     }

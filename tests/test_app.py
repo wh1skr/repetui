@@ -21,7 +21,7 @@ from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
-from repetui.preferences import JsonPreferences, SectionMode
+from repetui.preferences import AnswerLayout, JsonPreferences, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -1008,7 +1008,7 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
         assert settings.size.height == 6
         assert str(settings.query_one("#settings-header").render()) == "settings"
 
-        await pilot.press("space")
+        await pilot.press("j", "space")
         assert preferences.mode(
             content.identity, "back:heading:reading"
         ) is SectionMode.FOLD
@@ -1025,6 +1025,44 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
         await pilot.press("enter")
         assert "› Reading" in rendered_text(review)
         assert "そう" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_sections_settings_toggle_stacked_answers_for_the_current_template(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = japanese_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        layout_row = settings.query_one("#settings-sections").children[0]
+        assert str(layout_row.query_one(".setting-label").render()) == "answer layout"
+        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
+
+        await pilot.press("space")
+        assert preferences.answer_layout(content.identity) is AnswerLayout.STACKED
+        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
+
+        await pilot.press("escape", "enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        flow = rendered_text(review)
+        assert "そう  · Reading\nburial; interment  · Meaning" in flow
+        assert "Meaning · burial; interment" not in flow
+
+        await pilot.press("?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        layout_row = settings.query_one("#settings-sections").children[0]
+        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
+
+        await pilot.press("space", "escape")
+        assert preferences.answer_layout(content.identity) is AnswerLayout.COMPACT
+        assert "Reading · そう" in rendered_text(review)
 
 
 @pytest.mark.asyncio

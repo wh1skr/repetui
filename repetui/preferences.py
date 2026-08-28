@@ -26,6 +26,21 @@ class SectionMode(str, Enum):
         return order[(order.index(self) + 1) % len(order)]
 
 
+class AnswerLayout(str, Enum):
+    """How short labelled answers share the compact review surface."""
+
+    COMPACT = "compact"
+    STACKED = "stacked"
+
+    @property
+    def next(self) -> AnswerLayout:
+        return (
+            AnswerLayout.STACKED
+            if self is AnswerLayout.COMPACT
+            else AnswerLayout.COMPACT
+        )
+
+
 class Preferences(Protocol):
     """Small injectable seam used by deck, review, and settings screens."""
 
@@ -48,6 +63,14 @@ class Preferences(Protocol):
         identity: CardTemplateIdentity,
         section_id: str,
         mode: SectionMode,
+    ) -> None: ...
+
+    def answer_layout(self, identity: CardTemplateIdentity) -> AnswerLayout: ...
+
+    def set_answer_layout(
+        self,
+        identity: CardTemplateIdentity,
+        layout: AnswerLayout,
     ) -> None: ...
 
 
@@ -176,6 +199,35 @@ class JsonPreferences:
             sections.pop(section_id, None)
         else:
             sections[section_id] = mode.value
+        self._save()
+
+    def answer_layout(self, identity: CardTemplateIdentity) -> AnswerLayout:
+        template = self._templates.get(self._template_key(identity), {})
+        try:
+            return AnswerLayout(
+                template.get("answer_layout", AnswerLayout.COMPACT.value)
+            )
+        except (TypeError, ValueError):
+            return AnswerLayout.COMPACT
+
+    def set_answer_layout(
+        self,
+        identity: CardTemplateIdentity,
+        layout: AnswerLayout,
+    ) -> None:
+        key = self._template_key(identity)
+        template = self._templates.setdefault(
+            key,
+            {
+                "note_type_name": identity.note_type_name,
+                "template_name": identity.template_name,
+                "sections": {},
+            },
+        )
+        if layout is AnswerLayout.COMPACT:
+            template.pop("answer_layout", None)
+        else:
+            template["answer_layout"] = layout.value
         self._save()
 
     def _save(self) -> None:
