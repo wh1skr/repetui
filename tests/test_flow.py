@@ -2,7 +2,12 @@ import pytest
 
 from repetui.backend import DueCounts, ReviewQueue
 from repetui.controls import ReviewAction, ReviewControls
-from repetui.flow import SectionState, compose_ratings, compose_review
+from repetui.flow import (
+    SectionState,
+    compose_rating_feedback,
+    compose_ratings,
+    compose_review,
+)
 from repetui.preferences import AnswerLayout, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
@@ -227,3 +232,21 @@ def test_rating_row_uses_current_bindings_and_marks_unbound_actions() -> None:
     result = compose_ratings(40, controls)
 
     assert result.plain == "2 again  - hard  3 good  4 easy"
+
+
+@pytest.mark.parametrize(
+    ("rating", "label", "colour"),
+    (
+        (1, "again", "#dc6b72"),
+        (2, "hard", "#d7b85a"),
+        (3, "good", "#79c98b"),
+        (4, "easy", "#68a8df"),
+    ),
+)
+def test_rating_feedback_identifies_the_accepted_anki_action(
+    rating: int, label: str, colour: str
+) -> None:
+    result = compose_rating_feedback(rating)
+
+    assert result.plain == f"rated · {rating} {label}"
+    assert any(str(span.style) == f"bold {colour}" for span in result.spans)

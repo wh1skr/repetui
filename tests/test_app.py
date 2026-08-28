@@ -156,6 +156,10 @@ class TwoCardBackend(FakeBackend):
         )
         return ReviewCard(self.card_ids[0], present_card(content))
 
+    def answer(self, rating: int) -> None:
+        self.rating = rating
+        self.card_ids.pop(0)
+
     def bury_current(self) -> None:
         self.operations.append("bury")
         self.card_ids.pop(0)
@@ -460,6 +464,81 @@ async def test_complete_keyboard_review_loop(tmp_path) -> None:
         assert backend.rating == 3
         assert "Nothing due" in str(review.query_one("#card").render())
         assert str(review.query_one("#card").render()).startswith("done · Japanese")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "rating", "label"),
+    (
+        ("1", 1, "again"),
+        ("2", 2, "hard"),
+        ("3", 3, "good"),
+        ("4", 4, "easy"),
+        ("enter", 3, "good"),
+    ),
+)
+async def test_successful_rating_is_confirmed_on_the_completed_deck(
+    tmp_path, key, rating, label
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", key)
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+
+        actions = review.query_one("#review-actions")
+        assert backend.rating == rating
+        assert review.card is None
+        assert actions.display is True
+        assert str(actions.render()) == f"rated · {rating} {label}"
+
+
+@pytest.mark.asyncio
+async def test_rebound_rating_confirms_the_action_instead_of_the_pressed_key(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    controls = ReviewControls.defaults().with_binding(ReviewAction.EASY, "e")
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    preferences.set_review_controls(profile, controls)
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "e")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+
+        assert backend.rating == 4
+        assert str(review.query_one("#review-actions").render()) == "rated · 4 easy"
+
+
+@pytest.mark.asyncio
+async def test_newest_rating_feedback_survives_rapid_review_and_then_clears(
+    tmp_path,
+) -> None:
+    backend = TwoCardBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "1")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        actions = review.query_one("#review-actions")
+        assert review.card is not None and review.card.id == 43
+        assert str(actions.render()) == "rated · 1 again"
+
+        await pilot.press("enter", "4")
+        assert review.card is None
+        assert str(actions.render()) == "rated · 4 easy"
+
+        await pilot.pause(1.05)
+        assert actions.display is False
 
 
 @pytest.mark.asyncio
@@ -1530,6 +1609,47 @@ async def test_sync_completion_replaces_progress_then_dismisses_after_one_second
         await pilot.pause(0.3)
         assert app.screen is origin
         assert app.syncing is False
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_background_frozen_until_popup_closes(tmp_path) -> None:
+    started = Event()
+    release = Event()
+
+    def fake_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    backend = CountsChangeWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=fake_sync,
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        before = str(decks.query_one(".deck-row").render())
+        assert "0/0/1" in before
+
+        await pilot.press("s")
+        assert started.wait(timeout=1)
+        release.set()
+        await pilot.pause(0.15)
+
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        assert str(popup.query_one("#sync-popup").render()) == "[ok] synced"
+        assert str(decks.query_one(".deck-row").render()) == before
+
+        await pilot.pause(1.0)
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
 
 
 @pytest.mark.asyncio

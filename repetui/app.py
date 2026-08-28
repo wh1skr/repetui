@@ -29,7 +29,13 @@ from .controls import (
     ReviewControls,
 )
 from .deck_tree import VisibleDeckRow, visible_deck_rows
-from .flow import SectionState, compose_ratings, compose_review, section_name
+from .flow import (
+    SectionState,
+    compose_rating_feedback,
+    compose_ratings,
+    compose_review,
+    section_name,
+)
 from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
 from .sync import SyncOutcome, SyncStatus, failed_sync_outcome, sync_profile
@@ -649,6 +655,8 @@ class ReviewContent(Static):
 
 
 class ReviewScreen(Screen[None]):
+    RATING_FEEDBACK_DURATION = 1.0
+
     BINDINGS = [
         Binding("escape", "back", "Decks", show=False),
         Binding(
@@ -682,6 +690,8 @@ class ReviewScreen(Screen[None]):
         self.expanded_sections: set[str] = set()
         self.selected_folded = 0
         self._rendered_card_width = 0
+        self._rating_feedback: int | None = None
+        self._rating_feedback_timer: Timer | None = None
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -697,6 +707,11 @@ class ReviewScreen(Screen[None]):
     def on_mount(self) -> None:
         self.repetui.backend.begin_review(self.deck.id)
         self.load_next()
+
+    def on_unmount(self) -> None:
+        if self._rating_feedback_timer is not None:
+            self._rating_feedback_timer.stop()
+            self._rating_feedback_timer = None
 
     def _busy(self) -> bool:
         if self.repetui.syncing:
@@ -756,7 +771,7 @@ class ReviewScreen(Screen[None]):
             complete.append(self.deck.leaf_name, style="bold #eee9e0")
             complete.append("\nNothing due. You showed up.", style="#aaa49b")
             content.update(complete)
-            actions.display = False
+            self._refresh_action_row(actions)
             return
 
         renderable_width = content.size.width or self.size.width
@@ -773,16 +788,37 @@ class ReviewScreen(Screen[None]):
                 self.card.presentation.identity
             ),
         )
-        if self.revealed:
+        self._refresh_action_row(actions)
+        content.update(flow)
+        if reset_scroll:
+            self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def _refresh_action_row(self, actions: Static) -> None:
+        if self.card is not None and self.revealed:
             actions.update(
                 compose_ratings(self.size.width, self.repetui.review_controls)
             )
             actions.display = True
+        elif self._rating_feedback is not None:
+            actions.update(compose_rating_feedback(self._rating_feedback))
+            actions.display = True
         else:
             actions.display = False
-        content.update(flow)
-        if reset_scroll:
-            self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def _set_rating_feedback(self, rating: int) -> None:
+        if self._rating_feedback_timer is not None:
+            self._rating_feedback_timer.stop()
+        self._rating_feedback = rating
+        self._rating_feedback_timer = self.set_timer(
+            self.RATING_FEEDBACK_DURATION,
+            self._clear_rating_feedback,
+        )
+
+    def _clear_rating_feedback(self) -> None:
+        self._rating_feedback = None
+        self._rating_feedback_timer = None
+        if self.is_mounted:
+            self._refresh_view(reset_scroll=False)
 
     def renderable_width_changed(self, actual_width: int) -> None:
         """Recompose after Textual adds or removes the scrollbar gutter."""
@@ -842,6 +878,7 @@ class ReviewScreen(Screen[None]):
             return
         try:
             self.repetui.backend.answer(rating)
+            self._set_rating_feedback(rating)
             self.load_next()
         except Exception as exc:
             self.notify(str(exc), severity="error")
@@ -1439,16 +1476,16 @@ class RepetuiApp(App[None]):
         return SyncRunResult(outcome, reopen_error)
 
     def _finish_sync(self, result: SyncRunResult) -> None:
-        if self.backend.is_open:
-            for screen in self.screen_stack:
-                if hasattr(screen, "backend_refreshed"):
-                    cast(Refreshable, screen).backend_refreshed()
         self._sync_fatal_error = result.reopen_error
         if self._sync_popup is not None:
             self._sync_popup.finish(result)
 
     def _sync_popup_closed(self, fatal: bool | None) -> None:
         fatal_error = self._sync_fatal_error
+        if self.backend.is_open:
+            for screen in self.screen_stack:
+                if hasattr(screen, "backend_refreshed"):
+                    cast(Refreshable, screen).backend_refreshed()
         self.syncing = False
         self._sync_popup = None
         self._sync_origin = None
