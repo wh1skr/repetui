@@ -8,7 +8,7 @@ from repetui.flow import (
     compose_ratings,
     compose_review,
 )
-from repetui.preferences import SectionMode
+from repetui.preferences import AnswerLayout, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -84,6 +84,73 @@ def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
     assert "cross)\nMeaning Mnemonic · mnemonic paragraph" in revealed
     assert "meaning info\nReading Mnemonic · reading paragraph" in revealed
     assert "reading info" in revealed
+
+
+def test_stacked_flow_starts_each_short_answer_at_the_left_edge() -> None:
+    presentation = real_kanji_presentation()
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    )
+
+    assert revealed.plain.splitlines()[1:5] == [
+        "Stylish  · Meaning",
+        "すい  · On'yomi",
+        "いき  · Kun'yomi",
+        "米, 九, 十 (rice, nine, cross)  · Radicals",
+    ]
+    styled_fragments = {
+        (revealed.plain[span.start : span.end], str(span.style))
+        for span in revealed.spans
+    }
+    assert ("Meaning", "#817d76") in styled_fragments
+    assert ("On'yomi", "#817d76") in styled_fragments
+    assert "mnemonic paragraph" in revealed.plain
+    assert "meaning info" in revealed.plain
+
+
+def test_stacked_flow_leaves_multiline_and_folded_sections_unchanged() -> None:
+    presentation = real_kanji_presentation()
+    states = (
+        SectionState(presentation.back.sections[4], SectionMode.SHOW),
+        SectionState(
+            presentation.back.sections[5],
+            SectionMode.FOLD,
+            selected=True,
+        ),
+    )
+
+    compact = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+    ).plain
+    stacked = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    ).plain
+
+    assert stacked == compact
+    assert "mnemonic paragraph\n\nmeaning info" in stacked
+    assert "› Reading Mnemonic" in stacked
 
 
 def test_review_count_cluster_keeps_neutral_total_and_anki_split_colours() -> None:
