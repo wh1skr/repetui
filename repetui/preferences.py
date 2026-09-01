@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -54,6 +55,24 @@ class Preferences(Protocol):
 
     def set_review_controls(
         self, profile: ProfilePaths, controls: ReviewControls
+    ) -> None: ...
+
+    def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool: ...
+
+    def set_add_on_enabled(
+        self, profile: ProfilePaths, add_on_id: str, *, enabled: bool
+    ) -> None: ...
+
+    def add_on_settings(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, str | int | bool]: ...
+
+    def set_add_on_setting(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        setting_id: str,
+        value: str | int | bool,
     ) -> None: ...
 
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode: ...
@@ -165,6 +184,92 @@ class JsonPreferences:
             saved_profile.pop("review_controls", None)
         self._write_document(self._templates, profiles)
         self._profiles = profiles
+
+    def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool:
+        return self._add_on_state(profile, add_on_id).get("enabled") is True
+
+    def set_add_on_enabled(
+        self, profile: ProfilePaths, add_on_id: str, *, enabled: bool
+    ) -> None:
+        def update(state: dict[str, object]) -> None:
+            if enabled:
+                state["enabled"] = True
+            else:
+                state.pop("enabled", None)
+
+        self._update_add_on_state(profile, add_on_id, update)
+
+    def _add_on_state(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, object]:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        add_ons = saved_profile.get("add_ons", {})
+        if not isinstance(add_ons, dict):
+            return {}
+        state = add_ons.get(add_on_id, {})
+        return state if isinstance(state, dict) else {}
+
+    def _update_add_on_state(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        update: Callable[[dict[str, object]], None],
+    ) -> None:
+        profiles = {key: dict(value) for key, value in self._profiles.items()}
+        profile_key = self._profile_key(profile)
+        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
+        add_ons = dict(
+            saved_profile.get("add_ons", {})
+            if isinstance(saved_profile.get("add_ons"), dict)
+            else {}
+        )
+        state = dict(
+            add_ons.get(add_on_id, {})
+            if isinstance(add_ons.get(add_on_id), dict)
+            else {}
+        )
+        update(state)
+        if state:
+            add_ons[add_on_id] = state
+        else:
+            add_ons.pop(add_on_id, None)
+        if add_ons:
+            saved_profile["add_ons"] = add_ons
+        else:
+            saved_profile.pop("add_ons", None)
+        self._write_document(self._templates, profiles)
+        self._profiles = profiles
+
+    def add_on_settings(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, str | int | bool]:
+        state = self._add_on_state(profile, add_on_id)
+        settings = state.get("settings", {})
+        if not isinstance(settings, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in settings.items()
+            if isinstance(value, (str, int, bool))
+        }
+
+    def set_add_on_setting(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        setting_id: str,
+        value: str | int | bool,
+    ) -> None:
+        def update(state: dict[str, object]) -> None:
+            settings = dict(
+                state.get("settings", {})
+                if isinstance(state.get("settings"), dict)
+                else {}
+            )
+            settings[setting_id] = value
+            state["settings"] = settings
+
+        self._update_add_on_state(profile, add_on_id, update)
 
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode:
         template = self._templates.get(self._template_key(identity), {})
