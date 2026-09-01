@@ -32,6 +32,7 @@ class PresentationCueType(str, Enum):
     """Presentation forms implemented by repetui itself."""
 
     NOTICE = "notice"
+    COMPLETION_CELEBRATION = "completion-celebration"
 
 
 @dataclass(frozen=True)
@@ -245,4 +246,6 @@ class AddOnManager:
 
 def bundled_add_ons() -> tuple[AddOnDefinition, ...]:
     """Return the official add-ons shipped with this repetui build."""
-    return ()
+    from .completion import completion_celebration_add_on
+
+    return (completion_celebration_add_on(),)

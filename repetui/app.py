@@ -32,6 +32,7 @@ from .addons import (
     bundled_add_ons,
 )
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
+from .completion import completion_duration_seconds, compose_completion_frame
 from .config import ProfilePaths
 from .controls import (
     DEFAULT_REVIEW_BINDINGS,
@@ -54,6 +55,85 @@ from .sync import SyncOutcome, SyncStatus, failed_sync_outcome, sync_profile
 
 class Refreshable(Protocol):
     def backend_refreshed(self) -> None: ...
+
+
+class CompletionCelebrationScreen(Screen[None]):
+    """Brief full-pane presentation that consumes the key used to skip it."""
+
+    FRAME_SECONDS = 0.08
+    BINDINGS = [
+        Binding("q", "skip", "Skip", show=False, priority=True),
+        Binding("question_mark", "skip", "Skip", show=False, priority=True),
+    ]
+
+    def __init__(self, deck_name: str, duration: float) -> None:
+        super().__init__()
+        self.deck_name = deck_name
+        self.duration = duration
+        self.phase = 0
+        self._frame_timer: Timer | None = None
+        self._finish_timer: Timer | None = None
+        self._discard_on_resume = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="completion-art")
+
+    def on_mount(self) -> None:
+        self._render_frame()
+        self._frame_timer = self.set_interval(self.FRAME_SECONDS, self._advance_frame)
+        self._finish_timer = self.set_timer(self.duration, self._finish)
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._render_frame()
+
+    def on_unmount(self) -> None:
+        self.stop_animation()
+
+    def on_screen_suspend(self) -> None:
+        self._discard_on_resume = True
+        self.stop_animation()
+
+    def on_screen_resume(self) -> None:
+        if self._discard_on_resume:
+            self.call_after_refresh(self._dismiss_effect)
+
+    def stop_animation(self) -> None:
+        """Release every timer owned by the transient effect."""
+        for timer in (self._frame_timer, self._finish_timer):
+            if timer is not None:
+                timer.stop()
+        self._frame_timer = None
+        self._finish_timer = None
+
+    def _render_frame(self) -> None:
+        art = self.query_one("#completion-art", Static)
+        width = art.size.width or self.size.width
+        height = art.size.height or self.size.height
+        art.update(
+            compose_completion_frame(width, height, self.deck_name, self.phase)
+        )
+
+    def _advance_frame(self) -> None:
+        self.phase += 1
+        if self.is_mounted:
+            self._render_frame()
+
+    def _finish(self) -> None:
+        self._finish_timer = None
+        self._dismiss_effect()
+
+    def action_skip(self) -> None:
+        self._dismiss_effect()
+
+    def on_key(self, event: events.Key) -> None:
+        event.stop()
+        event.prevent_default()
+        self._dismiss_effect()
+
+    def _dismiss_effect(self) -> None:
+        if self.is_mounted:
+            cast("RepetuiApp", self.app).close_completion_celebration(self)
 
 
 @dataclass(frozen=True)
@@ -1427,6 +1507,13 @@ class RepetuiApp(App[None]):
         height: 100%;
     }
 
+    CompletionCelebrationScreen, #completion-art {
+        width: 100%;
+        height: 100%;
+        background: #111416;
+        overflow: hidden;
+    }
+
     #deck-header, #error-header {
         height: 1;
         color: #eee9e0;
@@ -1636,6 +1723,7 @@ class RepetuiApp(App[None]):
         self._sync_popup: SyncPopup | None = None
         self._sync_thread: Thread | None = None
         self._sync_fatal_error: str | None = None
+        self._completion_celebration: CompletionCelebrationScreen | None = None
         self._shutdown_requested = Event()
         self._backend_lock = Lock()
 
@@ -1663,6 +1751,27 @@ class RepetuiApp(App[None]):
         """Render one supported cue without exposing application internals."""
         if cue.type is PresentationCueType.NOTICE and cue.message:
             self.notify(cue.message)
+        elif cue.type is PresentationCueType.COMPLETION_CELEBRATION:
+            values = cue.values or {}
+            deck_name = values.get("deck_name", "")
+            duration = values.get("duration", "medium")
+            celebration = CompletionCelebrationScreen(
+                deck_name if isinstance(deck_name, str) else "",
+                completion_duration_seconds(
+                    duration if isinstance(duration, str) else "medium"
+                ),
+            )
+            self._completion_celebration = celebration
+            self.push_screen(celebration)
+
+    def close_completion_celebration(
+        self, celebration: CompletionCelebrationScreen
+    ) -> None:
+        celebration.stop_animation()
+        if self._completion_celebration is celebration:
+            self._completion_celebration = None
+        if self.screen is celebration:
+            self.pop_screen()
 
     def on_mount(self) -> None:
         try:
@@ -1673,6 +1782,9 @@ class RepetuiApp(App[None]):
 
     def on_unmount(self) -> None:
         self._shutdown_requested.set()
+        if self._completion_celebration is not None:
+            self._completion_celebration.stop_animation()
+            self._completion_celebration = None
         with self._backend_lock:
             self.backend.close()
 
@@ -1680,7 +1792,9 @@ class RepetuiApp(App[None]):
         if self.syncing:
             return
         screen = self.screen
-        if isinstance(screen, SettingsScreen):
+        if isinstance(screen, CompletionCelebrationScreen):
+            screen.action_skip()
+        elif isinstance(screen, SettingsScreen):
             screen.action_back()
         elif isinstance(screen, ReviewScreen) and screen.card is not None:
             self.push_screen(SettingsScreen(screen, initial_tab="sections"))
@@ -1688,7 +1802,9 @@ class RepetuiApp(App[None]):
             self.push_screen(SettingsScreen(initial_tab="help"))
 
     def action_quit(self) -> None:
-        if not self.syncing:
+        if isinstance(self.screen, CompletionCelebrationScreen):
+            self.screen.action_skip()
+        elif not self.syncing:
             self.exit()
 
     def action_sync(self) -> None:
