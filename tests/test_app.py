@@ -6,6 +6,16 @@ from threading import Event
 import pytest
 from textual.widgets import Input
 
+from repetui.addons import (
+    AddOnDefinition,
+    AddOnEvent,
+    AddOnEventType,
+    ChoiceSetting,
+    NumberSetting,
+    PresentationCue,
+    PresentationCueType,
+    ToggleSetting,
+)
 from repetui.app import (
     DeckScreen,
     ErrorScreen,
@@ -122,6 +132,7 @@ def make_app(
     decks: list[Deck] | None = None,
     counts: DueCounts | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
+    add_ons: tuple[AddOnDefinition, ...] = (),
 ) -> tuple[RepetuiApp, FakeBackend]:
     backend = FakeBackend(card_content, decks, counts)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
@@ -129,9 +140,9 @@ def make_app(
         (tmp_path or Path("/tmp")) / "preferences.json"
     )
     app = (
-        RepetuiApp(backend, profile, store)
+        RepetuiApp(backend, profile, store, add_ons=add_ons)
         if syncer is None
-        else RepetuiApp(backend, profile, store, syncer)
+        else RepetuiApp(backend, profile, store, syncer, add_ons=add_ons)
     )
     return app, backend
 
@@ -1178,6 +1189,153 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
             ("Sync", "s"),
         ]
         assert settings.query_one("#settings-footer").region == (0, 5, 40, 1)
+
+
+@pytest.mark.asyncio
+async def test_add_ons_tab_enables_and_configures_registered_add_on_at_40x6(
+    tmp_path,
+) -> None:
+    definition = AddOnDefinition(
+        id="completion-celebration",
+        name="Completion Celebration",
+        description="Celebrate the final due card.",
+        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
+        settings=(
+            ToggleSetting("sparkles", "Sparkles"),
+            ChoiceSetting("duration", "Duration", ("short", "long"), "short"),
+            NumberSetting("density", "Density", 1, 3, 1, 1),
+        ),
+        handle=lambda _event, _settings: None,
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences, add_ons=(definition,))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("?", "h")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        registry = settings.query_one("#settings-add-ons")
+        assert registry.region == (0, 2, 40, 3)
+        row = registry.children[0]
+        assert str(row.query_one(".add-on-label").render()) == "Completion Celebration"
+        assert str(row.query_one(".add-on-state").render()) == "off"
+
+        await pilot.press("space", "enter")
+        assert app.add_ons.is_enabled(definition.id) is True
+        detail = settings.query_one("#settings-add-on-detail")
+        assert detail.display is True
+        assert [
+            str(item.query_one(".add-on-setting-label").render())
+            for item in detail.children
+        ] == ["enabled", "Sparkles", "Duration", "Density"]
+
+        await pilot.press("j", "space")
+        assert app.add_ons.setting_values(definition.id)["sparkles"] is True
+
+        await pilot.press("escape")
+        assert registry.display is True
+
+        await pilot.press("escape", "enter", "?", "l")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        assert settings.query_one("#settings-add-ons").display is True
+
+
+@pytest.mark.asyncio
+async def test_enabled_add_on_receives_review_events_at_accepted_transitions(
+    tmp_path,
+) -> None:
+    received: list[AddOnEvent] = []
+    definition = AddOnDefinition(
+        id="review-observer",
+        name="Review Observer",
+        description="Observe review transitions.",
+        events=frozenset(AddOnEventType),
+        settings=(),
+        handle=lambda event, _settings: received.append(event),
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        assert backend.rating == 3
+        assert received == [
+            AddOnEvent(AddOnEventType.REVIEW_STARTED, deck_name="Japanese"),
+            AddOnEvent(
+                AddOnEventType.RATING_ACCEPTED,
+                deck_name="Japanese",
+                rating=3,
+            ),
+            AddOnEvent(AddOnEventType.REVIEW_COMPLETED, deck_name="Japanese"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_add_on_presentation_cue_is_rendered_by_repetui(tmp_path, monkeypatch) -> None:
+    definition = AddOnDefinition(
+        id="review-acknowledgement",
+        name="Review Acknowledgement",
+        description="Acknowledge starting a review.",
+        events=frozenset({AddOnEventType.REVIEW_STARTED}),
+        settings=(),
+        handle=lambda _event, _settings: PresentationCue(
+            PresentationCueType.NOTICE,
+            message="Review started.",
+        ),
+    )
+    app, _ = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+    notifications = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+
+        assert notifications == [(('Review started.',), {})]
+
+
+@pytest.mark.asyncio
+async def test_failing_add_on_cannot_interrupt_rating_or_expose_private_error(
+    tmp_path, monkeypatch
+) -> None:
+    def fail(_event, _settings):
+        raise RuntimeError("private add-on detail")
+
+    definition = AddOnDefinition(
+        id="broken-feedback",
+        name="Broken Feedback",
+        description="A failing test add-on.",
+        events=frozenset({AddOnEventType.RATING_ACCEPTED}),
+        settings=(),
+        handle=fail,
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+    notifications = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        assert backend.rating == 3
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert notifications == [
+            (("Broken Feedback add-on failed.",), {"severity": "warning"})
+        ]
 
 
 @pytest.mark.asyncio

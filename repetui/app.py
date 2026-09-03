@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
 from typing import Protocol, cast
@@ -20,6 +20,17 @@ from textual.timer import Timer
 from textual.widgets import ListItem, ListView, Static
 
 from . import __version__
+from .addons import (
+    AddOnDefinition,
+    AddOnEvent,
+    AddOnEventType,
+    AddOnManager,
+    NumberSetting,
+    PresentationCue,
+    PresentationCueType,
+    SettingDefinition,
+    bundled_add_ons,
+)
 from .backend import AnkiBackend, BackendError, Deck, ReviewCard
 from .config import ProfilePaths
 from .controls import (
@@ -334,6 +345,66 @@ class ControlSettingItem(ListItem):
         )
 
 
+class AddOnItem(ListItem):
+    """One registered add-on and its profile-scoped enabled state."""
+
+    def __init__(self, definition: AddOnDefinition) -> None:
+        super().__init__()
+        self.definition = definition
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.definition.name, classes="add-on-label")
+        yield Static(classes="add-on-state")
+
+    def refresh_state(self, manager: AddOnManager) -> None:
+        self.query_one(".add-on-state", Static).update(
+            _on_off_text(manager.is_enabled(self.definition.id))
+        )
+
+
+def _on_off_text(enabled: bool) -> Text:
+    return Text("on" if enabled else "off", style="#79c98b" if enabled else "#aaa49b")
+
+
+class AddOnSettingItem(ListItem):
+    """One repetui-rendered enabled or declarative setting row."""
+
+    def __init__(
+        self,
+        setting: SettingDefinition | None = None,
+        value: str | int | bool = False,
+    ) -> None:
+        super().__init__()
+        self.setting = setting
+        self.value = value
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "enabled" if self.setting is None else self.setting.label,
+            classes="add-on-setting-label",
+        )
+        yield Static(
+            self._rendered_value(self.value),
+            classes="add-on-setting-value",
+        )
+
+    def _rendered_value(self, value: str | int | bool) -> Text:
+        if isinstance(value, bool):
+            return _on_off_text(value)
+        style = "#d7b85a" if isinstance(self.setting, NumberSetting) else "#d9d5ce"
+        return Text(str(value), style=style, no_wrap=True)
+
+    def refresh_value(self, manager: AddOnManager, add_on_id: str) -> None:
+        if self.setting is None:
+            value: str | int | bool = manager.is_enabled(add_on_id)
+        else:
+            value = manager.setting_values(add_on_id)[self.setting.id]
+        self.value = value
+        self.query_one(".add-on-setting-value", Static).update(
+            self._rendered_value(value)
+        )
+
+
 @dataclass(frozen=True)
 class PendingControlBinding:
     action: ReviewAction
@@ -344,7 +415,7 @@ class PendingControlBinding:
 class SettingsScreen(Screen[None]):
     """One tiny-pane-safe home for help, controls, and card sections."""
 
-    TABS = ("help", "controls", "sections")
+    TABS = ("help", "controls", "sections", "add-ons")
 
     BINDINGS = [
         Binding("escape", "back", "Back", show=False),
@@ -374,6 +445,7 @@ class SettingsScreen(Screen[None]):
             initial_tab = "help"
         self.initial_tab = initial_tab
         self.tab = initial_tab
+        self.add_on_detail: AddOnDefinition | None = None
         self.capturing: ReviewAction | None = None
         self.pending_binding: PendingControlBinding | None = None
 
@@ -403,6 +475,12 @@ class SettingsScreen(Screen[None]):
                 *(ControlSettingItem(action) for action in ReviewAction),
                 id="settings-controls",
             ),
+            ListView(
+                *(AddOnItem(definition) for definition in self.repetui.add_ons.definitions),
+                id="settings-add-ons",
+            ),
+            Static("no add-ons bundled", id="settings-add-ons-empty"),
+            ListView(id="settings-add-on-detail"),
             Static(
                 "j/k · enter bind · bs default · esc",
                 id="settings-footer",
@@ -422,6 +500,8 @@ class SettingsScreen(Screen[None]):
                 )
         for item in self.query(ControlSettingItem):
             item.refresh_binding(self.repetui.review_controls)
+        for item in self.query(AddOnItem):
+            item.refresh_state(self.repetui.add_ons)
         sections = self.query_one("#settings-sections", ListView)
         if sections.children:
             sections.index = 0
@@ -433,10 +513,17 @@ class SettingsScreen(Screen[None]):
         sections = self.query_one("#settings-sections", ListView)
         sections_empty = self.query_one("#settings-sections-empty", Static)
         controls = self.query_one("#settings-controls", ListView)
+        add_ons = self.query_one("#settings-add-ons", ListView)
+        add_ons_empty = self.query_one("#settings-add-ons-empty", Static)
+        add_on_detail = self.query_one("#settings-add-on-detail", ListView)
         help_scroll.display = tab == "help"
         sections.display = tab == "sections" and self.card is not None
         sections_empty.display = tab == "sections" and self.card is None
         controls.display = tab == "controls"
+        showing_add_ons = tab == "add-ons" and self.add_on_detail is None
+        add_ons.display = showing_add_ons and bool(add_ons.children)
+        add_ons_empty.display = showing_add_ons and not add_ons.children
+        add_on_detail.display = tab == "add-ons" and self.add_on_detail is not None
         self.query_one("#settings-tabs", Static).update(
             "  ".join(
                 f"[reverse] {name} [/reverse]" if name == tab else name
@@ -449,6 +536,11 @@ class SettingsScreen(Screen[None]):
             if controls.children and controls.index is None:
                 controls.index = 0
             controls.focus()
+        elif tab == "add-ons":
+            target = add_on_detail if self.add_on_detail is not None else add_ons
+            if target.children and target.index is None:
+                target.index = 0
+            target.focus()
         elif self.card is not None:
             if sections.children and sections.index is None:
                 sections.index = 0
@@ -456,10 +548,12 @@ class SettingsScreen(Screen[None]):
         self._show_default_footer()
 
     def action_previous_tab(self) -> None:
+        self.add_on_detail = None
         index = self.TABS.index(self.tab)
         self._show_tab(self.TABS[(index - 1) % len(self.TABS)])
 
     def action_next_tab(self) -> None:
+        self.add_on_detail = None
         index = self.TABS.index(self.tab)
         self._show_tab(self.TABS[(index + 1) % len(self.TABS)])
 
@@ -470,6 +564,8 @@ class SettingsScreen(Screen[None]):
             self.query_one("#settings-sections", ListView).action_cursor_down()
         elif self.tab == "controls":
             self.query_one("#settings-controls", ListView).action_cursor_down()
+        elif self.tab == "add-ons":
+            self._active_add_on_view().action_cursor_down()
 
     def action_up(self) -> None:
         if self.tab == "help":
@@ -478,6 +574,8 @@ class SettingsScreen(Screen[None]):
             self.query_one("#settings-sections", ListView).action_cursor_up()
         elif self.tab == "controls":
             self.query_one("#settings-controls", ListView).action_cursor_up()
+        elif self.tab == "add-ons":
+            self._active_add_on_view().action_cursor_up()
 
     def action_top(self) -> None:
         if self.tab == "help":
@@ -487,6 +585,8 @@ class SettingsScreen(Screen[None]):
             view = self.query_one("#settings-sections", ListView)
         elif self.tab == "controls":
             view = self.query_one("#settings-controls", ListView)
+        elif self.tab == "add-ons":
+            view = self._active_add_on_view()
         else:
             return
         if view.children:
@@ -500,12 +600,17 @@ class SettingsScreen(Screen[None]):
             view = self.query_one("#settings-sections", ListView)
         elif self.tab == "controls":
             view = self.query_one("#settings-controls", ListView)
+        elif self.tab == "add-ons":
+            view = self._active_add_on_view()
         else:
             return
         if view.children:
             view.index = len(view.children) - 1
 
     def action_cycle(self) -> None:
+        if self.tab == "add-ons":
+            self._cycle_add_on_value()
+            return
         if self.tab == "controls":
             action = self._selected_control_action()
             if action is not None:
@@ -530,6 +635,80 @@ class SettingsScreen(Screen[None]):
         self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
         item.refresh_mode(self.repetui.preferences, identity)
 
+    def _active_add_on_view(self) -> ListView:
+        return self.query_one(
+            "#settings-add-on-detail"
+            if self.add_on_detail is not None
+            else "#settings-add-ons",
+            ListView,
+        )
+
+    def _selected_add_on(self) -> AddOnItem | None:
+        view = self.query_one("#settings-add-ons", ListView)
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return None
+        item = view.children[view.index]
+        return item if isinstance(item, AddOnItem) else None
+
+    def _open_selected_add_on(self) -> None:
+        item = self._selected_add_on()
+        if item is None:
+            return
+        self.add_on_detail = item.definition
+        detail = self.query_one("#settings-add-on-detail", ListView)
+        detail.clear()
+        values = self.repetui.add_ons.setting_values(item.definition.id)
+        detail.append(
+            AddOnSettingItem(
+                value=self.repetui.add_ons.is_enabled(item.definition.id)
+            )
+        )
+        for setting in item.definition.settings:
+            detail.append(AddOnSettingItem(setting, values[setting.id]))
+        detail.index = 0
+        self._show_tab("add-ons")
+
+    def _cycle_add_on_value(self) -> None:
+        if self.add_on_detail is None:
+            item = self._selected_add_on()
+            if item is None:
+                return
+            try:
+                self.repetui.add_ons.set_enabled(
+                    item.definition.id,
+                    not self.repetui.add_ons.is_enabled(item.definition.id),
+                )
+            except OSError:
+                self._show_footer("[err] add-on not saved")
+                return
+            item.refresh_state(self.repetui.add_ons)
+            self._show_default_footer()
+            return
+        view = self.query_one("#settings-add-on-detail", ListView)
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return
+        item = view.children[view.index]
+        if not isinstance(item, AddOnSettingItem):
+            return
+        try:
+            if item.setting is None:
+                self.repetui.add_ons.set_enabled(
+                    self.add_on_detail.id,
+                    not self.repetui.add_ons.is_enabled(self.add_on_detail.id),
+                )
+                registry_item = self._selected_add_on()
+                if registry_item is not None:
+                    registry_item.refresh_state(self.repetui.add_ons)
+            else:
+                self.repetui.add_ons.cycle_setting(
+                    self.add_on_detail.id, item.setting.id
+                )
+        except OSError:
+            self._show_footer("[err] add-on not saved")
+            return
+        item.refresh_value(self.repetui.add_ons, self.add_on_detail.id)
+        self._show_default_footer()
+
     def _selected_control_action(self) -> ReviewAction | None:
         view = self.query_one("#settings-controls", ListView)
         if view.index is None or not (0 <= view.index < len(view.children)):
@@ -548,6 +727,11 @@ class SettingsScreen(Screen[None]):
                 "j/k · space change · h/l tabs · esc"
                 if self.card is not None
                 else "h/l tabs · esc"
+            ),
+            "add-ons": (
+                "j/k · space change · esc back"
+                if self.add_on_detail is not None
+                else "j/k · space toggle · enter settings"
             ),
         }[self.tab]
         self._show_footer(message)
@@ -603,6 +787,14 @@ class SettingsScreen(Screen[None]):
                 self._show_default_footer()
             return
         if self.capturing is None:
+            if self.tab == "add-ons" and event.key == "enter":
+                event.stop()
+                event.prevent_default()
+                if self.add_on_detail is None:
+                    self._open_selected_add_on()
+                else:
+                    self.action_cycle()
+                return
             if self.tab == "controls" and event.key == "enter":
                 event.stop()
                 event.prevent_default()
@@ -639,6 +831,10 @@ class SettingsScreen(Screen[None]):
             self.capturing = None
             self.pending_binding = None
             self._show_default_footer()
+            return
+        if self.tab == "add-ons" and self.add_on_detail is not None:
+            self.add_on_detail = None
+            self._show_tab("add-ons")
             return
         self.app.pop_screen()
         if self.review is not None:
@@ -707,6 +903,10 @@ class ReviewScreen(Screen[None]):
     def on_mount(self) -> None:
         self.repetui.backend.begin_review(self.deck.id)
         self.load_next()
+        if self.card is not None:
+            self.repetui.dispatch_add_on_event(
+                AddOnEvent(AddOnEventType.REVIEW_STARTED, deck_name=self.deck.name)
+            )
 
     def on_unmount(self) -> None:
         if self._rating_feedback_timer is not None:
@@ -880,6 +1080,20 @@ class ReviewScreen(Screen[None]):
             self.repetui.backend.answer(rating)
             self._set_rating_feedback(rating)
             self.load_next()
+            self.repetui.dispatch_add_on_event(
+                AddOnEvent(
+                    AddOnEventType.RATING_ACCEPTED,
+                    deck_name=self.deck.name,
+                    rating=rating,
+                )
+            )
+            if self.card is None:
+                self.repetui.dispatch_add_on_event(
+                    AddOnEvent(
+                        AddOnEventType.REVIEW_COMPLETED,
+                        deck_name=self.deck.name,
+                    )
+                )
         except Exception as exc:
             self.notify(str(exc), severity="error")
 
@@ -1275,24 +1489,36 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    #settings-help, #settings-sections, #settings-sections-empty, #settings-controls {
+    #settings-help,
+    #settings-sections,
+    #settings-sections-empty,
+    #settings-controls,
+    #settings-add-ons,
+    #settings-add-ons-empty,
+    #settings-add-on-detail {
         height: 1fr;
         background: #111416;
         scrollbar-size-vertical: 1;
     }
 
-    #settings-sections-empty {
+    #settings-sections-empty, #settings-add-ons-empty {
         color: #aaa49b;
     }
 
-    AnswerLayoutSettingItem, SectionSettingItem, ControlSettingItem {
+    AnswerLayoutSettingItem,
+    SectionSettingItem,
+    ControlSettingItem,
+    AddOnItem,
+    AddOnSettingItem {
         height: 1;
         layout: horizontal;
     }
 
     AnswerLayoutSettingItem.-highlight,
     SectionSettingItem.-highlight,
-    ControlSettingItem.-highlight {
+    ControlSettingItem.-highlight,
+    AddOnItem.-highlight,
+    AddOnSettingItem.-highlight {
         background: #293034;
     }
 
@@ -1313,6 +1539,19 @@ class RepetuiApp(App[None]):
     }
 
     .control-binding {
+        width: 9;
+        height: 1;
+        text-align: right;
+    }
+
+    .add-on-label, .add-on-setting-label {
+        width: 1fr;
+        height: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .add-on-state, .add-on-setting-value {
         width: 9;
         height: 1;
         text-align: right;
@@ -1377,11 +1616,18 @@ class RepetuiApp(App[None]):
         profile: ProfilePaths,
         preferences: Preferences | None = None,
         syncer: Callable[[ProfilePaths], SyncOutcome] = sync_profile,
+        *,
+        add_ons: Sequence[AddOnDefinition] | None = None,
     ) -> None:
         super().__init__()
         self.backend = backend
         self.profile = profile
         self.preferences = preferences if preferences is not None else JsonPreferences()
+        self.add_ons = AddOnManager(
+            bundled_add_ons() if add_ons is None else add_ons,
+            self.preferences,
+            profile,
+        )
         self.review_controls = self.preferences.review_controls(profile)
         self.set_keymap(self.review_controls.keymap())
         self.syncer = syncer
@@ -1398,6 +1644,25 @@ class RepetuiApp(App[None]):
         self.preferences.set_review_controls(self.profile, controls)
         self.review_controls = controls
         self.set_keymap(controls.keymap())
+
+    def dispatch_add_on_event(self, event: AddOnEvent) -> tuple[PresentationCue, ...]:
+        """Deliver a presentation event without exposing collection operations."""
+        report = self.add_ons.dispatch(event)
+        for failure in report.failures:
+            definition = next(
+                definition
+                for definition in self.add_ons.definitions
+                if definition.id == failure.add_on_id
+            )
+            self.notify(f"{definition.name} add-on failed.", severity="warning")
+        for cue in report.cues:
+            self.present_add_on_cue(cue)
+        return report.cues
+
+    def present_add_on_cue(self, cue: PresentationCue) -> None:
+        """Render one supported cue without exposing application internals."""
+        if cue.type is PresentationCueType.NOTICE and cue.message:
+            self.notify(cue.message)
 
     def on_mount(self) -> None:
         try:
