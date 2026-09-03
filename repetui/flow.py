@@ -179,12 +179,30 @@ def _expanded_body(section: PresentationSection) -> str:
     return text
 
 
+def _is_unlabelled_section(section: PresentationSection) -> bool:
+    return section.id.endswith(":fallback")
+
+
 def _stacked_section(section: PresentationSection) -> Text:
     body = _expanded_body(section)
     result = Text(body, style="#d9d5ce", overflow="fold")
+    if _is_unlabelled_section(section):
+        return result
     result.append("  · ", style="#817d76")
     result.append(section_name(section), style="#817d76")
     return result
+
+
+def _short_unlabelled_blocks(section: PresentationSection) -> tuple[str, ...]:
+    if not _is_unlabelled_section(section):
+        return ()
+    blocks = tuple(block.strip() for block in _BLOCK_BREAK.split(section.text))
+    if len(blocks) < 2 or any(
+        not block or "\n" in block or cell_len(block) > _SHORT_BLOCK_WIDTH
+        for block in blocks
+    ):
+        return ()
+    return blocks
 
 
 def _back(
@@ -205,6 +223,11 @@ def _back(
             continue
         if state.mode is SectionMode.SHOW:
             shown = _shown_section(section)
+            short_blocks = _short_unlabelled_blocks(section)
+            if short_blocks:
+                flush_compact()
+                rows.extend(Text(block, style="#d9d5ce") for block in short_blocks)
+                continue
             if (
                 answer_layout is AnswerLayout.STACKED
                 and _is_compact_section(section, shown)

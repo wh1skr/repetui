@@ -64,26 +64,50 @@ def test_section_modes_survive_restart_and_are_scoped_to_template(tmp_path) -> N
     }
 
 
-def test_answer_layout_defaults_compact_and_survives_restart_per_template(
+def test_answer_layout_defaults_stacked_and_survives_restart_per_template(
     tmp_path,
 ) -> None:
     path = tmp_path / "preferences.json"
     preferences = JsonPreferences(path)
 
-    assert preferences.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.COMPACT
+    assert preferences.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.STACKED
     assert not path.exists()
 
-    preferences.set_answer_layout(JAPANESE_RECOGNITION, AnswerLayout.STACKED)
+    preferences.set_answer_layout(JAPANESE_RECOGNITION, AnswerLayout.COMPACT)
     restarted = JsonPreferences(path)
 
-    assert restarted.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.STACKED
-    assert restarted.answer_layout(JAPANESE_PRODUCTION) is AnswerLayout.COMPACT
-    assert restarted.answer_layout(AWS_BASIC) is AnswerLayout.COMPACT
+    assert restarted.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.COMPACT
+    assert restarted.answer_layout(JAPANESE_PRODUCTION) is AnswerLayout.STACKED
+    assert restarted.answer_layout(AWS_BASIC) is AnswerLayout.STACKED
     document = json.loads(path.read_text())
-    assert document["templates"]["204:0"]["answer_layout"] == "stacked"
+    assert document["templates"]["204:0"]["answer_layout"] == "compact"
 
-    restarted.set_answer_layout(JAPANESE_RECOGNITION, AnswerLayout.COMPACT)
+    restarted.set_answer_layout(JAPANESE_RECOGNITION, AnswerLayout.STACKED)
     assert "answer_layout" not in json.loads(path.read_text())["templates"]["204:0"]
+
+
+def test_existing_saved_stacked_answer_layout_remains_valid(tmp_path) -> None:
+    path = tmp_path / "preferences.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {},
+                "templates": {
+                    "204:0": {
+                        "answer_layout": "stacked",
+                        "note_type_name": "Japanese",
+                        "sections": {},
+                        "template_name": "Recognition",
+                    }
+                },
+            }
+        )
+    )
+
+    preferences = JsonPreferences(path)
+
+    assert preferences.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.STACKED
 
 
 def test_default_path_respects_xdg_config_home(monkeypatch, tmp_path) -> None:

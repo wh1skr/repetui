@@ -205,10 +205,10 @@ class JsonPreferences:
         template = self._templates.get(self._template_key(identity), {})
         try:
             return AnswerLayout(
-                template.get("answer_layout", AnswerLayout.COMPACT.value)
+                template.get("answer_layout", AnswerLayout.STACKED.value)
             )
         except (TypeError, ValueError):
-            return AnswerLayout.COMPACT
+            return AnswerLayout.STACKED
 
     def set_answer_layout(
         self,
@@ -224,7 +224,7 @@ class JsonPreferences:
                 "sections": {},
             },
         )
-        if layout is AnswerLayout.COMPACT:
+        if layout is AnswerLayout.STACKED:
             template.pop("answer_layout", None)
         else:
             template["answer_layout"] = layout.value

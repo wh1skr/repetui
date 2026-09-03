@@ -838,10 +838,12 @@ async def test_real_kanji_card_flows_and_scrolls_at_40_by_6(tmp_path) -> None:
 
         await pilot.press("enter")
         flow = rendered_text(review)
-        assert flow.splitlines()[1].startswith(
-            "Meaning: Stylish  ·  On'yomi: すい  ·  Kun'yomi: いき"
-        )
-        assert "Radicals: 米, 九, 十 (rice, nine, cross)" in flow
+        assert flow.splitlines()[1:5] == [
+            "Stylish  · Meaning",
+            "すい  · On'yomi",
+            "いき  · Kun'yomi",
+            "米, 九, 十 (rice, nine, cross)  · Radicals",
+        ]
         assert "Meaning Mnemonic · A stylish rice ceremony" in flow
         assert flow.count("makes the unusual shape memorable.") == 6
         assert "Reading Mnemonic · すい sounds like a stylish suit." in flow
@@ -1052,8 +1054,8 @@ async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> 
 
         flow = rendered_text(review)
         first_row = rendered_card_row(review, 0)
-        assert "Reading · そう" in flow
-        assert "Meaning · burial; interment" in flow
+        assert "そう  · Reading" in flow
+        assert "burial; interment  · Meaning" in flow
         assert "› Mnemonic" in flow
         assert "Flowers laid upon a grave." not in flow
         assert "Examples" not in flow
@@ -1107,7 +1109,7 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_sections_settings_toggle_stacked_answers_for_the_current_template(
+async def test_sections_settings_toggle_answer_layout_for_the_current_template(
     tmp_path,
 ) -> None:
     preferences = JsonPreferences(tmp_path / "preferences.json")
@@ -1120,28 +1122,28 @@ async def test_sections_settings_toggle_stacked_answers_for_the_current_template
         assert isinstance(settings, SettingsScreen)
         layout_row = settings.query_one("#settings-sections").children[0]
         assert str(layout_row.query_one(".setting-label").render()) == "answer layout"
-        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
+        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
 
         await pilot.press("space")
-        assert preferences.answer_layout(content.identity) is AnswerLayout.STACKED
-        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
+        assert preferences.answer_layout(content.identity) is AnswerLayout.COMPACT
+        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
 
         await pilot.press("escape", "enter")
         review = app.screen
         assert isinstance(review, ReviewScreen)
-        flow = rendered_text(review)
-        assert "そう  · Reading\nburial; interment  · Meaning" in flow
-        assert "Meaning · burial; interment" not in flow
+        assert "Reading · そう" in rendered_text(review)
 
         await pilot.press("?")
         settings = app.screen
         assert isinstance(settings, SettingsScreen)
         layout_row = settings.query_one("#settings-sections").children[0]
-        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
+        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
 
         await pilot.press("space", "escape")
-        assert preferences.answer_layout(content.identity) is AnswerLayout.COMPACT
-        assert "Reading · そう" in rendered_text(review)
+        assert preferences.answer_layout(content.identity) is AnswerLayout.STACKED
+        flow = rendered_text(review)
+        assert "そう  · Reading\nburial; interment  · Meaning" in flow
+        assert "Meaning · burial; interment" not in flow
 
 
 @pytest.mark.asyncio
