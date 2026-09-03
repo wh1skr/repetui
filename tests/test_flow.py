@@ -119,6 +119,97 @@ def test_stacked_flow_starts_each_short_answer_at_the_left_edge() -> None:
     assert "meaning info" in revealed.plain
 
 
+def test_stacked_flow_keeps_a_generic_one_line_answer_unlabelled() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(1, "Basic", 0, "Card 1"),
+            "question",
+            "answer",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Default",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    )
+
+    assert revealed.plain.splitlines()[1:] == ["answer"]
+
+
+@pytest.mark.parametrize("answer_layout", tuple(AnswerLayout))
+def test_short_unlabelled_answers_use_adjacent_rows_in_every_layout(
+    answer_layout: AnswerLayout,
+) -> None:
+    front = '<div class="word">房</div><div>Vocabulary Meaning</div>'
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(204, "Japanese Vocabulary", 0, "Vocabulary Meaning"),
+            front,
+            front + "<br>Cluster, Tassel, Tuft<br><br>ふさ",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese::Vocabulary",
+        DueCounts(1, 0, 37),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=answer_layout,
+    )
+
+    assert revealed.plain.splitlines()[1:] == ["Cluster, Tassel, Tuft", "ふさ"]
+
+
+@pytest.mark.parametrize("answer_layout", tuple(AnswerLayout))
+def test_unlabelled_long_prose_keeps_its_paragraph_gap(
+    answer_layout: AnswerLayout,
+) -> None:
+    front = "Question"
+    first_paragraph = (
+        "This explanation is intentionally longer than a short answer value so its "
+        "paragraph structure must remain visible."
+    )
+    second_paragraph = "This supporting explanation belongs in a separate paragraph."
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(204, "Japanese", 0, "Recognition"),
+            front,
+            front + f"<br>{first_paragraph}<br><br>{second_paragraph}",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=answer_layout,
+    )
+
+    assert f"{first_paragraph}\n\n{second_paragraph}" in revealed.plain
+
+
 def test_stacked_flow_leaves_multiline_and_folded_sections_unchanged() -> None:
     presentation = real_kanji_presentation()
     states = (
