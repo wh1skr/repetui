@@ -17,6 +17,7 @@ from repetui.addons import (
     ToggleSetting,
 )
 from repetui.app import (
+    CompletionCelebrationScreen,
     DeckScreen,
     ErrorScreen,
     FlagSelectionPill,
@@ -132,7 +133,7 @@ def make_app(
     decks: list[Deck] | None = None,
     counts: DueCounts | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
-    add_ons: tuple[AddOnDefinition, ...] = (),
+    add_ons: tuple[AddOnDefinition, ...] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
     backend = FakeBackend(card_content, decks, counts)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
@@ -199,6 +200,205 @@ def japanese_card() -> RawCardContent:
         <h2>Examples</h2><p>葬式 — funeral</p>
         """,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_key", ("q", "u", "1", "s", "escape"))
+async def test_enabled_completion_celebration_takes_over_full_pane_and_consumes_skip(
+    tmp_path, skip_key
+) -> None:
+    app, backend = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        assert celebration.query_one("#completion-art").region == (0, 0, 40, 6)
+        rendered = str(celebration.query_one("#completion-art").render())
+        assert "deck complete" in rendered
+        assert "Japanese" in rendered
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert backend.rating == 3
+
+        await pilot.press(skip_key)
+
+        assert app.screen is review
+        assert backend.rating == 3
+        assert backend.undo_calls == 0
+        assert app.syncing is False
+        await pilot.pause(0.2)
+        assert app.screen is review
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_waits_for_the_final_due_card(tmp_path) -> None:
+    backend = TwoCardBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None and review.card.id == 43
+
+        await pilot.press("enter", "3")
+
+        assert isinstance(app.screen, CompletionCelebrationScreen)
+        assert app.screen_stack[-2] is review
+        assert review.card is None
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_adapts_to_narrow_resize_and_stays_skippable(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+    app.add_ons.set_setting("completion-celebration", "duration", "long")
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        review = app.screen_stack[-2]
+
+        await pilot.resize_terminal(8, 4)
+        rendered = str(celebration.query_one("#completion-art").render())
+        assert "complete" in rendered
+
+        await pilot.press("escape")
+        assert app.screen is review
+        await pilot.pause(0.2)
+        assert app.screen is review
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_duration_returns_to_existing_done_screen(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+    app.add_ons.set_setting("completion-celebration", "duration", "short")
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        review = app.screen_stack[-2]
+
+        await pilot.pause(0.9)
+        assert app.screen is review
+        await pilot.pause(0.2)
+        assert app.screen is review
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_cleans_timers_on_application_shutdown(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        app.exit()
+        await pilot.pause()
+
+    assert celebration._frame_timer is None
+    assert celebration._finish_timer is None
+    assert app.backend.is_open is False
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_is_discarded_if_another_screen_takes_over(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        review = app.screen_stack[-2]
+
+        app.push_screen(SettingsScreen())
+        await pilot.pause()
+        assert celebration._frame_timer is None
+        assert celebration._finish_timer is None
+
+        app.pop_screen()
+        await pilot.pause()
+        assert app.screen is review
+
+
+@pytest.mark.asyncio
+async def test_disabled_completion_celebration_reaches_done_without_takeover(
+    tmp_path,
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+async def test_completion_duration_uses_the_shared_add_ons_settings_surface(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("?", "h", "enter")
+
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        detail = settings.query_one("#settings-add-on-detail")
+        assert [
+            (
+                str(item.query_one(".add-on-setting-label").render()),
+                str(item.query_one(".add-on-setting-value").render()),
+            )
+            for item in detail.children
+        ] == [("enabled", "off"), ("Duration", "medium")]
+
+
+@pytest.mark.asyncio
+async def test_already_empty_and_reopened_review_never_celebrate(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+    backend.card_available = False
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+
+        await pilot.press("escape", "enter")
+        reopened = app.screen
+        assert isinstance(reopened, ReviewScreen)
+        assert reopened.card is None
+        assert backend.rating is None
 
 
 def real_kanji_card() -> RawCardContent:
@@ -1658,6 +1858,20 @@ class CountsChangeWhenReopenedBackend(FakeBackend):
             self._decks = [Deck(1, "Japanese", 0, DueCounts(0, 0, 0))]
 
 
+class ReviewEmptiesWhenReopenedBackend(FakeBackend):
+    """Make an active review empty only after a sync reopen."""
+
+    def __init__(self) -> None:
+        super().__init__(counts=DueCounts(0, 0, 1))
+        self.open_calls = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+        super().open()
+        if self.open_calls > 1:
+            self.card_available = False
+
+
 @pytest.mark.asyncio
 async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
     backend = FailingBackend()
@@ -1808,6 +2022,32 @@ async def test_sync_keeps_background_frozen_until_popup_closes(tmp_path) -> None
         await pilot.pause(1.0)
         assert app.screen is decks
         assert "0/0/0" in str(decks.query_one(".deck-row").render())
+
+
+@pytest.mark.asyncio
+async def test_sync_to_zero_never_triggers_completion_celebration(tmp_path) -> None:
+    backend = ReviewEmptiesWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=lambda _profile: SyncOutcome(SyncStatus.SYNCED),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None
+
+        await pilot.press("s")
+        await pilot.pause(1.2)
+
+        assert app.screen is review
+        assert review.card is None
+        assert backend.rating is None
 
 
 @pytest.mark.asyncio
