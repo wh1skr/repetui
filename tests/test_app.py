@@ -4,7 +4,7 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from textual.widgets import Input
+from textual.widgets import Input, Static
 
 from repetui.addons import (
     AddOnDefinition,
@@ -2208,8 +2208,9 @@ async def test_collection_close_failure_becomes_dismissible_without_running_sync
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [SyncStatus.OFFLINE, SyncStatus.FULL_SYNC_REQUIRED])
 async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal(
-    tmp_path,
+    tmp_path, status,
 ) -> None:
     backend = ReopenFailingBackend()
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
@@ -2217,7 +2218,7 @@ async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal
         backend,
         profile,
         JsonPreferences(tmp_path / "preferences.json"),
-        lambda _profile: SyncOutcome(SyncStatus.OFFLINE, "network problem"),
+        lambda _profile: SyncOutcome(status, "sync problem"),
     )
 
     async with app.run_test(size=(40, 6)) as pilot:
@@ -2394,3 +2395,55 @@ async def test_failed_sync_reopens_collection_and_clears_busy_state(tmp_path) ->
         await pilot.press("enter")
         assert app.syncing is False
         assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_review", [False, True])
+async def test_full_sync_conflict_stays_visible_and_can_be_dismissed_and_retried(
+    tmp_path, in_review
+) -> None:
+    calls = []
+
+    def conflict(profile):
+        calls.append(profile)
+        return SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+
+    app, backend = make_app(tmp_path, syncer=conflict)
+    async with app.run_test(size=(40, 6)) as pilot:
+        if in_review:
+            await pilot.press("enter")
+        origin = app.screen
+        await pilot.press("s")
+        await pilot.pause(1.2)
+
+        assert isinstance(app.screen, SyncPopup)
+        surface = app.screen.query_one("#sync-recovery")
+        assert surface.display
+        message = str(surface.query_one(Static).render())
+        assert "Cards were not synced" in message
+        assert "Back up both collections" in message
+        assert "replaces one side" in message
+        assert "Esc/Enter: back" in message
+        assert surface.region.height <= 6
+        assert surface.virtual_size.height <= surface.size.height
+        assert backend.is_open
+        assert not app.screen.query_one("#sync-popup").display
+
+        await pilot.resize_terminal(20, 4)
+        assert surface.region.width <= 20
+        assert surface.region.height <= 4
+        assert surface.max_scroll_y > 0
+        await pilot.press("end")
+        await pilot.pause()
+        assert surface.scroll_y == surface.max_scroll_y
+        await pilot.resize_terminal(40, 6)
+
+        await pilot.press("enter")
+        assert app.screen is origin
+        assert not app.syncing
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        assert len(calls) == 2
+        await pilot.press("escape")
+        assert app.screen is origin
+        assert backend.rating is None

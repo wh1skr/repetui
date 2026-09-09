@@ -53,6 +53,19 @@ Navigation remains fixed so it is always recoverable. Review actions can be
 rebound under `?` → Controls; conflicts are shown before an existing action is
 unbound.
 
+### Full-sync conflicts
+
+If sync reports **full sync required**, your cards have not been synchronized.
+Repetui will not choose which populated collection to replace. Back up both
+collections, close Repetui, and resolve the affected local profile in Anki
+Desktop. Upload replaces the AnkiWeb collection; download replaces the local
+collection. If both sides have unsynced progress, preserve and reconcile it
+before choosing either direction. Windows and WSL may use separate local
+collections; syncing one does not resolve a conflict in the other.
+
+Press `Esc` or `Enter` to dismiss the warning; use arrow keys to scroll it in
+smaller panes. After resolving the conflict, reopen Repetui and press `s` again.
+
 ## Card rendering
 
 Anki cards are HTML documents designed for a browser. `repetui` translates
