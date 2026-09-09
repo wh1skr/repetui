@@ -79,7 +79,7 @@ def test_missing_ankiweb_credentials_require_sign_in(tmp_path: Path) -> None:
 class FakeSyncCollection:
     instances = []
     status_required = SyncStatusResponse.Required.NORMAL_SYNC
-    collection_required = SyncCollectionResponse.NORMAL_SYNC
+    collection_required = SyncCollectionResponse.NO_CHANGES
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -121,7 +121,7 @@ def test_normal_sync_includes_media(
     profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
     FakeSyncCollection.instances.clear()
     FakeSyncCollection.status_required = SyncStatusResponse.Required.NORMAL_SYNC
-    FakeSyncCollection.collection_required = SyncCollectionResponse.NORMAL_SYNC
+    FakeSyncCollection.collection_required = SyncCollectionResponse.NO_CHANGES
     monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
 
     outcome = sync_profile(profile)
@@ -132,18 +132,105 @@ def test_normal_sync_includes_media(
     assert collection.closed is True
 
 
-def test_required_full_download_is_performed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("required", [SyncCollectionResponse.NORMAL_SYNC, 999])
+def test_incomplete_or_unknown_sync_response_is_not_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, required: int
+) -> None:
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required", SyncStatusResponse.Required.NORMAL_SYNC
+    )
+    monkeypatch.setattr(FakeSyncCollection, "collection_required", required)
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+
+    outcome = sync_profile(profile)
+
+    assert not outcome.ok
+    assert outcome.status is SyncStatus.FAILED
+    assert not FakeSyncCollection.instances[-1].media_synced
+    assert FakeSyncCollection.instances[-1].closed
+
+
+@pytest.mark.parametrize("required, upload", [
+    (SyncCollectionResponse.FULL_DOWNLOAD, False),
+    (SyncCollectionResponse.FULL_UPLOAD, True),
+])
+def test_unambiguous_full_sync_is_performed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, required: int, upload: bool
 ) -> None:
     profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
     FakeSyncCollection.instances.clear()
-    FakeSyncCollection.status_required = SyncStatusResponse.Required.FULL_SYNC
-    FakeSyncCollection.collection_required = SyncCollectionResponse.FULL_DOWNLOAD
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required", SyncStatusResponse.Required.FULL_SYNC
+    )
+    monkeypatch.setattr(FakeSyncCollection, "collection_required", required)
     monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
 
     outcome = sync_profile(profile)
 
     collection = FakeSyncCollection.instances[-1]
     assert outcome.ok is True
-    assert collection.full_sync == (12, False)
+    assert collection.full_sync == (12, upload)
     assert collection.media_synced is True
+
+
+@pytest.mark.parametrize("initial_status", [
+    SyncStatusResponse.Required.NORMAL_SYNC,
+    SyncStatusResponse.Required.FULL_SYNC,
+])
+def test_unresolved_full_sync_never_reports_success_or_transfers_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_status: int
+) -> None:
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(FakeSyncCollection, "status_required", initial_status)
+    monkeypatch.setattr(FakeSyncCollection, "collection_required", SyncCollectionResponse.FULL_SYNC)
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+
+    outcome = sync_profile(profile)
+
+    assert outcome.ok is False
+    assert outcome.status.value == "full_sync_required"
+    assert "not synced" in outcome.detail
+    collection = FakeSyncCollection.instances[-1]
+    assert collection.media_synced is False
+    assert collection.full_sync is None
+    assert collection.closed is True
+
+
+def test_resolved_conflict_can_be_retried_successfully(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required", SyncStatusResponse.Required.NORMAL_SYNC
+    )
+    monkeypatch.setattr(FakeSyncCollection, "collection_required", SyncCollectionResponse.FULL_SYNC)
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+    assert sync_profile(profile).status is SyncStatus.FULL_SYNC_REQUIRED
+
+    monkeypatch.setattr(
+        FakeSyncCollection, "collection_required", SyncCollectionResponse.NO_CHANGES
+    )
+    assert sync_profile(profile).status is SyncStatus.SYNCED
+    assert FakeSyncCollection.instances[-1].media_synced
+    assert FakeSyncCollection.instances[-1].closed
+
+
+def test_media_failure_after_collection_sync_does_not_report_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required", SyncStatusResponse.Required.NORMAL_SYNC
+    )
+    monkeypatch.setattr(
+        FakeSyncCollection, "collection_required", SyncCollectionResponse.NO_CHANGES
+    )
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+
+    def fail_media(self, auth):
+        raise ConnectionError("media connection lost")
+
+    monkeypatch.setattr(FakeSyncCollection, "sync_media", fail_media)
+    assert sync_profile(profile).status is SyncStatus.OFFLINE
+    assert FakeSyncCollection.instances[-1].closed

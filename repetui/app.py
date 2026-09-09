@@ -1404,7 +1404,7 @@ class FlagSelectionPill(StatusPill):
 
 
 class SyncPopup(StatusPill):
-    """One modal, terminal-native sync message over the originating screen."""
+    """Sync status and persistent conflict guidance over the originating screen."""
 
     SPINNER_FRAMES = ("|", "/", "-", "\\")
     SPINNER_INTERVAL = 0.12
@@ -1425,6 +1425,20 @@ class SyncPopup(StatusPill):
         self._dismiss_timer: Timer | None = None
         self._failure_dismissible = False
         self._fatal = False
+
+    def compose(self) -> ComposeResult:
+        yield from super().compose()
+        with VerticalScroll(id="sync-recovery"):
+            yield Static(
+                Text(
+                    "[err] full sync required\n"
+                    "Cards were not synced.\n"
+                    "Back up both collections before\n"
+                    "resolving this profile in Anki.\n"
+                    "Upload/download replaces one side.\n"
+                    "Esc/Enter: back"
+                )
+            )
 
     def on_mount(self) -> None:
         super().on_mount()
@@ -1453,6 +1467,12 @@ class SyncPopup(StatusPill):
         else:
             self._failure_dismissible = True
             self._fatal = result.reopen_error is not None
+            if outcome.status is SyncStatus.FULL_SYNC_REQUIRED and not self._fatal:
+                self.query_one("#sync-popup").display = False
+                recovery = self.query_one("#sync-recovery", VerticalScroll)
+                recovery.display = True
+                recovery.focus()
+                return
             message = (
                 "[err] collection unavailable"
                 if self._fatal
@@ -1689,6 +1709,18 @@ class RepetuiApp(App[None]):
 
     .status-pill.-error {
         color: #dc6b72;
+    }
+
+    #sync-recovery {
+        display: none;
+        width: 40;
+        max-width: 100%;
+        height: auto;
+        max-height: 100%;
+        padding: 0;
+        background: #293034;
+        color: #dc6b72;
+        scrollbar-size-vertical: 1;
     }
     """
 

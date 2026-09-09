@@ -18,6 +18,7 @@ class SyncStatus(str, Enum):
     OFFLINE = "offline"
     AUTH_REQUIRED = "auth_required"
     COLLECTION_UNAVAILABLE = "collection_unavailable"
+    FULL_SYNC_REQUIRED = "full_sync_required"
     FAILED = "failed"
 
 
@@ -133,7 +134,7 @@ def _auth(profile: ProfilePaths):
 
 
 def sync_profile(profile: ProfilePaths) -> SyncOutcome:
-    """Run collection and media sync, including required full syncs."""
+    """Sync collection and media, stopping when full sync needs a user's choice."""
     from anki.collection import Collection
     from anki.sync_pb2 import SyncCollectionResponse, SyncStatusResponse
 
@@ -150,6 +151,14 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
         result = collection.sync_collection(auth, sync_media=False)
         if result.new_endpoint:
             auth.endpoint = result.new_endpoint.rstrip("/") + "/"
+        if result.required == SyncCollectionResponse.FULL_SYNC:
+            # Both sides contain data. Media sync cannot resolve this choice,
+            # and choosing a direction here could discard unsynced reviews.
+            return SyncOutcome(
+                SyncStatus.FULL_SYNC_REQUIRED,
+                "Cards were not synced. Back up both collections before resolving "
+                "this profile in Anki. Upload/download replaces one side.",
+            )
         if result.required in {
             SyncCollectionResponse.FULL_DOWNLOAD,
             SyncCollectionResponse.FULL_UPLOAD,
@@ -162,6 +171,11 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
                 upload=upload,
             )
             collection.reopen(after_full_sync=True)
+        elif result.required != SyncCollectionResponse.NO_CHANGES:
+            return SyncOutcome(
+                SyncStatus.FAILED,
+                "Collection sync did not complete. Try syncing again.",
+            )
         collection.sync_media(auth)
         return SyncOutcome(SyncStatus.SYNCED)
     except Exception as exc:
