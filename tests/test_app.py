@@ -39,7 +39,7 @@ from repetui.presentation import (
     SourceField,
     present_card,
 )
-from repetui.sync import SyncOutcome, SyncStatus
+from repetui.sync import FullSyncDirection, SyncOutcome, SyncStatus
 
 
 class FakeBackend:
@@ -2208,7 +2208,9 @@ async def test_collection_close_failure_becomes_dismissible_without_running_sync
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [SyncStatus.OFFLINE, SyncStatus.FULL_SYNC_REQUIRED])
+@pytest.mark.parametrize(
+    "status", [SyncStatus.OFFLINE, SyncStatus.FULL_SYNC_REQUIRED, SyncStatus.SYNCED]
+)
 async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal(
     tmp_path, status,
 ) -> None:
@@ -2421,7 +2423,8 @@ async def test_full_sync_conflict_stays_visible_and_can_be_dismissed_and_retried
         assert surface.display
         message = str(surface.query_one(Static).render())
         assert "Cards were not synced" in message
-        assert "Back up both collections" in message
+        assert "d: download" in message
+        assert "u: upload" in message
         assert "replaces one side" in message
         assert "Esc/Enter: back" in message
         assert surface.region.height <= 6
@@ -2447,3 +2450,89 @@ async def test_full_sync_conflict_stays_visible_and_can_be_dismissed_and_retried
         await pilot.press("escape")
         assert app.screen is origin
         assert backend.rating is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", list(FullSyncDirection))
+async def test_full_sync_requires_exact_typed_confirmation(tmp_path, direction):
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+    )
+    calls = []
+
+    def resolve(profile, selected):
+        assert not backend.is_open
+        calls.append((profile, selected))
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app.full_syncer = resolve
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press(direction.value[0])
+        text = str(app.screen.query_one("#sync-recovery Static").render())
+        assert "Profile: test" in text
+        assert "LOCAL" in text if direction is FullSyncDirection.DOWNLOAD else "WEB" in text
+        confirm = app.screen.query_one("#sync-confirm", Input)
+        assert confirm.has_focus
+        assert confirm.region.bottom <= 6
+        await pilot.resize_terminal(20, 4)
+        await pilot.pause()
+        assert confirm.region.bottom <= 4
+        await pilot.resize_terminal(40, 6)
+        await pilot.press("enter")
+        assert not calls
+        confirm.value = "yes"
+        await pilot.press("enter")
+        assert not calls
+        confirm.value = direction.value.upper()
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert calls == [(app.profile, direction)]
+        assert backend.is_open
+        assert str(app.screen.query_one("#sync-popup").render()) == "[ok] synced"
+        await pilot.pause(1.1)
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_cancel_full_sync_confirmation_never_transfers(tmp_path):
+    app, _ = make_app(tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED))
+    calls = []
+    app.full_syncer = lambda *args: calls.append(args)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press("u", "escape")
+        assert isinstance(app.screen, DeckScreen)
+        assert not calls
+        assert not app.syncing
+
+
+@pytest.mark.asyncio
+async def test_failed_backup_can_be_dismissed_and_retried_with_fresh_confirmation(tmp_path):
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+    )
+    calls = []
+
+    def fail_backup(profile, direction):
+        calls.append(direction)
+        return SyncOutcome(SyncStatus.BACKUP_FAILED)
+
+    app.full_syncer = fail_backup
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press("d")
+        app.screen.query_one("#sync-confirm", Input).value = "DOWNLOAD"
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert "backup failed" in str(app.screen.query_one("#sync-popup").render())
+        assert backend.is_open
+        await pilot.press("escape", "s")
+        await pilot.pause(0.1)
+        await pilot.press("d")
+        assert app.screen.query_one("#sync-confirm", Input).value == ""
+        await pilot.press("escape")
+        assert calls == [FullSyncDirection.DOWNLOAD]

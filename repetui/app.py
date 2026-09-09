@@ -17,7 +17,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
-from textual.widgets import ListItem, ListView, Static
+from textual.widgets import Input, ListItem, ListView, Static
 
 from . import __version__
 from .addons import (
@@ -50,7 +50,14 @@ from .flow import (
 )
 from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
-from .sync import SyncOutcome, SyncStatus, failed_sync_outcome, sync_profile
+from .sync import (
+    FullSyncDirection,
+    SyncOutcome,
+    SyncStatus,
+    failed_sync_outcome,
+    full_sync_profile,
+    sync_profile,
+)
 
 
 class Refreshable(Protocol):
@@ -1416,6 +1423,8 @@ class SyncPopup(StatusPill):
         Binding("s", "block", show=False),
         Binding("escape", "dismiss_failure", show=False),
         Binding("enter", "dismiss_failure", show=False),
+        Binding("d", "choose_download", show=False),
+        Binding("u", "choose_upload", show=False),
     ]
 
     def __init__(self) -> None:
@@ -1425,6 +1434,8 @@ class SyncPopup(StatusPill):
         self._dismiss_timer: Timer | None = None
         self._failure_dismissible = False
         self._fatal = False
+        self._conflict = False
+        self._direction: FullSyncDirection | None = None
 
     def compose(self) -> ComposeResult:
         yield from super().compose()
@@ -1433,12 +1444,67 @@ class SyncPopup(StatusPill):
                 Text(
                     "[err] full sync required\n"
                     "Cards were not synced.\n"
-                    "Back up both collections before\n"
-                    "resolving this profile in Anki.\n"
+                    "d: download web -> local\n"
+                    "u: upload local -> web\n"
                     "Upload/download replaces one side.\n"
                     "Esc/Enter: back"
                 )
             )
+            yield Input(placeholder="Type the direction to confirm", id="sync-confirm")
+
+    def action_choose_download(self) -> None:
+        self._choose_direction(FullSyncDirection.DOWNLOAD)
+
+    def on_resize(self) -> None:
+        super().on_resize()
+        if self.is_mounted and self._direction is not None:
+            self.call_after_refresh(
+                self.query_one("#sync-confirm", Input).scroll_visible, animate=False
+            )
+
+    def action_choose_upload(self) -> None:
+        self._choose_direction(FullSyncDirection.UPLOAD)
+
+    def _choose_direction(self, direction: FullSyncDirection) -> None:
+        if not self._conflict or self._direction is not None:
+            return
+        self._direction = direction
+        profile = cast("RepetuiApp", self.app).profile
+        warning = (
+            "Replaces LOCAL cards/review history.\n"
+            "Local-only progress will be lost."
+            if direction is FullSyncDirection.DOWNLOAD
+            else "Replaces WEB cards/review history.\n"
+            "Back up web-only progress first!"
+        )
+        self.query_one("#sync-recovery Static", Static).update(
+            Text(
+                f"Profile: {profile.name}\n{warning}\n"
+                "Local backup first (not web/media).\n"
+                f"Type {direction.value.upper()}; Esc: cancel"
+            )
+        )
+        confirm = self.query_one("#sync-confirm", Input)
+        confirm.display = True
+        confirm.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        direction = self._direction
+        if direction is None or event.value != direction.value.upper():
+            return
+        self._direction = None
+        self._conflict = False
+        self._failure_dismissible = False
+        self.query_one("#sync-recovery").display = False
+        self.query_one("#sync-confirm", Input).value = ""
+        self.query_one("#sync-confirm").display = False
+        surface = self.query_one("#sync-popup")
+        surface.display = True
+        surface.remove_class("-error", "-success")
+        self._show_message("[|] backing up and syncing...")
+        self._spinner_timer = self.set_interval(self.SPINNER_INTERVAL, self.advance_spinner)
+        cast("RepetuiApp", self.app).start_full_sync(direction)
 
     def on_mount(self) -> None:
         super().on_mount()
@@ -1456,7 +1522,7 @@ class SyncPopup(StatusPill):
     def finish(self, result: SyncRunResult) -> None:
         self._stop_spinner()
         outcome = result.outcome
-        if outcome.ok:
+        if outcome.ok and result.reopen_error is None:
             message = {
                 SyncStatus.SYNCED: "[ok] synced",
                 SyncStatus.UP_TO_DATE: "[ok] up to date",
@@ -1468,6 +1534,7 @@ class SyncPopup(StatusPill):
             self._failure_dismissible = True
             self._fatal = result.reopen_error is not None
             if outcome.status is SyncStatus.FULL_SYNC_REQUIRED and not self._fatal:
+                self._conflict = True
                 self.query_one("#sync-popup").display = False
                 recovery = self.query_one("#sync-recovery", VerticalScroll)
                 recovery.display = True
@@ -1481,6 +1548,7 @@ class SyncPopup(StatusPill):
                     SyncStatus.AUTH_REQUIRED: "[err] sign in through Anki",
                     SyncStatus.COLLECTION_UNAVAILABLE: "[err] collection unavailable",
                     SyncStatus.FAILED: "[err] sync failed",
+                    SyncStatus.BACKUP_FAILED: "[err] backup failed; sync stopped",
                 }[outcome.status]
             )
             self._show_message(message)
@@ -1504,6 +1572,10 @@ class SyncPopup(StatusPill):
         """Consume keys while sync owns the collection and interaction."""
 
     def action_dismiss_failure(self) -> None:
+        if self._direction is not None:
+            # Enter is handled by the focused confirmation input; Escape
+            # cancels without ever forwarding a direction to the worker.
+            self._direction = None
         if self._failure_dismissible:
             self._stop_timers()
             self.dismiss(self._fatal)
@@ -1722,6 +1794,13 @@ class RepetuiApp(App[None]):
         color: #dc6b72;
         scrollbar-size-vertical: 1;
     }
+
+    #sync-confirm {
+        display: none;
+        height: 1;
+        border: none;
+        padding: 0;
+    }
     """
 
     BINDINGS = [
@@ -1737,6 +1816,7 @@ class RepetuiApp(App[None]):
         syncer: Callable[[ProfilePaths], SyncOutcome] = sync_profile,
         *,
         add_ons: Sequence[AddOnDefinition] | None = None,
+        full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] = full_sync_profile,
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -1750,6 +1830,7 @@ class RepetuiApp(App[None]):
         self.review_controls = self.preferences.review_controls(profile)
         self.set_keymap(self.review_controls.keymap())
         self.syncer = syncer
+        self.full_syncer = full_syncer
         self.syncing = False
         self._sync_origin: Screen[None] | None = None
         self._sync_popup: SyncPopup | None = None
@@ -1856,13 +1937,21 @@ class RepetuiApp(App[None]):
         )
         self._sync_thread.start()
 
-    def _sync_in_thread(self) -> None:
-        self.post_message(SyncFinished(self._run_sync()))
+    def start_full_sync(self, direction: FullSyncDirection) -> None:
+        if not self.syncing or self._shutdown_requested.is_set():
+            return
+        self._sync_thread = Thread(
+            target=self._sync_in_thread, args=(direction,), name="repetui-full-sync", daemon=True
+        )
+        self._sync_thread.start()
+
+    def _sync_in_thread(self, direction: FullSyncDirection | None = None) -> None:
+        self.post_message(SyncFinished(self._run_sync(direction)))
 
     def on_sync_finished(self, message: SyncFinished) -> None:
         self._finish_sync(message.result)
 
-    def _run_sync(self) -> SyncRunResult:
+    def _run_sync(self, direction: FullSyncDirection | None = None) -> SyncRunResult:
         """Run the blocking close/sync/reopen sequence without UI mutation."""
         close_error = None
         with self._backend_lock:
@@ -1876,7 +1965,11 @@ class RepetuiApp(App[None]):
             outcome = SyncOutcome(SyncStatus.COLLECTION_UNAVAILABLE, str(close_error))
         else:
             try:
-                outcome = self.syncer(self.profile)
+                outcome = (
+                    self.syncer(self.profile)
+                    if direction is None
+                    else self.full_syncer(self.profile, direction)
+                )
             except Exception as exc:
                 outcome = failed_sync_outcome(exc)
         reopen_error = None

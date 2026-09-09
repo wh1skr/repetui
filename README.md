@@ -56,15 +56,22 @@ unbound.
 ### Full-sync conflicts
 
 If sync reports **full sync required**, your cards have not been synchronized.
-Repetui will not choose which populated collection to replace. Back up both
-collections, close Repetui, and resolve the affected local profile in Anki
-Desktop. Upload replaces the AnkiWeb collection; download replaces the local
-collection. If both sides have unsynced progress, preserve and reconcile it
-before choosing either direction. Windows and WSL may use separate local
-collections; syncing one does not resolve a conflict in the other.
+Press `d` to download AnkiWeb into this local collection, or `u` to upload this
+local collection to AnkiWeb. A separate confirmation shows the active profile
+and replacement risk; type `DOWNLOAD` or `UPLOAD` exactly and press Enter.
+Nothing is selected by default. Escape cancels without transferring data.
 
-Press `Esc` or `Enter` to dismiss the warning; use arrow keys to scroll it in
-smaller panes. After resolving the conflict, reopen Repetui and press `s` again.
+Every confirmed attempt first exports and checks a local `.colpkg` backup in
+`backups/repetui-full-sync-*/` beside the collection. Backup failure blocks the
+transfer. These backups contain collection data, not media, and are retained
+for recovery through Anki Desktop. They do **not** preserve web-only changes:
+before uploading, back up any progress on your other clients separately.
+
+Full sync replaces, rather than merges, one collection. If both sides have
+unsynced progress, preserve and reconcile it before choosing either direction.
+Windows and WSL may use separate collections; check the selected profile.
+Use arrow keys to scroll instructions in small panes. After a failed attempt,
+Esc/Enter returns to study; press `s` to retry and make a fresh choice.
 
 ## Card rendering
 

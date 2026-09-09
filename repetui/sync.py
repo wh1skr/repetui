@@ -6,8 +6,11 @@ import contextlib
 import io
 import pickle
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from zipfile import ZipFile
 
 from .config import ProfilePaths
 
@@ -19,7 +22,13 @@ class SyncStatus(str, Enum):
     AUTH_REQUIRED = "auth_required"
     COLLECTION_UNAVAILABLE = "collection_unavailable"
     FULL_SYNC_REQUIRED = "full_sync_required"
+    BACKUP_FAILED = "backup_failed"
     FAILED = "failed"
+
+
+class FullSyncDirection(str, Enum):
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
 
 
 @dataclass(frozen=True)
@@ -179,6 +188,74 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
         collection.sync_media(auth)
         return SyncOutcome(SyncStatus.SYNCED)
     except Exception as exc:
+        return failed_sync_outcome(exc)
+    finally:
+        if collection is not None:
+            with contextlib.suppress(Exception):
+                collection.close()
+
+
+def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> SyncOutcome:
+    """Resolve a user-confirmed replacement, preserving local data first.
+
+    Call only after explicit direction-specific confirmation. A local backup
+    does not protect remote-only changes when uploading.
+    """
+    from anki.collection import Collection
+    from anki.sync_pb2 import SyncCollectionResponse, SyncStatusResponse
+
+    if not isinstance(direction, FullSyncDirection):
+        return SyncOutcome(SyncStatus.FAILED, "Choose a full-sync direction first.")
+    collection = None
+    backing_up = False
+    try:
+        auth = _auth(profile)
+        collection = Collection(str(profile.collection))
+        backing_up = True
+        backups = profile.collection.parent / "backups"
+        backups.mkdir(exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="repetui-full-sync-", dir=backups))
+        backup = folder / "collection.colpkg"
+        # Anki exports a consistent snapshot and closes the collection.
+        collection.export_collection_package(str(backup), include_media=False, legacy=False)
+        collection.reopen()
+        with ZipFile(backup) as archive:
+            if not any(name.startswith("collection.anki") for name in archive.namelist()):
+                raise ValueError("Backup contains no collection.")
+            if archive.testzip() is not None:
+                raise ValueError("Backup integrity check failed.")
+        backing_up = False
+
+        # Refresh server state and direction permissions; never reuse the modal's
+        # old response. If ordinary sync now succeeds, no replacement is needed.
+        result = collection.sync_collection(auth, sync_media=False)
+        if result.new_endpoint:
+            auth.endpoint = result.new_endpoint.rstrip("/") + "/"
+        upload = direction is FullSyncDirection.UPLOAD
+        allowed = {
+            SyncCollectionResponse.FULL_SYNC,
+            SyncCollectionResponse.FULL_UPLOAD if upload else SyncCollectionResponse.FULL_DOWNLOAD,
+        }
+        if result.required in allowed:
+            collection.close_for_full_sync()
+            collection.full_upload_or_download(
+                auth=auth, server_usn=result.server_media_usn, upload=upload
+            )
+            collection.reopen(after_full_sync=True)
+            status = collection.sync_status(auth)
+            if status.new_endpoint:
+                auth.endpoint = status.new_endpoint.rstrip("/") + "/"
+            if status.required != SyncStatusResponse.Required.NO_CHANGES:
+                return SyncOutcome(
+                    SyncStatus.FAILED, "Full sync still needs attention; retry sync."
+                )
+        elif result.required != SyncCollectionResponse.NO_CHANGES:
+            return SyncOutcome(SyncStatus.FAILED, "Sync state changed; retry and choose again.")
+        collection.sync_media(auth)
+        return SyncOutcome(SyncStatus.SYNCED, f"Local collection backup: {backup}")
+    except Exception as exc:
+        if backing_up:
+            return SyncOutcome(SyncStatus.BACKUP_FAILED, "Backup failed; no sync data transferred.")
         return failed_sync_outcome(exc)
     finally:
         if collection is not None:
