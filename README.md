@@ -33,6 +33,25 @@ If you have more than one Anki profile:
 repetui --profile PROFILE_NAME
 ```
 
+### Collection already in use
+
+The startup recovery screen offers `r` to retry after manual closure and `c`
+to request closure of the verified instance holding this collection. On
+Linux/WSL, recent Repetui instances can exit cooperatively; an instance currently
+syncing will not exit on that request. Waiting is bounded and Escape cancels
+waiting (it cannot undo a close request already sent).
+
+If orderly closure is unavailable or times out, `f` shows a separate warning
+naming the owner. Type `FORCE` to terminate it and retry. This may interrupt
+writes or lose unsaved work. No termination occurs without confirmation, and
+the process identity and collection lock are checked again before signaling.
+
+Only verified, same-user Linux Anki/Repetui owners can be targeted. Anki Desktop
+does not currently support cooperative closure here; older Repetui instances
+also require manual closure or the separate force option. Windows-host/macOS,
+unknown owners, inaccessible locks, and unsupported process APIs use manual
+Retry. Recovery never deletes collection, lock, WAL, or journal files.
+
 ## Controls
 
 | Where | Keys | Action |

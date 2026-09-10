@@ -22,6 +22,10 @@ class BackendError(RuntimeError):
     """Raised when the local Anki collection cannot be used."""
 
 
+class CollectionInUseError(BackendError):
+    """Anki explicitly reports that another instance owns the collection."""
+
+
 def _av_references(tags: list[Any]) -> tuple[AVReference, ...]:
     references: list[AVReference] = []
     for tag in tags:
@@ -105,8 +109,10 @@ class AnkiBackend:
             self._collection = Collection(str(self.collection_path))
         except Exception as exc:
             message = str(exc)
-            if "lock" in message.lower() or "anki already open" in message.lower():
-                raise BackendError("Close Anki Desktop before starting repetui.") from exc
+            if "anki already open, or media currently syncing" in message.lower():
+                raise CollectionInUseError(
+                    "This collection is in use by another instance."
+                ) from exc
             raise BackendError(f"Could not open the Anki collection: {message}") from exc
 
     def close(self) -> None:
