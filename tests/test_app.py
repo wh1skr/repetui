@@ -25,10 +25,11 @@ from repetui.app import (
     RepetuiApp,
     ReviewScreen,
     SettingsScreen,
+    StartupRecoveryScreen,
     SyncPopup,
     compose_deck_row,
 )
-from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
+from repetui.backend import BackendError, CollectionInUseError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
@@ -39,6 +40,7 @@ from repetui.presentation import (
     SourceField,
     present_card,
 )
+from repetui.recovery import CollectionOwner
 from repetui.sync import FullSyncDirection, SyncOutcome, SyncStatus
 
 
@@ -2536,3 +2538,117 @@ async def test_failed_backup_can_be_dismissed_and_retried_with_fresh_confirmatio
         assert app.screen.query_one("#sync-confirm", Input).value == ""
         await pilot.press("escape")
         assert calls == [FullSyncDirection.DOWNLOAD]
+
+
+class BusyStartupBackend(FakeBackend):
+    busy = True
+
+    def open(self):
+        if self.busy:
+            raise CollectionInUseError("Collection is in use.")
+        super().open()
+
+
+def startup_recovery_app(tmp_path):
+    backend = BusyStartupBackend()
+    profile = ProfilePaths(tmp_path, "test", tmp_path / "collection.anki2")
+    return RepetuiApp(backend, profile, JsonPreferences(tmp_path / "prefs.json")), backend
+
+
+@pytest.mark.asyncio
+async def test_unknown_startup_owner_allows_manual_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: None)
+    app, backend = startup_recovery_app(tmp_path)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, StartupRecoveryScreen)
+        assert "cannot be verified" in str(app.screen.query_one("#recovery-message").render())
+        await pilot.press("c", "f")
+        assert not app.screen.query_one("#force-confirm").display
+        backend.busy = False
+        await pilot.press("r")
+        await pilot.pause()
+        assert isinstance(app.screen, DeckScreen)
+        assert backend.is_open
+
+
+@pytest.mark.asyncio
+async def test_close_verified_owner_then_retry_opens_once(tmp_path, monkeypatch):
+    owner = CollectionOwner(123, "start", "repetui", "/python", ("repetui",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    app, backend = startup_recovery_app(tmp_path)
+    calls = []
+
+    def close(path, selected):
+        calls.append(selected)
+        backend.busy = False
+        return True
+
+    monkeypatch.setattr("repetui.app.request_close", close)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("c", "c", "r")
+        await pilot.pause()
+        assert calls == [owner]
+        assert isinstance(app.screen, DeckScreen)
+        assert len([screen for screen in app.screen_stack if isinstance(screen, DeckScreen)]) == 1
+
+
+@pytest.mark.asyncio
+async def test_force_close_requires_separate_exact_confirmation(tmp_path, monkeypatch):
+    owner = CollectionOwner(123, "start", "Anki Desktop", "/anki", ("anki",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    monkeypatch.setattr("repetui.app.request_close", lambda *_: False)
+    app, backend = startup_recovery_app(tmp_path)
+    calls = []
+
+    def force(path, selected):
+        calls.append(selected)
+        backend.busy = False
+        return True
+
+    monkeypatch.setattr("repetui.app.force_close", force)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("f")
+        assert not app.screen.query_one("#force-confirm").display
+        await pilot.press("c", "f")
+        field = app.screen.query_one("#force-confirm", Input)
+        assert field.display
+        assert "PID 123" in str(app.screen.query_one("#recovery-message").render())
+        field.value = "yes"
+        await pilot.press("enter", "escape")
+        assert not calls
+        await pilot.press("f")
+        assert field.value == ""
+        await pilot.resize_terminal(20, 4)
+        await pilot.pause()
+        assert field.region.bottom <= 4
+        field.value = "FORCE"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert calls == [owner]
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_startup_close_timeout_is_recoverable_and_cancel_does_not_force(
+    tmp_path, monkeypatch
+):
+    owner = CollectionOwner(123, "start", "repetui", "/python", ("repetui",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    monkeypatch.setattr("repetui.app.request_close", lambda *_: True)
+    calls = []
+    monkeypatch.setattr("repetui.app.force_close", lambda *args: calls.append(args))
+    app, _ = startup_recovery_app(tmp_path)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("c", "c")
+        await pilot.pause(3.5)
+        assert "Still in use" in str(app.screen.query_one("#recovery-message").render())
+        await pilot.press("f", "escape")
+        assert not calls
+        await pilot.press("c", "escape")
+        await pilot.pause(0.3)
+        assert isinstance(app.screen, StartupRecoveryScreen)
+        assert not calls

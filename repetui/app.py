@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from .addons import (
     SettingDefinition,
     bundled_add_ons,
 )
-from .backend import AnkiBackend, BackendError, Deck, ReviewCard
+from .backend import AnkiBackend, BackendError, CollectionInUseError, Deck, ReviewCard
 from .completion import completion_duration_seconds, compose_completion_frame
 from .config import ProfilePaths
 from .controls import (
@@ -50,6 +51,7 @@ from .flow import (
 )
 from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
 from .presentation import CardTemplateIdentity, PresentationSection
+from .recovery import CollectionOwner, InstanceControl, find_owner, force_close, request_close
 from .sync import (
     FullSyncDirection,
     SyncOutcome,
@@ -199,6 +201,176 @@ class ErrorScreen(Screen[None]):
             VerticalScroll(Static(Text(self.message)), id="error-scroll"),
             Static("q quit · ? help", classes="surface-footer"),
             id="error-layout",
+        )
+
+
+class InstanceCloseRequested(Message):
+    """A verified peer requested an ordinary app exit."""
+
+
+class StartupRecoveryScreen(ErrorScreen):
+    """Bounded, explicit recovery for a collection-in-use startup failure."""
+
+    BINDINGS = [
+        Binding("r", "retry", show=False),
+        Binding("c", "close_owner", show=False),
+        Binding("f", "confirm_force", show=False),
+        Binding("escape", "cancel", show=False),
+    ]
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.owner: CollectionOwner | None = None
+        self._working = False
+        self._cancelled = False
+        self._force_available = False
+        self._confirming = False
+        self._completed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="error-layout"):
+            yield Static("repetui · collection in use", id="error-header")
+            with VerticalScroll(id="error-scroll"):
+                yield Static(Text(self.message), id="recovery-message")
+                yield Input(placeholder="Type FORCE to confirm", id="force-confirm")
+            yield Static("r retry · c close other · q quit", classes="surface-footer")
+
+    def on_mount(self) -> None:
+        self.run_worker(self._discover())
+
+    def on_unmount(self) -> None:
+        self._cancelled = True
+
+    def on_resize(self) -> None:
+        if self.is_mounted and self._confirming:
+            self.call_after_refresh(
+                self.query_one("#force-confirm", Input).scroll_visible, animate=False
+            )
+
+    def _show(self, message: str) -> None:
+        if self.is_mounted:
+            self.query_one("#recovery-message", Static).update(Text(message))
+
+    async def _discover(self) -> None:
+        self._working = True
+        try:
+            owner = await asyncio.to_thread(
+                find_owner, cast("RepetuiApp", self.app).profile.collection
+            )
+            if not self.is_mounted:
+                return
+            self.owner = owner
+            self._show(
+                f"{owner.application} · PID {owner.pid}\n"
+                "c: close this instance and retry\nNo other collection will be closed."
+                if owner else
+                "Owner cannot be verified here.\nClose it manually, then press r.\n"
+                "Windows-host/macOS recovery is unsupported."
+            )
+        finally:
+            self._working = False
+
+    def action_retry(self) -> None:
+        self._start("retry")
+
+    def action_close_owner(self) -> None:
+        if self.owner is not None:
+            self._start("close")
+
+    def _start(self, mode: str) -> None:
+        if self._working or self._confirming or self._completed:
+            return
+        self._working = True
+        self._cancelled = False
+        self.run_worker(self._recover(mode), group="startup-recovery")
+
+    def _try_open(self, app: RepetuiApp) -> None:
+        with app._backend_lock:
+            if app._shutdown_requested.is_set() or self._cancelled:
+                return
+            app.backend.open()
+
+    async def _recover(self, mode: str) -> None:
+        app = cast("RepetuiApp", self.app)
+        owner = self.owner
+        self._show("Retrying… Esc cancels waiting.")
+        try:
+            if mode != "retry":
+                operation = force_close if mode == "force" else request_close
+                if owner is None or not await asyncio.to_thread(
+                    operation, app.profile.collection, owner
+                ):
+                    current = await asyncio.to_thread(find_owner, app.profile.collection)
+                    self._force_available = current is not None and current == owner
+                    self.owner = current
+                    self._show(
+                        "Closure unavailable or owner changed.\n"
+                        + (f"{current.application} · PID {current.pid}\n" if current else "")
+                        + "Close manually and press r.\n"
+                        + ("f: review force-close warning" if self._force_available
+                           else "c: inspect the current owner again")
+                    )
+                    return
+            for _ in range(20 if mode != "retry" else 1):
+                if self._cancelled or not self.is_mounted:
+                    return
+                try:
+                    await asyncio.to_thread(self._try_open, app)
+                except CollectionInUseError:
+                    await asyncio.sleep(0.15)
+                    continue
+                except BackendError as exc:
+                    self._show(str(exc))
+                    return
+                if self._cancelled or not self.is_mounted:
+                    with app._backend_lock:
+                        app.backend.close()
+                    return
+                if app.backend.is_open:
+                    self._completed = True
+                    app.call_later(app.startup_ready, replace=True)
+                    return
+            current = await asyncio.to_thread(find_owner, app.profile.collection)
+            self.owner = current
+            self._force_available = current is not None and current == owner
+            self._show(
+                "Still in use. r: retry manually\n"
+                + (f"{current.application} · PID {current.pid}\n" if current else "")
+                + ("f: review force-close warning" if self._force_available else "c: inspect owner")
+            )
+        finally:
+            self._working = False
+
+    def action_confirm_force(self) -> None:
+        if self._working or not self._force_available or self.owner is None:
+            return
+        self._confirming = True
+        self._show(
+            f"Force close {self.owner.application} PID {self.owner.pid}?\n"
+            "May lose unsaved work or damage data.\n"
+            "Type FORCE and Enter; Esc cancels."
+        )
+        field = self.query_one("#force-confirm", Input)
+        field.display = True
+        field.value = ""
+        field.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        if not self._confirming or event.value != "FORCE":
+            return
+        self._confirming = False
+        self.query_one("#force-confirm").display = False
+        self._start("force")
+
+    def action_cancel(self) -> None:
+        if self._confirming:
+            self._confirming = False
+            self.query_one("#force-confirm").display = False
+        self._cancelled = True
+        self._show(
+            "Waiting cancelled; a close request\nmay already have been sent. r: retry"
+            if self._working else "Cancelled. r: retry · c: close other"
         )
 
 
@@ -1795,7 +1967,7 @@ class RepetuiApp(App[None]):
         scrollbar-size-vertical: 1;
     }
 
-    #sync-confirm {
+    #sync-confirm, #force-confirm {
         display: none;
         height: 1;
         border: none;
@@ -1839,6 +2011,9 @@ class RepetuiApp(App[None]):
         self._completion_celebration: CompletionCelebrationScreen | None = None
         self._shutdown_requested = Event()
         self._backend_lock = Lock()
+        self._instance_control = InstanceControl(
+            lambda: self.post_message(InstanceCloseRequested())
+        )
 
     def save_review_controls(self, controls: ReviewControls) -> None:
         """Persist and activate one complete profile-scoped review keymap."""
@@ -1889,12 +2064,28 @@ class RepetuiApp(App[None]):
     def on_mount(self) -> None:
         try:
             self.backend.open()
-            self.push_screen(DeckScreen())
+            self.startup_ready()
+        except CollectionInUseError as exc:
+            self.push_screen(StartupRecoveryScreen(str(exc)))
         except BackendError as exc:
             self.push_screen(ErrorScreen(str(exc)))
 
+    def startup_ready(self, *, replace: bool = False) -> None:
+        if self._shutdown_requested.is_set():
+            return
+        self._instance_control.start()
+        if replace:
+            self.switch_screen(DeckScreen())
+        else:
+            self.push_screen(DeckScreen())
+
+    def on_instance_close_requested(self, message: InstanceCloseRequested) -> None:
+        if not self.syncing:
+            self.exit()
+
     def on_unmount(self) -> None:
         self._shutdown_requested.set()
+        self._instance_control.close()
         if self._completion_celebration is not None:
             self._completion_celebration.stop_animation()
             self._completion_celebration = None
@@ -1902,7 +2093,7 @@ class RepetuiApp(App[None]):
             self.backend.close()
 
     def action_help(self) -> None:
-        if self.syncing:
+        if self.syncing or isinstance(self.screen, StartupRecoveryScreen):
             return
         screen = self.screen
         if isinstance(screen, CompletionCelebrationScreen):
