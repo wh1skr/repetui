@@ -81,6 +81,7 @@ class ReviewCard:
     id: int
     presentation: CardPresentation
     queue: ReviewQueue | None = None
+    raw_content: RawCardContent | None = None
 
     @property
     def identity(self) -> CardTemplateIdentity:
@@ -200,6 +201,7 @@ class AnkiBackend:
             id=card.id,
             presentation=present_card(raw_content),
             queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
+            raw_content=raw_content,
         )
 
     def answer(self, rating: int) -> None:

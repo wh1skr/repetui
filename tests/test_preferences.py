@@ -11,7 +11,7 @@ from repetui.preferences import (
     SectionMode,
     default_preferences_path,
 )
-from repetui.presentation import CardTemplateIdentity
+from repetui.presentation import CardTemplateIdentity, TemplateFieldProfile
 
 JAPANESE_RECOGNITION = CardTemplateIdentity(204, "Japanese", 0, "Recognition")
 JAPANESE_PRODUCTION = CardTemplateIdentity(204, "Japanese", 1, "Production")
@@ -108,6 +108,82 @@ def test_existing_saved_stacked_answer_layout_remains_valid(tmp_path) -> None:
     preferences = JsonPreferences(path)
 
     assert preferences.answer_layout(JAPANESE_RECOGNITION) is AnswerLayout.STACKED
+
+
+def test_field_profile_survives_restart_with_order_and_template_scope(tmp_path) -> None:
+    path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(path)
+    configured = TemplateFieldProfile(
+        prompt_fields=("Expression",),
+        answer_fields=("Reading", "Meaning", "Example"),
+        ignored_fields=("Private note",),
+    )
+
+    assert preferences.field_profile(JAPANESE_RECOGNITION) is None
+    assert not path.exists()
+
+    preferences.set_field_profile(JAPANESE_RECOGNITION, configured)
+    restarted = JsonPreferences(path)
+
+    assert restarted.field_profile(JAPANESE_RECOGNITION) == configured
+    assert restarted.field_profile(JAPANESE_PRODUCTION) is None
+    assert restarted.field_profile(AWS_BASIC) is None
+    assert json.loads(path.read_text())["templates"]["204:0"]["field_profile"] == {
+        "answer_fields": ["Reading", "Meaning", "Example"],
+        "ignored_fields": ["Private note"],
+        "prompt_fields": ["Expression"],
+    }
+
+
+def test_malformed_or_ambiguous_field_profiles_are_ignored_and_rejected(tmp_path) -> None:
+    path = tmp_path / "preferences.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {},
+                "templates": {
+                    "204:0": {
+                        "field_profile": {
+                            "prompt_fields": ["Expression", "Expression"],
+                            "answer_fields": ["Meaning"],
+                        }
+                    }
+                },
+            }
+        )
+    )
+    preferences = JsonPreferences(path)
+
+    assert preferences.field_profile(JAPANESE_RECOGNITION) is None
+    with pytest.raises(ValueError, match="unique prompt and answer"):
+        preferences.set_field_profile(
+            JAPANESE_RECOGNITION,
+            TemplateFieldProfile(("Expression",), ("Expression", "Meaning")),
+        )
+
+
+def test_failed_field_profile_write_preserves_active_and_saved_mapping(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(path)
+    original = TemplateFieldProfile(("Expression",), ("Meaning",))
+    preferences.set_field_profile(JAPANESE_RECOGNITION, original)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_field_profile(
+            JAPANESE_RECOGNITION,
+            TemplateFieldProfile(("Expression",), ("Meaning", "Example")),
+        )
+
+    assert preferences.field_profile(JAPANESE_RECOGNITION) == original
+    assert JsonPreferences(path).field_profile(JAPANESE_RECOGNITION) == original
 
 
 def test_default_path_respects_xdg_config_home(monkeypatch, tmp_path) -> None:
