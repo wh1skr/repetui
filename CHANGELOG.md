@@ -4,6 +4,11 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+## 0.1.6a - 2026-09-15
+
+- Added adaptive field profiles for script-heavy card templates, including a
+  one-time 40×6-safe setup and persistent per-template field ordering.
+
 ## 0.1.3 - 2026-08-27
 
 - Unified Help, Controls, and Sections in one settings screen available from decks and review.

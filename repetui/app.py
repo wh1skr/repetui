@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from threading import Event, Lock, Thread
 from typing import Protocol, cast
 
@@ -50,7 +51,14 @@ from .flow import (
     section_name,
 )
 from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
-from .presentation import CardTemplateIdentity, PresentationSection
+from .presentation import (
+    CardTemplateIdentity,
+    PresentationSection,
+    SourceField,
+    TemplateFieldProfile,
+    default_field_profile,
+    present_card,
+)
 from .recovery import CollectionOwner, InstanceControl, find_owner, force_close, request_close
 from .sync import (
     FullSyncDirection,
@@ -585,6 +593,189 @@ class AnswerLayoutSettingItem(ListItem):
         )
 
 
+class TemplateFieldsSettingItem(ListItem):
+    """Entry point for editing the current template's field profile."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("card fields", classes="setting-label")
+        yield Static("edit", classes="setting-mode")
+
+
+class FieldRole(str, Enum):
+    AUTO = "auto"
+    IGNORE = "ignore"
+    PROMPT = "prompt"
+    ANSWER = "answer"
+
+    @property
+    def next(self) -> FieldRole:
+        roles = (FieldRole.AUTO, FieldRole.PROMPT, FieldRole.ANSWER, FieldRole.IGNORE)
+        return roles[(roles.index(self) + 1) % len(roles)]
+
+
+class FieldProfileItem(ListItem):
+    """One source field and its terminal presentation role."""
+
+    def __init__(self, field: SourceField, role: FieldRole) -> None:
+        super().__init__()
+        self.field = field
+        self.role = role
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="field-name")
+        yield Static(classes="field-role")
+
+    def on_mount(self) -> None:
+        self.refresh_role()
+
+    def refresh_role(self) -> None:
+        colour = {
+            FieldRole.AUTO: "#aaa49b",
+            FieldRole.IGNORE: "#817d76",
+            FieldRole.PROMPT: "#68a8df",
+            FieldRole.ANSWER: "#79c98b",
+        }[self.role]
+        self.query_one(".field-name", Static).update(
+            Text(self.field.name, style="#d9d5ce", overflow="ellipsis", no_wrap=True)
+        )
+        self.query_one(".field-role", Static).update(
+            Text(self.role.value, style=colour, no_wrap=True)
+        )
+
+    def swap_with(self, other: FieldProfileItem) -> None:
+        self.field, other.field = other.field, self.field
+        self.role, other.role = other.role, self.role
+        self.refresh_role()
+        other.refresh_role()
+
+
+class TemplateFieldSetupScreen(Screen[None]):
+    """One-time, editable mapping from Anki fields to terminal roles."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("j", "down", "Down", show=False),
+        Binding("k", "up", "Up", show=False),
+        Binding("space", "cycle_role", "Role", show=False),
+        Binding("J", "move_down", "Move down", show=False),
+        Binding("K", "move_up", "Move up", show=False),
+        Binding("enter", "save", "Save", show=False, priority=True),
+    ]
+
+    def __init__(
+        self,
+        review: ReviewScreen,
+        profile: TemplateFieldProfile,
+    ) -> None:
+        super().__init__()
+        self.review = review
+        self.profile = profile
+
+    def compose(self) -> ComposeResult:
+        assert self.review.card is not None
+        raw = self.review.card.raw_content
+        assert raw is not None
+        prompt = set(self.profile.prompt_fields)
+        answer = set(self.profile.answer_fields)
+        ignored = set(self.profile.ignored_fields)
+        by_name = {field.name: field for field in raw.fields}
+        selected_order = self.profile.prompt_fields + self.profile.answer_fields
+        ordered_fields = tuple(
+            by_name[name] for name in selected_order if name in by_name
+        ) + tuple(field for field in raw.fields if field.name not in selected_order)
+        rows = []
+        for field in ordered_fields:
+            role = (
+                FieldRole.PROMPT
+                if field.name in prompt
+                else FieldRole.ANSWER
+                if field.name in answer
+                else FieldRole.IGNORE
+                if field.name in ignored
+                else FieldRole.AUTO
+            )
+            rows.append(FieldProfileItem(field, role))
+        yield Vertical(
+            Static("adapt card fields", id="field-profile-header"),
+            ListView(*rows, id="field-profile-fields"),
+            Static(
+                "space role · J/K order · enter save",
+                id="field-profile-footer",
+                classes="surface-footer",
+            ),
+            id="field-profile-layout",
+        )
+
+    def on_mount(self) -> None:
+        fields = self.query_one("#field-profile-fields", ListView)
+        if fields.children:
+            fields.index = 0
+        fields.focus()
+
+    def _view(self) -> ListView:
+        return self.query_one("#field-profile-fields", ListView)
+
+    def _selected(self) -> FieldProfileItem | None:
+        view = self._view()
+        if view.index is None or not (0 <= view.index < len(view.children)):
+            return None
+        item = view.children[view.index]
+        return item if isinstance(item, FieldProfileItem) else None
+
+    def action_down(self) -> None:
+        self._view().action_cursor_down()
+
+    def action_up(self) -> None:
+        self._view().action_cursor_up()
+
+    def action_cycle_role(self) -> None:
+        item = self._selected()
+        if item is not None:
+            item.role = item.role.next
+            item.refresh_role()
+
+    def _move(self, offset: int) -> None:
+        view = self._view()
+        if view.index is None:
+            return
+        destination = view.index + offset
+        if not (0 <= destination < len(view.children)):
+            return
+        current = view.children[view.index]
+        other = view.children[destination]
+        if isinstance(current, FieldProfileItem) and isinstance(other, FieldProfileItem):
+            current.swap_with(other)
+            view.index = destination
+
+    def action_move_down(self) -> None:
+        self._move(1)
+
+    def action_move_up(self) -> None:
+        self._move(-1)
+
+    def action_save(self) -> None:
+        rows = tuple(self.query(FieldProfileItem))
+        profile = TemplateFieldProfile(
+            tuple(row.field.name for row in rows if row.role is FieldRole.PROMPT),
+            tuple(row.field.name for row in rows if row.role is FieldRole.ANSWER),
+            tuple(row.field.name for row in rows if row.role is FieldRole.IGNORE),
+        )
+        if not profile.prompt_fields or not profile.answer_fields:
+            self.notify("Choose at least one prompt and answer field.", severity="warning")
+            return
+        try:
+            self.review.apply_field_profile(profile)
+        except OSError:
+            self.query_one("#field-profile-footer", Static).update(
+                Text("[err] field profile not saved", style="#dc6b72", no_wrap=True)
+            )
+            return
+        self.app.pop_screen()
+
+    def action_cancel(self) -> None:
+        self.app.pop_screen()
+
+
 class ControlSettingItem(ListItem):
     """One keyboard-editable review action and its current binding."""
 
@@ -712,8 +903,18 @@ class SettingsScreen(Screen[None]):
     def repetui(self) -> RepetuiApp:
         return cast("RepetuiApp", self.app)
 
+    def _field_profile_for_editor(self) -> TemplateFieldProfile | None:
+        if self.card is None or self.card.raw_content is None:
+            return None
+        return (
+            self.repetui.preferences.field_profile(self.card.identity)
+            or self.card.presentation.suggested_profile
+            or default_field_profile(self.card.raw_content, self.card.presentation)
+        )
+
     def compose(self) -> ComposeResult:
         sections = self.card.presentation.back.sections if self.card is not None else ()
+        can_edit_fields = self._field_profile_for_editor() is not None
         yield Vertical(
             Static("settings", id="settings-header"),
             Static(id="settings-tabs"),
@@ -724,6 +925,7 @@ class SettingsScreen(Screen[None]):
             ListView(
                 *(AnswerLayoutSettingItem(),) if self.card is not None else (),
                 *(SectionSettingItem(section) for section in sections),
+                *(TemplateFieldsSettingItem(),) if can_edit_fields else (),
                 id="settings-sections",
             ),
             Static(
@@ -887,6 +1089,13 @@ class SettingsScreen(Screen[None]):
             layout = self.repetui.preferences.answer_layout(identity)
             self.repetui.preferences.set_answer_layout(identity, layout.next)
             item.refresh_layout(self.repetui.preferences, identity)
+            return
+        if isinstance(item, TemplateFieldsSettingItem):
+            profile = self._field_profile_for_editor()
+            if profile is not None and self.review is not None:
+                setup = TemplateFieldSetupScreen(self.review, profile)
+                self.app.pop_screen()
+                self.repetui.call_after_refresh(lambda: self.repetui.push_screen(setup))
             return
         if not isinstance(item, SectionSettingItem):
             return
@@ -1180,7 +1389,39 @@ class ReviewScreen(Screen[None]):
 
     def load_next(self) -> None:
         self.card = self.repetui.backend.next_card()
+        if self.card is not None and self.card.raw_content is not None:
+            profile = self.repetui.preferences.field_profile(self.card.identity)
+            self.card = replace(
+                self.card,
+                presentation=present_card(self.card.raw_content, profile),
+            )
         self.revealed = False
+        self.expanded_sections.clear()
+        self.selected_folded = 0
+        self._refresh_view()
+        if self.card is not None and self.card.presentation.suggested_profile is not None:
+            self.call_after_refresh(self._offer_field_setup)
+
+    def _offer_field_setup(self) -> None:
+        if self.card is None or self.app.screen is not self:
+            return
+        suggestion = self.card.presentation.suggested_profile
+        if suggestion is None:
+            return
+        key = (self.card.identity.note_type_id, self.card.identity.template_ordinal)
+        if key in self.repetui.offered_field_setups:
+            return
+        self.repetui.offered_field_setups.add(key)
+        self.app.push_screen(TemplateFieldSetupScreen(self, suggestion))
+
+    def apply_field_profile(self, profile: TemplateFieldProfile) -> None:
+        if self.card is None or self.card.raw_content is None:
+            return
+        self.repetui.preferences.set_field_profile(self.card.identity, profile)
+        self.card = replace(
+            self.card,
+            presentation=present_card(self.card.raw_content, profile),
+        )
         self.expanded_sections.clear()
         self.selected_folded = 0
         self._refresh_view()
@@ -1830,6 +2071,47 @@ class RepetuiApp(App[None]):
         background: #111416;
     }
 
+    #field-profile-layout {
+        width: 100%;
+        height: 100%;
+        background: #111416;
+    }
+
+    #field-profile-header {
+        height: 1;
+        color: #eee9e0;
+    }
+
+    #field-profile-fields {
+        height: 1fr;
+        background: #111416;
+        scrollbar-size-vertical: 1;
+    }
+
+    #field-profile-footer {
+        height: 1;
+    }
+
+    FieldProfileItem {
+        height: 1;
+        layout: horizontal;
+    }
+
+    FieldProfileItem.-highlight {
+        background: #293034;
+    }
+
+    .field-name {
+        width: 1fr;
+        height: 1;
+    }
+
+    .field-role {
+        width: 7;
+        height: 1;
+        text-align: right;
+    }
+
     #settings-header {
         height: 1;
         color: #eee9e0;
@@ -1857,6 +2139,7 @@ class RepetuiApp(App[None]):
     }
 
     AnswerLayoutSettingItem,
+    TemplateFieldsSettingItem,
     SectionSettingItem,
     ControlSettingItem,
     AddOnItem,
@@ -1866,6 +2149,7 @@ class RepetuiApp(App[None]):
     }
 
     AnswerLayoutSettingItem.-highlight,
+    TemplateFieldsSettingItem.-highlight,
     SectionSettingItem.-highlight,
     ControlSettingItem.-highlight,
     AddOnItem.-highlight,
@@ -2009,6 +2293,7 @@ class RepetuiApp(App[None]):
         self._sync_thread: Thread | None = None
         self._sync_fatal_error: str | None = None
         self._completion_celebration: CompletionCelebrationScreen | None = None
+        self.offered_field_setups: set[tuple[int, int]] = set()
         self._shutdown_requested = Event()
         self._backend_lock = Lock()
         self._instance_control = InstanceControl(

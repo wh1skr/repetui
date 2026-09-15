@@ -64,6 +64,7 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
+| Card-field setup | `Space`, `J` / `K`, `Enter` | Change role, reorder, save |
 | Decks / review | `s` | Sync with AnkiWeb |
 | Anywhere | `?` | Help, controls, and section settings |
 | Anywhere | `q` | Quit |
@@ -100,6 +101,17 @@ headings, ruby readings, lists, tables, code, math labels, and media references
 where possible. Unknown markup falls back to its visible text rather than being
 silently discarded.
 
+If a script-heavy template cannot be separated safely, `repetui` derives a
+field-based terminal layout and opens a one-time setup. Assign fields to Prompt,
+Answer, Auto, or Ignore with `Space`, reorder them with `J` / `K`, and save with
+`Enter`. Auto fields appear only when that field's content is present on the
+rendered card, so optional fields can start being used later without another
+setup. The mapping is remembered per note type and card template and can be
+edited under `?` → `Sections` → `card fields`. This adapts complex card types
+without executing their JavaScript or adding template-specific code. The same
+editor is available for any active card with usable source fields, so an
+unrecognized template can still be configured manually.
+
 ## Sections that fit your pane
 
 Card backs are not equally useful at every size. During review, open
@@ -115,8 +127,8 @@ Choices are remembered per note type and card template, so long explanations
 and mnemonics can stay one keypress away without taking over every card.
 
 Template JavaScript, typed-answer grading, CSS layout, and media playback are
-not currently executed. Card creation, editing, and statistics are also outside
-the current scope.
+not executed. Card creation, editing, and statistics are also outside the
+current scope.
 
 ### Acknowledgements
 

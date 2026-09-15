@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import ProfilePaths
 from .controls import ReviewControls
-from .presentation import CardTemplateIdentity
+from .presentation import CardTemplateIdentity, TemplateFieldProfile
 
 
 class SectionMode(str, Enum):
@@ -90,6 +90,16 @@ class Preferences(Protocol):
         self,
         identity: CardTemplateIdentity,
         layout: AnswerLayout,
+    ) -> None: ...
+
+    def field_profile(
+        self, identity: CardTemplateIdentity
+    ) -> TemplateFieldProfile | None: ...
+
+    def set_field_profile(
+        self,
+        identity: CardTemplateIdentity,
+        profile: TemplateFieldProfile,
     ) -> None: ...
 
 
@@ -334,6 +344,64 @@ class JsonPreferences:
         else:
             template["answer_layout"] = layout.value
         self._save()
+
+    def field_profile(
+        self, identity: CardTemplateIdentity
+    ) -> TemplateFieldProfile | None:
+        template = self._templates.get(self._template_key(identity), {})
+        saved = template.get("field_profile")
+        if not isinstance(saved, dict):
+            return None
+        prompt = saved.get("prompt_fields")
+        answer = saved.get("answer_fields")
+        ignored = saved.get("ignored_fields", [])
+        if not all(
+            isinstance(names, list)
+            and all(isinstance(name, str) and name for name in names)
+            for names in (prompt, answer, ignored)
+        ):
+            return None
+        assert isinstance(prompt, list) and isinstance(answer, list) and isinstance(ignored, list)
+        if not prompt or not answer:
+            return None
+        selected = prompt + answer + ignored
+        if len(selected) != len(set(selected)):
+            return None
+        return TemplateFieldProfile(tuple(prompt), tuple(answer), tuple(ignored))
+
+    def set_field_profile(
+        self,
+        identity: CardTemplateIdentity,
+        profile: TemplateFieldProfile,
+    ) -> None:
+        selected = (
+            profile.prompt_fields + profile.answer_fields + profile.ignored_fields
+        )
+        if (
+            not profile.prompt_fields
+            or not profile.answer_fields
+            or any(not name for name in selected)
+            or len(selected) != len(set(selected))
+        ):
+            raise ValueError("A field profile requires unique prompt and answer fields.")
+        templates = {key: dict(value) for key, value in self._templates.items()}
+        key = self._template_key(identity)
+        template = templates.setdefault(
+            key,
+            {
+                "note_type_name": identity.note_type_name,
+                "template_name": identity.template_name,
+                "sections": {},
+            },
+        )
+        template["field_profile"] = {
+            "prompt_fields": list(profile.prompt_fields),
+            "answer_fields": list(profile.answer_fields),
+        }
+        if profile.ignored_fields:
+            template["field_profile"]["ignored_fields"] = list(profile.ignored_fields)
+        self._write_document(templates, self._profiles)
+        self._templates = templates
 
     def _save(self) -> None:
         self._write_document(self._templates, self._profiles)
