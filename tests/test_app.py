@@ -4,8 +4,9 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from textual.widgets import Input, Static
+from textual.widgets import Input, ListItem, Static
 
+import repetui.app as app_module
 from repetui.addons import (
     AddOnDefinition,
     AddOnEvent,
@@ -18,6 +19,7 @@ from repetui.addons import (
 )
 from repetui.app import (
     CompletionCelebrationScreen,
+    DeckItem,
     DeckScreen,
     ErrorScreen,
     FlagSelectionPill,
@@ -1017,6 +1019,54 @@ async def test_sync_reload_keeps_expansion_and_selected_deck(tmp_path) -> None:
         assert [item.deck.id for item in screen.query("DeckItem")] == [1, 2, 3]
         view = screen.query_one("#decks")
         assert screen.query("DeckItem")[view.index].deck.id == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_refresh_frames_never_expose_internal_deck_item_text(tmp_path) -> None:
+    app, _ = make_app(
+        tmp_path,
+        decks=[Deck(1, "Japanese::WK", 0, DueCounts(0, 0, 117))],
+        syncer=lambda _profile: SyncOutcome(SyncStatus.UP_TO_DATE),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        for _ in range(80):
+            assert "DeckItem.-highlight" not in app.export_screenshot()
+            await pilot.pause(0.02)
+
+        assert isinstance(app.screen, DeckScreen)
+        assert "0/0/117" in str(app.screen.query_one(".deck-row").render())
+
+
+def test_pending_selected_deck_item_never_renders_its_internal_identifier() -> None:
+    row = VisibleDeckRow(
+        Deck(1, "Japanese::WK", 0, DueCounts(0, 0, 117)),
+        is_parent=False,
+        expanded=False,
+    )
+    item = DeckItem(row)
+    item.add_class("-highlight")
+
+    rendered = item.render()
+    pending_content = getattr(rendered, "plain", str(rendered))
+
+    assert "DeckItem" not in pending_content
+    assert "-highlight" not in pending_content
+
+
+def test_all_repetui_list_rows_override_textual_identifier_fallback() -> None:
+    row_types = {
+        value
+        for value in vars(app_module).values()
+        if isinstance(value, type)
+        and value.__module__ == app_module.__name__
+        and value is not ListItem
+        and issubclass(value, ListItem)
+    }
+
+    assert row_types
+    assert all(row_type.render is not ListItem.render for row_type in row_types)
 
 
 @pytest.mark.asyncio

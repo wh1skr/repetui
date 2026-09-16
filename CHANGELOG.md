@@ -8,6 +8,8 @@ Brief user-visible updates to repetui are recorded here.
 
 - Prevented review-screen timers and resizes from reading the Anki collection
   while sync has it closed.
+- Prevented internal widget names from flashing while deck and settings rows
+  rebuild, including immediately after sync.
 - Returned directly to the refreshed deck list after the completion celebration,
   avoiding a second finished-review screen.
 - Added profile-specific Instant, Brief, Normal, and Relaxed feedback timing,

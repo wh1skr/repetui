@@ -442,7 +442,14 @@ def compose_deck_row(row: VisibleDeckRow, width: int) -> Text:
     return result
 
 
-class DeckItem(ListItem):
+class RepetuiListItem(ListItem):
+    """List row whose pending-mount fallback never exposes Textual internals."""
+
+    def render(self) -> Text:
+        return Text()
+
+
+class DeckItem(RepetuiListItem):
     def __init__(self, row: VisibleDeckRow) -> None:
         super().__init__()
         self.row = row
@@ -453,6 +460,10 @@ class DeckItem(ListItem):
 
     def compose(self) -> ComposeResult:
         yield Static(classes="deck-row")
+
+    def render(self) -> Text:
+        """Keep useful deck content visible while the child row is mounting."""
+        return compose_deck_row(self.row, self.size.width)
 
     def on_mount(self) -> None:
         self._refresh_counts(self.size.width)
@@ -555,7 +566,7 @@ class DeckScreen(Screen[None]):
             self.app.push_screen(ReviewScreen(item.deck))
 
 
-class SectionSettingItem(ListItem):
+class SectionSettingItem(RepetuiListItem):
     """One keyboard-editable presentation section."""
 
     def __init__(self, section: PresentationSection) -> None:
@@ -582,7 +593,7 @@ class SectionSettingItem(ListItem):
         self.query_one(".setting-mode", Static).update(Text(mode.value, style=colour))
 
 
-class AnswerLayoutSettingItem(ListItem):
+class AnswerLayoutSettingItem(RepetuiListItem):
     """The current template's compact or left-aligned answer flow."""
 
     def compose(self) -> ComposeResult:
@@ -599,7 +610,7 @@ class AnswerLayoutSettingItem(ListItem):
         )
 
 
-class TemplateFieldsSettingItem(ListItem):
+class TemplateFieldsSettingItem(RepetuiListItem):
     """Entry point for editing the current template's field profile."""
 
     def compose(self) -> ComposeResult:
@@ -619,7 +630,7 @@ class FieldRole(str, Enum):
         return roles[(roles.index(self) + 1) % len(roles)]
 
 
-class FieldProfileItem(ListItem):
+class FieldProfileItem(RepetuiListItem):
     """One source field and its terminal presentation role."""
 
     def __init__(self, field: SourceField, role: FieldRole) -> None:
@@ -782,7 +793,7 @@ class TemplateFieldSetupScreen(Screen[None]):
         self.app.pop_screen()
 
 
-class ControlSettingItem(ListItem):
+class ControlSettingItem(RepetuiListItem):
     """One keyboard-editable review action and its current binding."""
 
     def __init__(self, action: ReviewAction) -> None:
@@ -801,7 +812,7 @@ class ControlSettingItem(ListItem):
         )
 
 
-class ActionFeedbackDurationSettingItem(ListItem):
+class ActionFeedbackDurationSettingItem(RepetuiListItem):
     """Profile-scoped duration for successful review-operation feedback."""
 
     def compose(self) -> ComposeResult:
@@ -814,7 +825,7 @@ class ActionFeedbackDurationSettingItem(ListItem):
         )
 
 
-class AddOnItem(ListItem):
+class AddOnItem(RepetuiListItem):
     """One registered add-on and its profile-scoped enabled state."""
 
     def __init__(self, definition: AddOnDefinition) -> None:
@@ -835,7 +846,7 @@ def _on_off_text(enabled: bool) -> Text:
     return Text("on" if enabled else "off", style="#79c98b" if enabled else "#aaa49b")
 
 
-class AddOnSettingItem(ListItem):
+class AddOnSettingItem(RepetuiListItem):
     """One repetui-rendered enabled or declarative setting row."""
 
     def __init__(
