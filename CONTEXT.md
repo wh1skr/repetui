@@ -69,7 +69,10 @@ after reveal.
   setup assigns ordered Prompt, Answer, Auto, or Ignore roles without executing
   card JavaScript or adding note-type-specific rules. Auto fields appear only
   when their content is detected on that card, allowing optional fields to
-  evolve without another configuration pass.
+  evolve without another configuration pass. Field roles and order update an
+  unsaved preview through the same presentation and Flow composition modules
+  as review. Narrow panes toggle between fields and preview; wide panes show
+  both. Save applies the draft; Escape discards it.
 
 ### Settings
 
