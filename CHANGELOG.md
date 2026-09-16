@@ -4,6 +4,15 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+## 0.1.6b - 2026-09-16
+
+- Prevented review-screen timers and resizes from reading the Anki collection
+  while sync has it closed.
+- Returned directly to the refreshed deck list after the completion celebration,
+  avoiding a second finished-review screen.
+- Added profile-specific Instant, Brief, Normal, and Relaxed feedback timing,
+  with Enter able to continue immediately after successful review actions.
+
 ## 0.1.6a - 2026-09-15
 
 - Added adaptive field profiles for script-heavy card templates, including a
