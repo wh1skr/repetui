@@ -2171,6 +2171,119 @@ class ReviewEmptiesWhenReopenedBackend(FakeBackend):
             self.card_available = False
 
 
+class ClosedAwareBackend(FakeBackend):
+    """Reject collection reads while a held sync owns the closed backend."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed_count_calls = 0
+
+    def counts(self) -> DueCounts:
+        if not self.is_open:
+            self.closed_count_calls += 1
+            raise BackendError("The Anki collection is not open.")
+        return super().counts()
+
+
+def make_held_sync_app(
+    tmp_path: Path, started: Event, release: Event
+) -> tuple[RepetuiApp, ClosedAwareBackend]:
+    def held_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=3)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    backend = ClosedAwareBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=held_sync,
+    )
+    return app, backend
+
+
+@pytest.mark.asyncio
+async def test_rating_feedback_expiry_does_not_read_closed_backend_during_sync(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("enter", "enter", "3")
+            review = app.screen
+            assert isinstance(review, ReviewScreen)
+            frozen_content = str(review.query_one("#card").render())
+            frozen_actions = str(review.query_one("#review-actions").render())
+
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            assert backend.is_open is False
+
+            await pilot.pause(1.05)
+
+            assert isinstance(app.screen, SyncPopup)
+            assert backend.closed_count_calls == 0
+            assert str(review.query_one("#card").render()) == frozen_content
+            assert str(review.query_one("#review-actions").render()) == frozen_actions
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_resize_does_not_read_closed_review_backend_during_sync(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("enter", "s")
+            assert started.wait(timeout=1)
+            assert backend.is_open is False
+
+            await pilot.resize_terminal(41, 6)
+            await pilot.pause()
+
+            assert isinstance(app.screen, SyncPopup)
+            assert backend.closed_count_calls == 0
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_review_refreshes_once_after_held_sync_popup_closes(tmp_path) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert backend.begun_deck_ids == [1]
+
+        await pilot.press("s")
+        assert started.wait(timeout=1)
+        assert backend.is_open is False
+        assert backend.begun_deck_ids == [1]
+
+        release.set()
+        await pilot.pause(1.2)
+
+        assert app.screen is review
+        assert backend.is_open is True
+        assert backend.begun_deck_ids == [1, 1]
+
+
 @pytest.mark.asyncio
 async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
     backend = FailingBackend()

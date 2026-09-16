@@ -1463,6 +1463,8 @@ class ReviewScreen(Screen[None]):
         return tuple(states)
 
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
+        if self.repetui.syncing:
+            return
         counts = self.repetui.backend.counts()
         content = self.query_one("#card", Static)
         actions = self.query_one("#review-actions", Static)
@@ -2464,11 +2466,11 @@ class RepetuiApp(App[None]):
 
     def _sync_popup_closed(self, fatal: bool | None) -> None:
         fatal_error = self._sync_fatal_error
+        self.syncing = False
         if self.backend.is_open:
             for screen in self.screen_stack:
                 if hasattr(screen, "backend_refreshed"):
                     cast(Refreshable, screen).backend_refreshed()
-        self.syncing = False
         self._sync_popup = None
         self._sync_origin = None
         self._sync_fatal_error = None
