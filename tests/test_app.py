@@ -516,19 +516,18 @@ async def test_enabled_completion_celebration_takes_over_full_pane_and_consumes_
         rendered = str(celebration.query_one("#completion-art").render())
         assert "deck complete" in rendered
         assert "Japanese" in rendered
-        review = app.screen_stack[-2]
-        assert isinstance(review, ReviewScreen)
-        assert review.card is None
+        assert isinstance(app.screen_stack[-2], DeckScreen)
+        assert not any(isinstance(screen, ReviewScreen) for screen in app.screen_stack)
         assert backend.rating == 3
 
         await pilot.press(skip_key)
 
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
         assert backend.rating == 3
         assert backend.undo_calls == 0
         assert app.syncing is False
         await pilot.pause(0.2)
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
 
 
 @pytest.mark.asyncio
@@ -552,8 +551,8 @@ async def test_completion_celebration_waits_for_the_final_due_card(tmp_path) -> 
         await pilot.press("enter", "3")
 
         assert isinstance(app.screen, CompletionCelebrationScreen)
-        assert app.screen_stack[-2] is review
-        assert review.card is None
+        assert review not in app.screen_stack
+        assert isinstance(app.screen_stack[-2], DeckScreen)
 
 
 @pytest.mark.asyncio
@@ -568,20 +567,20 @@ async def test_completion_celebration_adapts_to_narrow_resize_and_stays_skippabl
         await pilot.press("enter", "enter", "3")
         celebration = app.screen
         assert isinstance(celebration, CompletionCelebrationScreen)
-        review = app.screen_stack[-2]
+        assert isinstance(app.screen_stack[-2], DeckScreen)
 
         await pilot.resize_terminal(8, 4)
         rendered = str(celebration.query_one("#completion-art").render())
         assert "complete" in rendered
 
         await pilot.press("escape")
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
         await pilot.pause(0.2)
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
 
 
 @pytest.mark.asyncio
-async def test_completion_celebration_duration_returns_to_existing_done_screen(
+async def test_completion_celebration_duration_returns_to_decks(
     tmp_path,
 ) -> None:
     app, _ = make_app(tmp_path)
@@ -592,12 +591,48 @@ async def test_completion_celebration_duration_returns_to_existing_done_screen(
         await pilot.press("enter", "enter", "3")
         celebration = app.screen
         assert isinstance(celebration, CompletionCelebrationScreen)
-        review = app.screen_stack[-2]
+        assert isinstance(app.screen_stack[-2], DeckScreen)
 
         await pilot.pause(0.9)
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
         await pilot.pause(0.2)
-        assert app.screen is review
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_refreshes_counts_before_showing_decks(
+    tmp_path,
+) -> None:
+    class CountsChangeAfterAnswerBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__(
+                decks=[Deck(1, "Japanese", 0, DueCounts(0, 0, 1))],
+                counts=DueCounts(0, 0, 1),
+            )
+
+        def answer(self, rating: int) -> None:
+            super().answer(rating)
+            self._decks = [Deck(1, "Japanese", 0, DueCounts(0, 0, 0))]
+
+    backend = CountsChangeAfterAnswerBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        assert "0/0/1" in str(decks.query_one(".deck-row").render())
+
+        await pilot.press("enter", "enter", "3", "escape")
+
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
 
 
 @pytest.mark.asyncio
@@ -630,7 +665,8 @@ async def test_completion_celebration_is_discarded_if_another_screen_takes_over(
         await pilot.press("enter", "enter", "3")
         celebration = app.screen
         assert isinstance(celebration, CompletionCelebrationScreen)
-        review = app.screen_stack[-2]
+        decks = app.screen_stack[-2]
+        assert isinstance(decks, DeckScreen)
 
         app.push_screen(SettingsScreen())
         await pilot.pause()
@@ -639,7 +675,7 @@ async def test_completion_celebration_is_discarded_if_another_screen_takes_over(
 
         app.pop_screen()
         await pilot.pause()
-        assert app.screen is review
+        assert app.screen is decks
 
 
 @pytest.mark.asyncio
@@ -647,6 +683,36 @@ async def test_disabled_completion_celebration_reaches_done_without_takeover(
     tmp_path,
 ) -> None:
     app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", (False, True))
+async def test_completion_add_on_without_a_cue_keeps_done_screen(
+    tmp_path, fails
+) -> None:
+    def handle(_event, _settings):
+        if fails:
+            raise RuntimeError("private completion detail")
+        return None
+
+    definition = AddOnDefinition(
+        id="quiet-completion",
+        name="Quiet Completion",
+        description="Observe completion without presenting a cue.",
+        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
+        settings=(),
+        handle=handle,
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
 
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press("enter", "enter", "3")
@@ -1698,7 +1764,7 @@ async def test_add_ons_tab_enables_and_configures_registered_add_on_at_40x6(
         id="completion-celebration",
         name="Completion Celebration",
         description="Celebrate the final due card.",
-        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
+        events=frozenset({AddOnEventType.RATING_ACCEPTED}),
         settings=(
             ToggleSetting("sparkles", "Sparkles"),
             ChoiceSetting("duration", "Duration", ("short", "long"), "short"),
@@ -1812,7 +1878,7 @@ async def test_failing_add_on_cannot_interrupt_rating_or_expose_private_error(
         id="broken-feedback",
         name="Broken Feedback",
         description="A failing test add-on.",
-        events=frozenset({AddOnEventType.RATING_ACCEPTED}),
+        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
         settings=(),
         handle=fail,
     )

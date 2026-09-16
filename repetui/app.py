@@ -2337,7 +2337,10 @@ class RepetuiApp(App[None]):
                 ),
             )
             self._completion_celebration = celebration
-            self.push_screen(celebration)
+            if isinstance(self.screen, ReviewScreen) and self.screen.card is None:
+                self.switch_screen(celebration)
+            else:
+                self.push_screen(celebration)
 
     def close_completion_celebration(
         self, celebration: CompletionCelebrationScreen
@@ -2345,8 +2348,14 @@ class RepetuiApp(App[None]):
         celebration.stop_animation()
         if self._completion_celebration is celebration:
             self._completion_celebration = None
-        if self.screen is celebration:
-            self.pop_screen()
+        if self.screen is not celebration:
+            return
+
+        stack = self.screen_stack
+        decks = stack[-2] if len(stack) >= 2 else None
+        if isinstance(decks, DeckScreen):
+            decks.backend_refreshed()
+        self.pop_screen()
 
     def on_mount(self) -> None:
         try:
