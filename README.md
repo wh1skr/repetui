@@ -71,7 +71,11 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 
 Navigation remains fixed so it is always recoverable. Review actions can be
 rebound under `?` → Controls; conflicts are shown before an existing action is
-unbound.
+unbound. The same tab offers a profile-scoped **Action feedback duration**:
+Instant, Brief, Normal, or Relaxed. This controls successful Undo, Bury,
+Suspend, and Flag confirmations; errors remain readable. While a successful
+confirmation is visible, `Enter` dismisses it and immediately continues with
+the current card's primary action, while `Escape` only dismisses it.
 
 ### Full-sync conflicts
 

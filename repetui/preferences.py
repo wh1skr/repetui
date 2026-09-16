@@ -42,6 +42,29 @@ class AnswerLayout(str, Enum):
         )
 
 
+class ActionFeedbackDuration(str, Enum):
+    """How long successful review-operation feedback stays on screen."""
+
+    INSTANT = "instant"
+    BRIEF = "brief"
+    NORMAL = "normal"
+    RELAXED = "relaxed"
+
+    @property
+    def seconds(self) -> float:
+        return {
+            ActionFeedbackDuration.INSTANT: 0.0,
+            ActionFeedbackDuration.BRIEF: 0.4,
+            ActionFeedbackDuration.NORMAL: 1.0,
+            ActionFeedbackDuration.RELAXED: 2.0,
+        }[self]
+
+    @property
+    def next(self) -> ActionFeedbackDuration:
+        order = tuple(ActionFeedbackDuration)
+        return order[(order.index(self) + 1) % len(order)]
+
+
 class Preferences(Protocol):
     """Small injectable seam used by deck, review, and settings screens."""
 
@@ -55,6 +78,14 @@ class Preferences(Protocol):
 
     def set_review_controls(
         self, profile: ProfilePaths, controls: ReviewControls
+    ) -> None: ...
+
+    def action_feedback_duration(
+        self, profile: ProfilePaths
+    ) -> ActionFeedbackDuration: ...
+
+    def set_action_feedback_duration(
+        self, profile: ProfilePaths, duration: ActionFeedbackDuration
     ) -> None: ...
 
     def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool: ...
@@ -192,6 +223,33 @@ class JsonPreferences:
             saved_profile["review_controls"] = overrides
         else:
             saved_profile.pop("review_controls", None)
+        self._write_document(self._templates, profiles)
+        self._profiles = profiles
+
+    def action_feedback_duration(
+        self, profile: ProfilePaths
+    ) -> ActionFeedbackDuration:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        try:
+            return ActionFeedbackDuration(
+                saved_profile.get(
+                    "action_feedback_duration",
+                    ActionFeedbackDuration.NORMAL.value,
+                )
+            )
+        except (TypeError, ValueError):
+            return ActionFeedbackDuration.NORMAL
+
+    def set_action_feedback_duration(
+        self, profile: ProfilePaths, duration: ActionFeedbackDuration
+    ) -> None:
+        profiles = {key: dict(value) for key, value in self._profiles.items()}
+        profile_key = self._profile_key(profile)
+        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
+        if duration is ActionFeedbackDuration.NORMAL:
+            saved_profile.pop("action_feedback_duration", None)
+        else:
+            saved_profile["action_feedback_duration"] = duration.value
         self._write_document(self._templates, profiles)
         self._profiles = profiles
 

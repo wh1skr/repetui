@@ -79,7 +79,11 @@ configures the active card template during review and otherwise explains that
 a card must be opened first. Cards with usable source fields expose an Edit
 fields row, providing a manual escape hatch even when automatic detection is
 not needed or cannot recognize the template; the mapping persists per note
-type and card template. `h`/`l` and `Tab` move between tabs.
+type and card template. Controls also exposes a semantic Action feedback
+duration for successful review operations. Errors keep a readable duration
+regardless of that choice. Enter on successful feedback continues the
+underlying primary review action once; Escape dismisses without forwarding.
+`h`/`l` and `Tab` move between tabs.
 
 ### Deck Tree
 

@@ -6,6 +6,7 @@ import pytest
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.preferences import (
+    ActionFeedbackDuration,
     AnswerLayout,
     JsonPreferences,
     SectionMode,
@@ -254,6 +255,63 @@ def test_review_controls_survive_restart_and_are_isolated_by_profile(tmp_path) -
     restarted = JsonPreferences(path)
     assert restarted.review_controls(whskr).binding(ReviewAction.UNDO) == "z"
     assert restarted.review_controls(work) == ReviewControls.defaults()
+
+
+def test_action_feedback_duration_survives_restart_and_is_isolated_by_profile(
+    tmp_path,
+) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    work = profile(tmp_path / "Anki2", "work")
+    preferences = JsonPreferences(path)
+
+    assert (
+        preferences.action_feedback_duration(whskr)
+        is ActionFeedbackDuration.NORMAL
+    )
+    assert not path.exists()
+
+    preferences.set_action_feedback_duration(whskr, ActionFeedbackDuration.BRIEF)
+    restarted = JsonPreferences(path)
+
+    assert (
+        restarted.action_feedback_duration(whskr)
+        is ActionFeedbackDuration.BRIEF
+    )
+    assert (
+        restarted.action_feedback_duration(work)
+        is ActionFeedbackDuration.NORMAL
+    )
+    saved = json.loads(path.read_text())["profiles"][str(whskr.collection.resolve())]
+    assert saved["action_feedback_duration"] == "brief"
+
+
+def test_failed_action_feedback_duration_write_preserves_active_and_saved_choice(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    preferences = JsonPreferences(path)
+    preferences.set_action_feedback_duration(whskr, ActionFeedbackDuration.BRIEF)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_action_feedback_duration(
+            whskr, ActionFeedbackDuration.RELAXED
+        )
+
+    assert (
+        preferences.action_feedback_duration(whskr)
+        is ActionFeedbackDuration.BRIEF
+    )
+    assert (
+        JsonPreferences(path).action_feedback_duration(whskr)
+        is ActionFeedbackDuration.BRIEF
+    )
 
 
 @pytest.mark.parametrize(

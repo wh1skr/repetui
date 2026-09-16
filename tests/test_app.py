@@ -35,7 +35,12 @@ from repetui.backend import BackendError, CollectionInUseError, Deck, DueCounts,
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
-from repetui.preferences import AnswerLayout, JsonPreferences, SectionMode
+from repetui.preferences import (
+    ActionFeedbackDuration,
+    AnswerLayout,
+    JsonPreferences,
+    SectionMode,
+)
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -1252,6 +1257,110 @@ async def test_operation_status_dismisses_after_roughly_one_second(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_saved_brief_feedback_duration_controls_success_timeout_at_40x6(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.BRIEF
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "b")
+        popup = app.screen
+        assert isinstance(popup, OperationStatusPill)
+        assert popup.size == (40, 6)
+
+        await pilot.pause(0.25)
+        assert app.screen is popup
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, ReviewScreen)
+
+
+@pytest.mark.asyncio
+async def test_instant_feedback_duration_auto_dismisses_success_at_40x6(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.INSTANT
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "b")
+        await pilot.pause()
+
+        assert isinstance(app.screen, ReviewScreen)
+        assert backend.operations == ["bury"]
+
+
+@pytest.mark.asyncio
+async def test_undo_enter_continues_once_without_reapplying_or_rating(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        assert isinstance(app.screen, OperationStatusPill)
+
+        await pilot.press("enter", "enter")
+        await pilot.pause(0.2)
+
+        assert app.screen is review
+        assert backend.undo_calls == 1
+        assert backend.rating == 3
+        assert review.card is not None
+        assert review.revealed is True
+
+
+@pytest.mark.asyncio
+async def test_escape_dismisses_success_feedback_without_forwarding_primary(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+
+        await pilot.press("escape")
+
+        assert app.screen is review
+        assert backend.undo_calls == 1
+        assert review.card is not None
+        assert review.revealed is False
+
+
+@pytest.mark.asyncio
+async def test_instant_success_preference_does_not_hide_or_forward_error_feedback(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.INSTANT
+    )
+    backend.undo_available = False
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        assert isinstance(app.screen, OperationStatusPill)
+
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, OperationStatusPill)
+        await pilot.press("enter")
+
+        assert app.screen is review
+        assert review.card is not None
+        assert review.revealed is False
+        assert backend.undo_calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("key", "message"), (("0", "[ok] flag clear"), ("3", "[ok] flag 3")))
 @pytest.mark.parametrize("revealed", [False, True])
 async def test_flag_clear_and_set_keep_the_current_card_and_reveal_state(
@@ -1733,7 +1842,7 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
         assert controls.display is True
         assert controls.region == (0, 2, 40, 3)
         rows = list(controls.children)
-        assert len(rows) == 10
+        assert len(rows) == 11
         rendered_rows = [
             (
                 str(row.query_one(".control-label").render()),
@@ -1752,8 +1861,52 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
             ("Suspend", "x"),
             ("Flag", "f"),
             ("Sync", "s"),
+            ("Action feedback duration", "Normal"),
         ]
         assert settings.query_one("#settings-footer").region == (0, 5, 40, 1)
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "j/k · enter/space · bs default · esc"
+        )
+
+
+@pytest.mark.asyncio
+async def test_action_feedback_duration_cycles_in_settings_and_recovers_from_write_failure(
+    tmp_path, monkeypatch
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "h", "G")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        row = settings.query_one("#settings-controls").children[-1]
+        assert str(row.query_one(".control-label").render()) == (
+            "Action feedback duration"
+        )
+        assert str(row.query_one(".control-binding").render()) == "Normal"
+
+        await pilot.press("space")
+        assert (
+            preferences.action_feedback_duration(app.profile)
+            is ActionFeedbackDuration.RELAXED
+        )
+        assert str(row.query_one(".control-binding").render()) == "Relaxed"
+
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+        await pilot.press("space")
+
+        assert app.screen is settings
+        assert (
+            preferences.action_feedback_duration(app.profile)
+            is ActionFeedbackDuration.RELAXED
+        )
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "[err] feedback duration not saved"
+        )
 
 
 @pytest.mark.asyncio
@@ -2008,7 +2161,7 @@ async def test_capture_rejects_fixed_navigation_and_escape_cancels_it(
         await pilot.press("escape")
         assert app.screen is settings
         assert str(settings.query_one("#settings-footer").render()) == (
-            "j/k · enter bind · bs default · esc"
+            "j/k · enter/space · bs default · esc"
         )
 
         await pilot.press("escape")

@@ -50,7 +50,13 @@ from .flow import (
     compose_review,
     section_name,
 )
-from .preferences import AnswerLayout, JsonPreferences, Preferences, SectionMode
+from .preferences import (
+    ActionFeedbackDuration,
+    AnswerLayout,
+    JsonPreferences,
+    Preferences,
+    SectionMode,
+)
 from .presentation import (
     CardTemplateIdentity,
     PresentationSection,
@@ -795,6 +801,19 @@ class ControlSettingItem(ListItem):
         )
 
 
+class ActionFeedbackDurationSettingItem(ListItem):
+    """Profile-scoped duration for successful review-operation feedback."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("Action feedback duration", classes="control-label")
+        yield Static(classes="control-binding")
+
+    def refresh_duration(self, duration: ActionFeedbackDuration) -> None:
+        self.query_one(".control-binding", Static).update(
+            Text(duration.value.title(), style="#d9d5ce", no_wrap=True)
+        )
+
+
 class AddOnItem(ListItem):
     """One registered add-on and its profile-scoped enabled state."""
 
@@ -934,6 +953,7 @@ class SettingsScreen(Screen[None]):
             ),
             ListView(
                 *(ControlSettingItem(action) for action in ReviewAction),
+                ActionFeedbackDurationSettingItem(),
                 id="settings-controls",
             ),
             ListView(
@@ -961,6 +981,9 @@ class SettingsScreen(Screen[None]):
                 )
         for item in self.query(ControlSettingItem):
             item.refresh_binding(self.repetui.review_controls)
+        self.query_one(ActionFeedbackDurationSettingItem).refresh_duration(
+            self.repetui.preferences.action_feedback_duration(self.repetui.profile)
+        )
         for item in self.query(AddOnItem):
             item.refresh_state(self.repetui.add_ons)
         sections = self.query_one("#settings-sections", ListView)
@@ -1073,6 +1096,23 @@ class SettingsScreen(Screen[None]):
             self._cycle_add_on_value()
             return
         if self.tab == "controls":
+            view = self.query_one("#settings-controls", ListView)
+            if view.index is not None and 0 <= view.index < len(view.children):
+                item = view.children[view.index]
+                if isinstance(item, ActionFeedbackDurationSettingItem):
+                    current = self.repetui.preferences.action_feedback_duration(
+                        self.repetui.profile
+                    )
+                    try:
+                        self.repetui.preferences.set_action_feedback_duration(
+                            self.repetui.profile, current.next
+                        )
+                    except OSError:
+                        self._show_footer("[err] feedback duration not saved")
+                        return
+                    item.refresh_duration(current.next)
+                    self._show_default_footer()
+                    return
             action = self._selected_control_action()
             if action is not None:
                 self.capturing = action
@@ -1190,7 +1230,7 @@ class SettingsScreen(Screen[None]):
     def _show_default_footer(self) -> None:
         message = {
             "help": "j/k scroll · h/l tabs · esc",
-            "controls": "j/k · enter bind · bs default · esc",
+            "controls": "j/k · enter/space · bs default · esc",
             "sections": (
                 "j/k · space change · h/l tabs · esc"
                 if self.card is not None
@@ -1612,7 +1652,21 @@ class ReviewScreen(Screen[None]):
         self._rate(4)
 
     def _show_operation_status(self, message: str, *, success: bool) -> None:
-        self.app.push_screen(OperationStatusPill(message, success=success))
+        duration = (
+            self.repetui.preferences.action_feedback_duration(
+                self.repetui.profile
+            ).seconds
+            if success
+            else 1.0
+        )
+        self.app.push_screen(
+            OperationStatusPill(
+                message,
+                success=success,
+                duration=duration,
+                continue_action=self.action_primary if success else None,
+            )
+        )
 
     def action_undo(self) -> None:
         if self._busy():
@@ -1776,19 +1830,34 @@ class OperationStatusPill(StatusPill):
     """Brief review-operation result using the shared status surface."""
 
     BINDINGS = [
+        Binding("enter", "continue", show=False, priority=True),
+        Binding("escape", "cancel", show=False, priority=True),
         Binding("q", "block", show=False, priority=True),
         Binding("question_mark", "block", show=False, priority=True),
     ]
 
-    def __init__(self, message: str, *, success: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        success: bool,
+        duration: float = 1.0,
+        continue_action: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(message)
         self.success = success
+        self.duration = duration
+        self.continue_action = continue_action
         self._dismiss_timer: Timer | None = None
+        self._continuing = False
 
     def on_mount(self) -> None:
         super().on_mount()
         self.query_one(".status-pill").add_class("-success" if self.success else "-error")
-        self._dismiss_timer = self.set_timer(1.0, self._dismiss_status)
+        if self.duration <= 0:
+            self.call_after_refresh(self._dismiss_status)
+        else:
+            self._dismiss_timer = self.set_timer(self.duration, self._dismiss_status)
 
     def on_unmount(self) -> None:
         if self._dismiss_timer is not None:
@@ -1798,8 +1867,32 @@ class OperationStatusPill(StatusPill):
     def action_block(self) -> None:
         """Keep global shortcuts from leaking through the brief status state."""
 
-    def _dismiss_status(self) -> None:
+    def action_continue(self) -> None:
+        """Dismiss errors, or continue a successful review action exactly once."""
+        if self._continuing:
+            return
+        if not self.success:
+            self.action_cancel()
+            return
+        self._continuing = True
+        if self._dismiss_timer is not None:
+            self._dismiss_timer.stop()
+        if self.continue_action is not None:
+            self.continue_action()
+        # Keep the modal mounted for one input turn so repeated Enter presses
+        # cannot leak through to the newly revealed review screen.
+        self._dismiss_timer = self.set_timer(0.15, self._dismiss_status)
+
+    def action_cancel(self) -> None:
+        if self._dismiss_timer is not None:
+            self._dismiss_timer.stop()
+            self._dismiss_timer = None
         self.dismiss()
+
+    def _dismiss_status(self) -> None:
+        self._dismiss_timer = None
+        if self.is_mounted:
+            self.dismiss()
 
 
 class FlagSelectionPill(StatusPill):
