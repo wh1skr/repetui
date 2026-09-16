@@ -5,6 +5,7 @@ from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
     SourceField,
+    TemplateFieldProfile,
     present_card,
 )
 
@@ -229,6 +230,19 @@ def test_hidden_content_stays_hidden_and_empty_back_does_not_repeat_front() -> N
     assert card.back.text == "(empty card)"
 
 
+def test_conventional_hidden_class_does_not_leak_field_content() -> None:
+    card = present_card(
+        raw(
+            'visible<div class="hidden">front secret</div>',
+            '<div class="hidden other">back secret</div><hr id=answer>answer',
+        )
+    )
+
+    assert card.front.text == "visible"
+    assert card.back.text == "answer"
+    assert "secret" not in card.front.text + card.back.text
+
+
 def test_hidden_void_elements_do_not_hide_the_content_after_them() -> None:
     card = present_card(raw('<input hidden value="secret">still visible', "answer"))
 
@@ -348,3 +362,171 @@ def test_reports_terminal_display_width_without_truncating_unicode() -> None:
 
     assert card.front.display_width == 3
     assert card.front.text == "葬a\n👩‍💻"
+
+
+def test_dynamic_template_falls_back_to_a_safe_suggested_field_profile() -> None:
+    dictionary_entry = "long dictionary detail " * 80
+    card = present_card(
+        raw(
+            """
+            <style>.tooltip { display: none }</style>
+            <div class="hidden">漁をする</div>
+            <div class="template-help">Need help? Template version 1</div>
+            <aside class="tooltip">View the card documentation</aside>
+            <img src="_field.css">
+            <script>document.querySelector('.hidden').remove()</script>
+            <div id="display">漁</div>
+            """,
+            f"""
+            <div class="template-help">Need help? Template version 1</div>
+            <aside class="tooltip">View the card documentation</aside>
+            <img src="_field.css">
+            <div class="hidden">漁</div>
+            <div id="reading">りょう</div>
+            <ol><li>fishing</li></ol>
+            <div id="sentence">漁をする</div>
+            <div id="dictionary">{dictionary_entry}</div>
+            <img src="answer.png" alt="answer diagram">
+            <script>document.querySelector('.template-help').remove()</script>
+            """,
+            SourceField("Key", "漁"),
+            SourceField("Word", "漁"),
+            SourceField("Reading", "りょう"),
+            SourceField("Definition", "<ol><li>fishing</li></ol>"),
+            SourceField("Sentence", "漁をする"),
+            SourceField("Dictionary", dictionary_entry),
+            SourceField("Picture", '<img src="answer.png" alt="answer diagram">'),
+            SourceField("Control", "1"),
+            SourceField("Unused secret", "must never leak"),
+        )
+    )
+
+    assert card.front.text == "漁"
+    assert [section.source_label for section in card.back.sections] == [
+        "Reading",
+        "Definition",
+        "Sentence",
+        "Dictionary",
+        "Picture",
+    ]
+    assert card.back.text == (
+        f"りょう\n\n• fishing\n\n漁をする\n\n{dictionary_entry.strip()}"
+        "\n\n[image: answer diagram]"
+    )
+    assert "Need help" not in card.front.text + card.back.text
+    assert "View the card" not in card.front.text + card.back.text
+    assert "_field.css" not in card.front.text + card.back.text
+    assert "must never leak" not in card.front.text + card.back.text
+    assert card.suggested_profile == TemplateFieldProfile(
+        prompt_fields=("Key",),
+        answer_fields=("Reading", "Definition", "Sentence", "Dictionary", "Picture"),
+    )
+
+
+def test_changed_template_reoffers_setup_when_a_saved_field_disappears() -> None:
+    content = raw(
+        """
+        <div class="template-help">Template controls</div>
+        <script>prepareCard()</script>
+        <div>question</div>
+        """,
+        """
+        <div class="template-help">Template controls</div>
+        <div>question</div><div>answer</div><div>details</div>
+        <script>prepareAnswer()</script>
+        """,
+        SourceField("Prompt", "question"),
+        SourceField("Answer", "answer"),
+        SourceField("Details", "details"),
+    )
+
+    card = present_card(
+        content,
+        TemplateFieldProfile(
+            prompt_fields=("Removed prompt",),
+            answer_fields=("Answer", "Details"),
+        ),
+    )
+
+    assert card.front.text == "question"
+    assert card.back.text == "answer\n\ndetails"
+    assert card.suggested_profile == TemplateFieldProfile(
+        prompt_fields=("Prompt",),
+        answer_fields=("Answer", "Details"),
+    )
+
+
+def test_saved_field_profile_controls_prompt_answer_order_and_ignored_fields() -> None:
+    content = raw(
+        "template question",
+        "template question and answer",
+        SourceField("Identifier", "internal-id"),
+        SourceField("Question", "What survives template changes?"),
+        SourceField("Meaning", "Stable fields"),
+        SourceField("Example", "A useful example"),
+        SourceField("Private note", "must never leak"),
+    )
+
+    card = present_card(
+        content,
+        TemplateFieldProfile(
+            prompt_fields=("Question",),
+            answer_fields=("Example", "Meaning"),
+        ),
+    )
+
+    assert card.front.text == "What survives template changes?"
+    assert [section.source_label for section in card.back.sections] == [
+        "Example",
+        "Meaning",
+    ]
+    assert card.back.text == "A useful example\n\nStable fields"
+    assert "internal-id" not in card.front.text + card.back.text
+    assert "must never leak" not in card.front.text + card.back.text
+    assert card.suggested_profile is None
+
+
+def test_saved_profile_auto_includes_newly_populated_rendered_fields() -> None:
+    content = raw(
+        """
+        <div class="hidden">internal-id</div><div>question</div>
+        <script>prepareCard()</script>
+        """,
+        """
+        <div class="hidden">internal-id</div><div>question</div>
+        <div>answer</div><div>new supporting detail</div>
+        <script>prepareAnswer()</script>
+        """,
+        SourceField("Identifier", "internal-id"),
+        SourceField("Question", "question"),
+        SourceField("Answer", "answer"),
+        SourceField("Sometimes populated", "new supporting detail"),
+        SourceField("Private note", "must never leak"),
+    )
+
+    card = present_card(
+        content,
+        TemplateFieldProfile(
+            prompt_fields=("Question",),
+            answer_fields=("Answer",),
+        ),
+    )
+
+    assert [section.source_label for section in card.back.sections] == [
+        "Answer",
+        "Sometimes populated",
+    ]
+    assert "new supporting detail" in card.back.text
+    assert "internal-id" not in card.front.text + card.back.text
+    assert "must never leak" not in card.front.text + card.back.text
+
+    ignored = present_card(
+        content,
+        TemplateFieldProfile(
+            prompt_fields=("Question",),
+            answer_fields=("Answer",),
+            ignored_fields=("Sometimes populated",),
+        ),
+    )
+    assert [section.source_label for section in ignored.back.sections] == ["Answer"]
+    assert "new supporting detail" not in ignored.back.text

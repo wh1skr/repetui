@@ -10,7 +10,7 @@ from rich.text import Text
 
 from .backend import DueCounts, ReviewQueue
 from .controls import ReviewAction, ReviewControls
-from .preferences import SectionMode
+from .preferences import AnswerLayout, SectionMode
 from .presentation import CardPresentation, PresentationSection
 
 _TYPE_ANSWER_MARKER = "[type answer]"
@@ -179,13 +179,42 @@ def _expanded_body(section: PresentationSection) -> str:
     return text
 
 
-def _back(states: tuple[SectionState, ...]) -> Text:
-    rows: list[tuple[str, str]] = []
+def _is_unlabelled_section(section: PresentationSection) -> bool:
+    return section.id.endswith(":fallback")
+
+
+def _stacked_section(section: PresentationSection) -> Text:
+    body = _expanded_body(section)
+    result = Text(body, style="#d9d5ce", overflow="fold")
+    if _is_unlabelled_section(section):
+        return result
+    result.append("  · ", style="#817d76")
+    result.append(section_name(section), style="#817d76")
+    return result
+
+
+def _short_unlabelled_blocks(section: PresentationSection) -> tuple[str, ...]:
+    if not _is_unlabelled_section(section):
+        return ()
+    blocks = tuple(block.strip() for block in _BLOCK_BREAK.split(section.text))
+    if len(blocks) < 2 or any(
+        not block or "\n" in block or cell_len(block) > _SHORT_BLOCK_WIDTH
+        for block in blocks
+    ):
+        return ()
+    return blocks
+
+
+def _back(
+    states: tuple[SectionState, ...],
+    answer_layout: AnswerLayout,
+) -> Text:
+    rows: list[Text] = []
     compact: list[str] = []
 
     def flush_compact() -> None:
         if compact:
-            rows.append(("  ·  ".join(compact), "#d9d5ce"))
+            rows.append(Text("  ·  ".join(compact), style="#d9d5ce"))
             compact.clear()
 
     for state in states:
@@ -194,28 +223,50 @@ def _back(states: tuple[SectionState, ...]) -> Text:
             continue
         if state.mode is SectionMode.SHOW:
             shown = _shown_section(section)
-            if _is_compact_section(section, shown):
+            short_blocks = _short_unlabelled_blocks(section)
+            if short_blocks:
+                flush_compact()
+                rows.extend(Text(block, style="#d9d5ce") for block in short_blocks)
+                continue
+            if (
+                answer_layout is AnswerLayout.STACKED
+                and _is_compact_section(section, shown)
+                and _expanded_body(section)
+            ):
+                flush_compact()
+                rows.append(_stacked_section(section))
+            elif _is_compact_section(section, shown):
                 compact.append(shown)
             else:
                 flush_compact()
-                rows.append((shown, "#d9d5ce"))
+                rows.append(Text(shown, style="#d9d5ce"))
             continue
 
         flush_compact()
         name = section_name(section)
         if state.expanded:
             body = _expanded_body(section)
-            rows.append((f"▾ {name}\n{body}", "#c6d8d0" if state.selected else "#aaa49b"))
+            rows.append(
+                Text(
+                    f"▾ {name}\n{body}",
+                    style="#c6d8d0" if state.selected else "#aaa49b",
+                )
+            )
         else:
             marker = "›" if state.selected else "▸"
-            rows.append((f"{marker} {name}", "#c6d8d0" if state.selected else "#817d76"))
+            rows.append(
+                Text(
+                    f"{marker} {name}",
+                    style="#c6d8d0" if state.selected else "#817d76",
+                )
+            )
     flush_compact()
 
     result = Text(overflow="fold")
-    for index, (row, style) in enumerate(rows):
+    for index, row in enumerate(rows):
         if index:
             result.append("\n")
-        result.append(row, style=style)
+        result.append_text(row)
     return result
 
 
@@ -228,12 +279,13 @@ def compose_review(
     revealed: bool,
     sections: tuple[SectionState, ...] = (),
     current_queue: ReviewQueue | None = None,
+    answer_layout: AnswerLayout = AnswerLayout.COMPACT,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
     result = _header(presentation, deck_name, counts, width, current_queue)
     if revealed:
         result.append("\n")
-        result.append_text(_back(sections))
+        result.append_text(_back(sections, answer_layout))
     return result
 
 
@@ -274,4 +326,22 @@ def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:
         if index:
             result.append("  ")
         result.append(label, style=colour)
+    return result
+
+
+def compose_rating_feedback(rating: int) -> Text:
+    """Identify the rating Anki accepted without echoing its triggering key."""
+    choices = {
+        1: ("again", "#dc6b72"),
+        2: ("hard", "#d7b85a"),
+        3: ("good", "#79c98b"),
+        4: ("easy", "#68a8df"),
+    }
+    try:
+        label, colour = choices[rating]
+    except KeyError as exc:
+        raise ValueError("Rating must be between 1 and 4.") from exc
+
+    result = Text("rated · ", style="#817d76", no_wrap=True)
+    result.append(f"{rating} {label}", style=f"bold {colour}")
     return result

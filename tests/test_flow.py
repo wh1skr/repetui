@@ -2,8 +2,13 @@ import pytest
 
 from repetui.backend import DueCounts, ReviewQueue
 from repetui.controls import ReviewAction, ReviewControls
-from repetui.flow import SectionState, compose_ratings, compose_review
-from repetui.preferences import SectionMode
+from repetui.flow import (
+    SectionState,
+    compose_rating_feedback,
+    compose_ratings,
+    compose_review,
+)
+from repetui.preferences import AnswerLayout, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -79,6 +84,164 @@ def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
     assert "cross)\nMeaning Mnemonic · mnemonic paragraph" in revealed
     assert "meaning info\nReading Mnemonic · reading paragraph" in revealed
     assert "reading info" in revealed
+
+
+def test_stacked_flow_starts_each_short_answer_at_the_left_edge() -> None:
+    presentation = real_kanji_presentation()
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    )
+
+    assert revealed.plain.splitlines()[1:5] == [
+        "Stylish  · Meaning",
+        "すい  · On'yomi",
+        "いき  · Kun'yomi",
+        "米, 九, 十 (rice, nine, cross)  · Radicals",
+    ]
+    styled_fragments = {
+        (revealed.plain[span.start : span.end], str(span.style))
+        for span in revealed.spans
+    }
+    assert ("Meaning", "#817d76") in styled_fragments
+    assert ("On'yomi", "#817d76") in styled_fragments
+    assert "mnemonic paragraph" in revealed.plain
+    assert "meaning info" in revealed.plain
+
+
+def test_stacked_flow_keeps_a_generic_one_line_answer_unlabelled() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(1, "Basic", 0, "Card 1"),
+            "question",
+            "answer",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Default",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    )
+
+    assert revealed.plain.splitlines()[1:] == ["answer"]
+
+
+@pytest.mark.parametrize("answer_layout", tuple(AnswerLayout))
+def test_short_unlabelled_answers_use_adjacent_rows_in_every_layout(
+    answer_layout: AnswerLayout,
+) -> None:
+    front = '<div class="word">房</div><div>Vocabulary Meaning</div>'
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(204, "Japanese Vocabulary", 0, "Vocabulary Meaning"),
+            front,
+            front + "<br>Cluster, Tassel, Tuft<br><br>ふさ",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese::Vocabulary",
+        DueCounts(1, 0, 37),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=answer_layout,
+    )
+
+    assert revealed.plain.splitlines()[1:] == ["Cluster, Tassel, Tuft", "ふさ"]
+
+
+@pytest.mark.parametrize("answer_layout", tuple(AnswerLayout))
+def test_unlabelled_long_prose_keeps_its_paragraph_gap(
+    answer_layout: AnswerLayout,
+) -> None:
+    front = "Question"
+    first_paragraph = (
+        "This explanation is intentionally longer than a short answer value so its "
+        "paragraph structure must remain visible."
+    )
+    second_paragraph = "This supporting explanation belongs in a separate paragraph."
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(204, "Japanese", 0, "Recognition"),
+            front,
+            front + f"<br>{first_paragraph}<br><br>{second_paragraph}",
+        )
+    )
+    states = tuple(
+        SectionState(section, SectionMode.SHOW)
+        for section in presentation.back.sections
+    )
+
+    revealed = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=answer_layout,
+    )
+
+    assert f"{first_paragraph}\n\n{second_paragraph}" in revealed.plain
+
+
+def test_stacked_flow_leaves_multiline_and_folded_sections_unchanged() -> None:
+    presentation = real_kanji_presentation()
+    states = (
+        SectionState(presentation.back.sections[4], SectionMode.SHOW),
+        SectionState(
+            presentation.back.sections[5],
+            SectionMode.FOLD,
+            selected=True,
+        ),
+    )
+
+    compact = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+    ).plain
+    stacked = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(8, 17, 213),
+        40,
+        revealed=True,
+        sections=states,
+        answer_layout=AnswerLayout.STACKED,
+    ).plain
+
+    assert stacked == compact
+    assert "mnemonic paragraph\n\nmeaning info" in stacked
+    assert "› Reading Mnemonic" in stacked
 
 
 def test_review_count_cluster_keeps_neutral_total_and_anki_split_colours() -> None:
@@ -160,3 +323,21 @@ def test_rating_row_uses_current_bindings_and_marks_unbound_actions() -> None:
     result = compose_ratings(40, controls)
 
     assert result.plain == "2 again  - hard  3 good  4 easy"
+
+
+@pytest.mark.parametrize(
+    ("rating", "label", "colour"),
+    (
+        (1, "again", "#dc6b72"),
+        (2, "hard", "#d7b85a"),
+        (3, "good", "#79c98b"),
+        (4, "easy", "#68a8df"),
+    ),
+)
+def test_rating_feedback_identifies_the_accepted_anki_action(
+    rating: int, label: str, colour: str
+) -> None:
+    result = compose_rating_feedback(rating)
+
+    assert result.plain == f"rated · {rating} {label}"
+    assert any(str(span.style) == f"bold {colour}" for span in result.spans)

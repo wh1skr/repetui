@@ -64,13 +64,26 @@ after reveal.
 - A user may explicitly show, fold, or hide sections for one stable Anki note
   type and card template.
 - Opening a fold during a review is temporary and never changes its saved mode.
+- If a script-heavy card cannot be separated confidently, review falls back to
+  source fields that are demonstrably present on the rendered card. A one-time
+  setup assigns ordered Prompt, Answer, Auto, or Ignore roles without executing
+  card JavaScript or adding note-type-specific rules. Auto fields appear only
+  when their content is detected on that card, allowing optional fields to
+  evolve without another configuration pass.
 
 ### Settings
 
 `?` opens one full-screen, small-pane-safe settings surface from decks or
 review. Help and profile-scoped review controls are always available. Sections
 configures the active card template during review and otherwise explains that
-a card must be opened first. `h`/`l` and `Tab` move between tabs.
+a card must be opened first. Cards with usable source fields expose an Edit
+fields row, providing a manual escape hatch even when automatic detection is
+not needed or cannot recognize the template; the mapping persists per note
+type and card template. Controls also exposes a semantic Action feedback
+duration for successful review operations. Errors keep a readable duration
+regardless of that choice. Enter on successful feedback continues the
+underlying primary review action once; Escape dismisses without forwarding.
+`h`/`l` and `Tab` move between tabs.
 
 ### Deck Tree
 

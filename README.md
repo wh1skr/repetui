@@ -33,6 +33,25 @@ If you have more than one Anki profile:
 repetui --profile PROFILE_NAME
 ```
 
+### Collection already in use
+
+The startup recovery screen offers `r` to retry after manual closure and `c`
+to request closure of the verified instance holding this collection. On
+Linux/WSL, recent Repetui instances can exit cooperatively; an instance currently
+syncing will not exit on that request. Waiting is bounded and Escape cancels
+waiting (it cannot undo a close request already sent).
+
+If orderly closure is unavailable or times out, `f` shows a separate warning
+naming the owner. Type `FORCE` to terminate it and retry. This may interrupt
+writes or lose unsaved work. No termination occurs without confirmation, and
+the process identity and collection lock are checked again before signaling.
+
+Only verified, same-user Linux Anki/Repetui owners can be targeted. Anki Desktop
+does not currently support cooperative closure here; older Repetui instances
+also require manual closure or the separate force option. Windows-host/macOS,
+unknown owners, inaccessible locks, and unsupported process APIs use manual
+Retry. Recovery never deletes collection, lock, WAL, or journal files.
+
 ## Controls
 
 | Where | Keys | Action |
@@ -45,13 +64,38 @@ repetui --profile PROFILE_NAME
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
+| Card-field setup | `Space`, `J` / `K`, `Enter` | Change role, reorder, save |
 | Decks / review | `s` | Sync with AnkiWeb |
 | Anywhere | `?` | Help, controls, and section settings |
 | Anywhere | `q` | Quit |
 
 Navigation remains fixed so it is always recoverable. Review actions can be
 rebound under `?` → Controls; conflicts are shown before an existing action is
-unbound.
+unbound. The same tab offers a profile-scoped **Action feedback duration**:
+Instant, Brief, Normal, or Relaxed. This controls successful Undo, Bury,
+Suspend, and Flag confirmations; errors remain readable. While a successful
+confirmation is visible, `Enter` dismisses it and immediately continues with
+the current card's primary action, while `Escape` only dismisses it.
+
+### Full-sync conflicts
+
+If sync reports **full sync required**, your cards have not been synchronized.
+Press `d` to download AnkiWeb into this local collection, or `u` to upload this
+local collection to AnkiWeb. A separate confirmation shows the active profile
+and replacement risk; type `DOWNLOAD` or `UPLOAD` exactly and press Enter.
+Nothing is selected by default. Escape cancels without transferring data.
+
+Every confirmed attempt first exports and checks a local `.colpkg` backup in
+`backups/repetui-full-sync-*/` beside the collection. Backup failure blocks the
+transfer. These backups contain collection data, not media, and are retained
+for recovery through Anki Desktop. They do **not** preserve web-only changes:
+before uploading, back up any progress on your other clients separately.
+
+Full sync replaces, rather than merges, one collection. If both sides have
+unsynced progress, preserve and reconcile it before choosing either direction.
+Windows and WSL may use separate collections; check the selected profile.
+Use arrow keys to scroll instructions in small panes. After a failed attempt,
+Esc/Enter returns to study; press `s` to retry and make a fresh choice.
 
 ## Card rendering
 
@@ -60,6 +104,17 @@ their rendered content into terminal-native text while preserving ordered text,
 headings, ruby readings, lists, tables, code, math labels, and media references
 where possible. Unknown markup falls back to its visible text rather than being
 silently discarded.
+
+If a script-heavy template cannot be separated safely, `repetui` derives a
+field-based terminal layout and opens a one-time setup. Assign fields to Prompt,
+Answer, Auto, or Ignore with `Space`, reorder them with `J` / `K`, and save with
+`Enter`. Auto fields appear only when that field's content is present on the
+rendered card, so optional fields can start being used later without another
+setup. The mapping is remembered per note type and card template and can be
+edited under `?` → `Sections` → `card fields`. This adapts complex card types
+without executing their JavaScript or adding template-specific code. The same
+editor is available for any active card with usable source fields, so an
+unrecognized template can still be configured manually.
 
 ## Sections that fit your pane
 
@@ -76,8 +131,8 @@ Choices are remembered per note type and card template, so long explanations
 and mnemonics can stay one keypress away without taking over every card.
 
 Template JavaScript, typed-answer grading, CSS layout, and media playback are
-not currently executed. Card creation, editing, and statistics are also outside
-the current scope.
+not executed. Card creation, editing, and statistics are also outside the
+current scope.
 
 ### Acknowledgements
 

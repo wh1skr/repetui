@@ -1,8 +1,10 @@
 """Lossless terminal-native presentation of rendered Anki cards.
 
 The module is deliberately pure: callers provide rendered card content and receive
-immutable sections. Note fields are identification hints only; displayed text always
-comes from the rendered side, so a hidden field can never leak onto the question.
+immutable sections. Ordinary cards display their rendered sides. When dynamic markup
+cannot be separated confidently, an inferred profile may use only source fields whose
+content is demonstrably present on that rendered side; users can then confirm or replace
+the field mapping explicitly.
 """
 
 from __future__ import annotations
@@ -44,10 +46,19 @@ class CardTemplateIdentity:
 
 @dataclass(frozen=True)
 class SourceField:
-    """A note field used only to identify a rendered section."""
+    """A note field available for section identification or profile display."""
 
     name: str
     html: str
+
+
+@dataclass(frozen=True)
+class TemplateFieldProfile:
+    """Ordered source fields used for a terminal-native card presentation."""
+
+    prompt_fields: tuple[str, ...]
+    answer_fields: tuple[str, ...]
+    ignored_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +124,7 @@ class CardPresentation:
     identity: CardTemplateIdentity
     front: CardSide
     back: CardSide
+    suggested_profile: TemplateFieldProfile | None = None
 
 
 @dataclass
@@ -194,8 +206,10 @@ class _RenderedHTMLParser(HTMLParser):
     @staticmethod
     def _is_hidden(attributes: dict[str, str | None]) -> bool:
         style = (attributes.get("style") or "").casefold().replace(" ", "")
+        classes = set((attributes.get("class") or "").casefold().split())
         return (
             "hidden" in attributes
+            or "hidden" in classes
             or attributes.get("aria-hidden", "").lower() == "true"
             or "display:none" in style
             or "visibility:hidden" in style
@@ -318,6 +332,7 @@ class _RenderedDocument:
     text: str
     structural_sections: tuple[tuple[str, str, str], ...]
     prelude: str
+    atoms: tuple[str, ...]
 
 
 def _promote_structural_labels(html: str) -> str:
@@ -340,7 +355,17 @@ def _render_document(html: str, av: tuple[AVReference, ...] = ()) -> _RenderedDo
         )
         for section in parser.sections
     )
-    return _RenderedDocument(text, sections, _normalise("".join(parser.prelude), av))
+    atoms = tuple(
+        atom
+        for part in parser.parts
+        if (atom := _normalise(part, av))
+    )
+    return _RenderedDocument(
+        text,
+        sections,
+        _normalise("".join(parser.prelude), av),
+        atoms,
+    )
 
 
 def _normalise(text: str, av: tuple[AVReference, ...] = ()) -> str:
@@ -548,8 +573,183 @@ def _terminal_width(text: str) -> int:
     return cell_len(text)
 
 
-def present_card(raw: RawCardContent) -> CardPresentation:
+def _field_is_present(field: _RenderedDocument, side: _RenderedDocument) -> bool:
+    key = _reconcile_key(field.text)
+    if len(key) <= 2 and key.isascii() and key.isalnum():
+        return any(_reconcile_key(atom) == key for atom in side.atoms)
+    return key in _reconcile_key(side.text)
+
+
+def _shared_word_ratio(front: str, back: str) -> float:
+    front_words = set(re.findall(r"\w+", front.casefold()))
+    if not front_words:
+        return 0.0
+    back_words = set(re.findall(r"\w+", back.casefold()))
+    return len(front_words & back_words) / len(front_words)
+
+
+def _suggest_field_profile(
+    raw: RawCardContent,
+    presentation: CardPresentation,
+) -> TemplateFieldProfile | None:
+    if len(raw.fields) < 3:
+        return None
+    if not all(
+        len(side.sections) == 1 and side.sections[0].id.endswith(":fallback")
+        for side in (presentation.front, presentation.back)
+    ):
+        return None
+    if _ANSWER_RULE.search(raw.back_html) or raw.back_html.startswith(raw.front_html):
+        return None
+    if not re.search(r"<(?:script|details)\b", raw.front_html + raw.back_html, re.IGNORECASE):
+        return None
+
+    front = _render_document(raw.front_html, raw.front_av)
+    back = _render_document(raw.back_html, raw.back_av)
+    if _shared_word_ratio(front.text, back.text) < 0.5:
+        return None
+    unique_fields: list[tuple[SourceField, _RenderedDocument]] = []
+    seen_content: set[str] = set()
+    for field in raw.fields:
+        rendered = _render_document(field.html)
+        content_key = _reconcile_key(rendered.text)
+        if not content_key or content_key in seen_content:
+            continue
+        seen_content.add(content_key)
+        unique_fields.append((field, rendered))
+
+    prompt = next(
+        (
+            (field, rendered)
+            for field, rendered in unique_fields
+            if _field_is_present(rendered, front)
+        ),
+        None,
+    )
+    if prompt is None:
+        return None
+    prompt_key = _reconcile_key(prompt[1].text)
+    answer_fields = tuple(
+        field.name
+        for field, rendered in unique_fields
+        if _reconcile_key(rendered.text) != prompt_key
+        and _field_is_present(rendered, back)
+    )
+    if not answer_fields:
+        return None
+    return TemplateFieldProfile((prompt[0].name,), answer_fields)
+
+
+def _field_side(
+    side: str,
+    names: tuple[str, ...],
+    fields: tuple[SourceField, ...],
+    *,
+    auto_names: frozenset[str] = frozenset(),
+    rendered_side: _RenderedDocument | None = None,
+    excluded_auto_content: frozenset[str] = frozenset(),
+) -> CardSide:
+    available = {field.name: field for field in fields}
+    seen: dict[str, int] = {}
+    seen_auto_content = set(excluded_auto_content)
+    sections: list[PresentationSection] = []
+    for name in names:
+        field = available.get(name)
+        if field is None:
+            continue
+        rendered = _render_document(field.html)
+        text = rendered.text
+        if not text:
+            continue
+        content_key = _reconcile_key(text)
+        if name in auto_names:
+            if rendered_side is None or not _field_is_present(rendered, rendered_side):
+                continue
+            if content_key in seen_auto_content:
+                continue
+        seen_auto_content.add(content_key)
+        sections.append(
+            PresentationSection(
+                _unique_id(f"{side}:field", name, seen),
+                text,
+                source_label=name,
+            )
+        )
+    if sections:
+        return CardSide(tuple(sections))
+    label = "Question" if side == "front" else "Answer"
+    return CardSide((PresentationSection(f"{side}:fallback", "(empty card)", label),))
+
+
+def _present_fields(
+    raw: RawCardContent,
+    profile: TemplateFieldProfile,
+    *,
+    suggested: bool = False,
+) -> CardPresentation:
+    front = _field_side("front", profile.prompt_fields, raw.fields)
+    assigned = set(
+        profile.prompt_fields + profile.answer_fields + profile.ignored_fields
+    )
+    auto_fields = tuple(field.name for field in raw.fields if field.name not in assigned)
+    front_content = frozenset(_reconcile_key(section.text) for section in front.sections)
+    return CardPresentation(
+        raw.identity,
+        front,
+        _field_side(
+            "back",
+            profile.answer_fields + auto_fields,
+            raw.fields,
+            auto_names=frozenset(auto_fields),
+            rendered_side=_render_document(raw.back_html, raw.back_av),
+            excluded_auto_content=front_content,
+        ),
+        profile if suggested else None,
+    )
+
+
+def default_field_profile(
+    raw: RawCardContent,
+    presentation: CardPresentation,
+) -> TemplateFieldProfile | None:
+    """Build a safe starting profile for a user-opened field editor."""
+    available = {field.name for field in raw.fields}
+
+    def source_fields(side: CardSide) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                section.source_label
+                for section in side.sections
+                if section.source_label in available
+            )
+        )
+
+    populated = tuple(
+        field.name for field in raw.fields if _render_document(field.html).text
+    )
+    prompt = source_fields(presentation.front)
+    if not prompt and populated:
+        prompt = (populated[0],)
+    answer = tuple(
+        name for name in source_fields(presentation.back) if name not in prompt
+    )
+    if not answer:
+        answer = tuple(name for name in populated if name not in prompt)[:1]
+    return TemplateFieldProfile(prompt, answer) if prompt and answer else None
+
+
+def present_card(
+    raw: RawCardContent,
+    profile: TemplateFieldProfile | None = None,
+) -> CardPresentation:
     """Convert one rendered Anki card to a complete immutable presentation."""
+    if profile is not None:
+        available = {field.name for field in raw.fields}
+        selected = profile.prompt_fields + profile.answer_fields
+        if profile.prompt_fields and profile.answer_fields and all(
+            name in available for name in selected
+        ):
+            return _present_fields(raw, profile)
     front = _present_side("front", raw.front_html, raw.fields, raw.front_av)
     back_html, used_answer_marker = _strip_answer_html(raw.back_html)
     used_exact_front = False
@@ -559,7 +759,9 @@ def present_card(raw: RawCardContent) -> CardPresentation:
     back = _present_side("back", back_html, raw.fields, raw.back_av)
     if not used_answer_marker and not used_exact_front:
         back = _strip_plain_front(back, front)
-    return CardPresentation(raw.identity, front, back)
+    presentation = CardPresentation(raw.identity, front, back)
+    suggestion = _suggest_field_profile(raw, presentation)
+    return _present_fields(raw, suggestion, suggested=True) if suggestion else presentation
 
 
 def html_to_text(html: str, *, answer: bool = False) -> str:

@@ -170,6 +170,8 @@ def test_review_uses_anki_rendering_and_scheduler() -> None:
     assert card.identity.template_ordinal == 0
     assert card.identity.template_name == "Card 1"
     assert card.queue is ReviewQueue.LEARNING
+    assert card.raw_content.front_html == "<div>front</div>"
+    assert [field.name for field in card.raw_content.fields] == ["Front", "Back"]
 
     service.answer(3)
 

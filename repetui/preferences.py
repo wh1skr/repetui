@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
 from .config import ProfilePaths
 from .controls import ReviewControls
-from .presentation import CardTemplateIdentity
+from .presentation import CardTemplateIdentity, TemplateFieldProfile
 
 
 class SectionMode(str, Enum):
@@ -23,6 +24,44 @@ class SectionMode(str, Enum):
     @property
     def next(self) -> SectionMode:
         order = (SectionMode.SHOW, SectionMode.FOLD, SectionMode.HIDE)
+        return order[(order.index(self) + 1) % len(order)]
+
+
+class AnswerLayout(str, Enum):
+    """How short labelled answers share the compact review surface."""
+
+    COMPACT = "compact"
+    STACKED = "stacked"
+
+    @property
+    def next(self) -> AnswerLayout:
+        return (
+            AnswerLayout.STACKED
+            if self is AnswerLayout.COMPACT
+            else AnswerLayout.COMPACT
+        )
+
+
+class ActionFeedbackDuration(str, Enum):
+    """How long successful review-operation feedback stays on screen."""
+
+    INSTANT = "instant"
+    BRIEF = "brief"
+    NORMAL = "normal"
+    RELAXED = "relaxed"
+
+    @property
+    def seconds(self) -> float:
+        return {
+            ActionFeedbackDuration.INSTANT: 0.0,
+            ActionFeedbackDuration.BRIEF: 0.4,
+            ActionFeedbackDuration.NORMAL: 1.0,
+            ActionFeedbackDuration.RELAXED: 2.0,
+        }[self]
+
+    @property
+    def next(self) -> ActionFeedbackDuration:
+        order = tuple(ActionFeedbackDuration)
         return order[(order.index(self) + 1) % len(order)]
 
 
@@ -41,6 +80,32 @@ class Preferences(Protocol):
         self, profile: ProfilePaths, controls: ReviewControls
     ) -> None: ...
 
+    def action_feedback_duration(
+        self, profile: ProfilePaths
+    ) -> ActionFeedbackDuration: ...
+
+    def set_action_feedback_duration(
+        self, profile: ProfilePaths, duration: ActionFeedbackDuration
+    ) -> None: ...
+
+    def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool: ...
+
+    def set_add_on_enabled(
+        self, profile: ProfilePaths, add_on_id: str, *, enabled: bool
+    ) -> None: ...
+
+    def add_on_settings(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, str | int | bool]: ...
+
+    def set_add_on_setting(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        setting_id: str,
+        value: str | int | bool,
+    ) -> None: ...
+
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode: ...
 
     def set_mode(
@@ -48,6 +113,24 @@ class Preferences(Protocol):
         identity: CardTemplateIdentity,
         section_id: str,
         mode: SectionMode,
+    ) -> None: ...
+
+    def answer_layout(self, identity: CardTemplateIdentity) -> AnswerLayout: ...
+
+    def set_answer_layout(
+        self,
+        identity: CardTemplateIdentity,
+        layout: AnswerLayout,
+    ) -> None: ...
+
+    def field_profile(
+        self, identity: CardTemplateIdentity
+    ) -> TemplateFieldProfile | None: ...
+
+    def set_field_profile(
+        self,
+        identity: CardTemplateIdentity,
+        profile: TemplateFieldProfile,
     ) -> None: ...
 
 
@@ -143,6 +226,119 @@ class JsonPreferences:
         self._write_document(self._templates, profiles)
         self._profiles = profiles
 
+    def action_feedback_duration(
+        self, profile: ProfilePaths
+    ) -> ActionFeedbackDuration:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        try:
+            return ActionFeedbackDuration(
+                saved_profile.get(
+                    "action_feedback_duration",
+                    ActionFeedbackDuration.NORMAL.value,
+                )
+            )
+        except (TypeError, ValueError):
+            return ActionFeedbackDuration.NORMAL
+
+    def set_action_feedback_duration(
+        self, profile: ProfilePaths, duration: ActionFeedbackDuration
+    ) -> None:
+        profiles = {key: dict(value) for key, value in self._profiles.items()}
+        profile_key = self._profile_key(profile)
+        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
+        if duration is ActionFeedbackDuration.NORMAL:
+            saved_profile.pop("action_feedback_duration", None)
+        else:
+            saved_profile["action_feedback_duration"] = duration.value
+        self._write_document(self._templates, profiles)
+        self._profiles = profiles
+
+    def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool:
+        return self._add_on_state(profile, add_on_id).get("enabled") is True
+
+    def set_add_on_enabled(
+        self, profile: ProfilePaths, add_on_id: str, *, enabled: bool
+    ) -> None:
+        def update(state: dict[str, object]) -> None:
+            if enabled:
+                state["enabled"] = True
+            else:
+                state.pop("enabled", None)
+
+        self._update_add_on_state(profile, add_on_id, update)
+
+    def _add_on_state(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, object]:
+        saved_profile = self._profiles.get(self._profile_key(profile), {})
+        add_ons = saved_profile.get("add_ons", {})
+        if not isinstance(add_ons, dict):
+            return {}
+        state = add_ons.get(add_on_id, {})
+        return state if isinstance(state, dict) else {}
+
+    def _update_add_on_state(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        update: Callable[[dict[str, object]], None],
+    ) -> None:
+        profiles = {key: dict(value) for key, value in self._profiles.items()}
+        profile_key = self._profile_key(profile)
+        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
+        add_ons = dict(
+            saved_profile.get("add_ons", {})
+            if isinstance(saved_profile.get("add_ons"), dict)
+            else {}
+        )
+        state = dict(
+            add_ons.get(add_on_id, {})
+            if isinstance(add_ons.get(add_on_id), dict)
+            else {}
+        )
+        update(state)
+        if state:
+            add_ons[add_on_id] = state
+        else:
+            add_ons.pop(add_on_id, None)
+        if add_ons:
+            saved_profile["add_ons"] = add_ons
+        else:
+            saved_profile.pop("add_ons", None)
+        self._write_document(self._templates, profiles)
+        self._profiles = profiles
+
+    def add_on_settings(
+        self, profile: ProfilePaths, add_on_id: str
+    ) -> dict[str, str | int | bool]:
+        state = self._add_on_state(profile, add_on_id)
+        settings = state.get("settings", {})
+        if not isinstance(settings, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in settings.items()
+            if isinstance(value, (str, int, bool))
+        }
+
+    def set_add_on_setting(
+        self,
+        profile: ProfilePaths,
+        add_on_id: str,
+        setting_id: str,
+        value: str | int | bool,
+    ) -> None:
+        def update(state: dict[str, object]) -> None:
+            settings = dict(
+                state.get("settings", {})
+                if isinstance(state.get("settings"), dict)
+                else {}
+            )
+            settings[setting_id] = value
+            state["settings"] = settings
+
+        self._update_add_on_state(profile, add_on_id, update)
+
     def mode(self, identity: CardTemplateIdentity, section_id: str) -> SectionMode:
         template = self._templates.get(self._template_key(identity), {})
         sections = template.get("sections", {})
@@ -177,6 +373,93 @@ class JsonPreferences:
         else:
             sections[section_id] = mode.value
         self._save()
+
+    def answer_layout(self, identity: CardTemplateIdentity) -> AnswerLayout:
+        template = self._templates.get(self._template_key(identity), {})
+        try:
+            return AnswerLayout(
+                template.get("answer_layout", AnswerLayout.STACKED.value)
+            )
+        except (TypeError, ValueError):
+            return AnswerLayout.STACKED
+
+    def set_answer_layout(
+        self,
+        identity: CardTemplateIdentity,
+        layout: AnswerLayout,
+    ) -> None:
+        key = self._template_key(identity)
+        template = self._templates.setdefault(
+            key,
+            {
+                "note_type_name": identity.note_type_name,
+                "template_name": identity.template_name,
+                "sections": {},
+            },
+        )
+        if layout is AnswerLayout.STACKED:
+            template.pop("answer_layout", None)
+        else:
+            template["answer_layout"] = layout.value
+        self._save()
+
+    def field_profile(
+        self, identity: CardTemplateIdentity
+    ) -> TemplateFieldProfile | None:
+        template = self._templates.get(self._template_key(identity), {})
+        saved = template.get("field_profile")
+        if not isinstance(saved, dict):
+            return None
+        prompt = saved.get("prompt_fields")
+        answer = saved.get("answer_fields")
+        ignored = saved.get("ignored_fields", [])
+        if not all(
+            isinstance(names, list)
+            and all(isinstance(name, str) and name for name in names)
+            for names in (prompt, answer, ignored)
+        ):
+            return None
+        assert isinstance(prompt, list) and isinstance(answer, list) and isinstance(ignored, list)
+        if not prompt or not answer:
+            return None
+        selected = prompt + answer + ignored
+        if len(selected) != len(set(selected)):
+            return None
+        return TemplateFieldProfile(tuple(prompt), tuple(answer), tuple(ignored))
+
+    def set_field_profile(
+        self,
+        identity: CardTemplateIdentity,
+        profile: TemplateFieldProfile,
+    ) -> None:
+        selected = (
+            profile.prompt_fields + profile.answer_fields + profile.ignored_fields
+        )
+        if (
+            not profile.prompt_fields
+            or not profile.answer_fields
+            or any(not name for name in selected)
+            or len(selected) != len(set(selected))
+        ):
+            raise ValueError("A field profile requires unique prompt and answer fields.")
+        templates = {key: dict(value) for key, value in self._templates.items()}
+        key = self._template_key(identity)
+        template = templates.setdefault(
+            key,
+            {
+                "note_type_name": identity.note_type_name,
+                "template_name": identity.template_name,
+                "sections": {},
+            },
+        )
+        template["field_profile"] = {
+            "prompt_fields": list(profile.prompt_fields),
+            "answer_fields": list(profile.answer_fields),
+        }
+        if profile.ignored_fields:
+            template["field_profile"]["ignored_fields"] = list(profile.ignored_fields)
+        self._write_document(templates, self._profiles)
+        self._templates = templates
 
     def _save(self) -> None:
         self._write_document(self._templates, self._profiles)

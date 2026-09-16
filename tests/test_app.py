@@ -4,9 +4,22 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from textual.widgets import Input
+from textual.widgets import Input, ListItem, Static
 
+import repetui.app as app_module
+from repetui.addons import (
+    AddOnDefinition,
+    AddOnEvent,
+    AddOnEventType,
+    ChoiceSetting,
+    NumberSetting,
+    PresentationCue,
+    PresentationCueType,
+    ToggleSetting,
+)
 from repetui.app import (
+    CompletionCelebrationScreen,
+    DeckItem,
     DeckScreen,
     ErrorScreen,
     FlagSelectionPill,
@@ -14,21 +27,31 @@ from repetui.app import (
     RepetuiApp,
     ReviewScreen,
     SettingsScreen,
+    StartupRecoveryScreen,
     SyncPopup,
+    TemplateFieldSetupScreen,
+    TemplateFieldsSettingItem,
     compose_deck_row,
 )
-from repetui.backend import BackendError, Deck, DueCounts, ReviewCard
+from repetui.backend import BackendError, CollectionInUseError, Deck, DueCounts, ReviewCard
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
-from repetui.preferences import JsonPreferences, SectionMode
+from repetui.preferences import (
+    ActionFeedbackDuration,
+    AnswerLayout,
+    JsonPreferences,
+    SectionMode,
+)
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
     SourceField,
+    TemplateFieldProfile,
     present_card,
 )
-from repetui.sync import SyncOutcome, SyncStatus
+from repetui.recovery import CollectionOwner
+from repetui.sync import FullSyncDirection, SyncOutcome, SyncStatus
 
 
 class FakeBackend:
@@ -81,7 +104,7 @@ class FakeBackend:
                 identity = CardTemplateIdentity(1, "Basic", 0, "Card 1")
                 content = RawCardContent(identity, "question", "answer")
             presentation = present_card(content)
-            return ReviewCard(42, presentation)
+            return ReviewCard(42, presentation, raw_content=content)
         return None
 
     def answer(self, rating: int) -> None:
@@ -122,6 +145,7 @@ def make_app(
     decks: list[Deck] | None = None,
     counts: DueCounts | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
+    add_ons: tuple[AddOnDefinition, ...] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
     backend = FakeBackend(card_content, decks, counts)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
@@ -129,9 +153,9 @@ def make_app(
         (tmp_path or Path("/tmp")) / "preferences.json"
     )
     app = (
-        RepetuiApp(backend, profile, store)
+        RepetuiApp(backend, profile, store, add_ons=add_ons)
         if syncer is None
-        else RepetuiApp(backend, profile, store, syncer)
+        else RepetuiApp(backend, profile, store, syncer, add_ons=add_ons)
     )
     return app, backend
 
@@ -155,6 +179,10 @@ class TwoCardBackend(FakeBackend):
             f"answer {self.card_ids[0]}",
         )
         return ReviewCard(self.card_ids[0], present_card(content))
+
+    def answer(self, rating: int) -> None:
+        self.rating = rating
+        self.card_ids.pop(0)
 
     def bury_current(self) -> None:
         self.operations.append("bury")
@@ -184,6 +212,563 @@ def japanese_card() -> RawCardContent:
         <h2>Examples</h2><p>葬式 — funeral</p>
         """,
     )
+
+
+def dynamic_card() -> RawCardContent:
+    return RawCardContent(
+        CardTemplateIdentity(900, "Dynamic", 0, "Card 1"),
+        """
+        <div class="hidden">internal-id</div>
+        <div>template controls</div>
+        <div>actual question</div>
+        <script>prepareCard()</script>
+        """,
+        """
+        <div class="hidden">internal-id</div>
+        <div>template controls</div>
+        <div>actual question</div><div>actual answer</div>
+        <script>prepareAnswer()</script>
+        """,
+        (
+            SourceField("Identifier", "internal-id"),
+            SourceField("Question", "actual question"),
+            SourceField("Answer", "actual answer"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_uses_the_saved_field_profile_for_a_dynamic_template(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    preferences.set_field_profile(
+        content.identity,
+        TemplateFieldProfile(("Question",), ("Answer",)),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "actual question" in rendered_text(review)
+        assert "internal-id" not in rendered_text(review)
+
+        await pilot.press("enter")
+
+        assert "actual answer" in rendered_text(review)
+        assert "template controls" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_field_profile_answer_sections_keep_saved_fold_behavior(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    preferences.set_field_profile(
+        content.identity,
+        TemplateFieldProfile(("Question",), ("Answer",)),
+    )
+    preferences.set_mode(content.identity, "back:field:answer", SectionMode.FOLD)
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "› Answer" in rendered_text(review)
+        assert "actual answer" not in rendered_text(review)
+
+        await pilot.press("space")
+
+        assert "▾ Answer\nactual answer" in rendered_text(review)
+        assert preferences.mode(
+            content.identity, "back:field:answer"
+        ) is SectionMode.FOLD
+
+
+@pytest.mark.asyncio
+async def test_dynamic_template_offers_one_time_field_setup_at_40x6(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        assert setup.size == (40, 6)
+        rows = list(setup.query_one("#field-profile-fields").children)
+        assert [str(row.query_one(".field-name").render()) for row in rows] == [
+            "Question",
+            "Answer",
+            "Identifier",
+        ]
+        assert [str(row.query_one(".field-role").render()) for row in rows] == [
+            "prompt",
+            "answer",
+            "auto",
+        ]
+
+        await pilot.press("enter")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "actual question" in rendered_text(review)
+        assert "internal-id" not in rendered_text(review)
+        assert preferences.field_profile(content.identity) == TemplateFieldProfile(
+            ("Question",),
+            ("Answer",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_sections_settings_reopens_a_saved_field_profile(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    saved = TemplateFieldProfile(("Question",), ("Answer",))
+    preferences.set_field_profile(content.identity, saved)
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        assert len(app.screen.query(TemplateFieldsSettingItem)) == 1
+
+        await pilot.press("G", "space")
+        await pilot.pause()
+
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        assert isinstance(app.screen_stack[-2], ReviewScreen)
+        rows = list(setup.query_one("#field-profile-fields").children)
+        assert [str(row.query_one(".field-name").render()) for row in rows] == [
+            "Question",
+            "Answer",
+            "Identifier",
+        ]
+        assert [str(row.query_one(".field-role").render()) for row in rows] == [
+            "prompt",
+            "answer",
+            "auto",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_sections_settings_can_adapt_a_regular_fielded_template(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = RawCardContent(
+        CardTemplateIdentity(901, "Basic fields", 0, "Card 1"),
+        "ordinary question",
+        "<hr id=answer>ordinary answer",
+        (
+            SourceField("Front", "ordinary question"),
+            SourceField("Back", "ordinary answer"),
+            SourceField("Optional", ""),
+        ),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        assert len(app.screen.query(TemplateFieldsSettingItem)) == 1
+
+        await pilot.press("G", "space")
+        await pilot.pause()
+
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        rows = list(setup.query_one("#field-profile-fields").children)
+        assert [str(row.query_one(".field-name").render()) for row in rows] == [
+            "Front",
+            "Back",
+            "Optional",
+        ]
+        assert [str(row.query_one(".field-role").render()) for row in rows] == [
+            "prompt",
+            "answer",
+            "auto",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_reopened_field_setup_preserves_the_saved_field_order(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    base = dynamic_card()
+    content = RawCardContent(
+        base.identity,
+        base.front_html,
+        base.back_html + "<div>supporting details</div>",
+        base.fields + (SourceField("Details", "supporting details"),),
+    )
+    preferences.set_field_profile(
+        content.identity,
+        TemplateFieldProfile(("Question",), ("Details", "Answer")),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "G", "space")
+        await pilot.pause()
+
+        rows = list(app.screen.query_one("#field-profile-fields").children)
+        assert [str(row.query_one(".field-name").render()) for row in rows] == [
+            "Question",
+            "Details",
+            "Answer",
+            "Identifier",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_field_setup_reorders_answer_fields_before_saving(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    base = dynamic_card()
+    content = RawCardContent(
+        base.identity,
+        base.front_html,
+        base.back_html.replace(
+            "<script>prepareAnswer()",
+            "<div>supporting details</div><script>prepareAnswer()",
+        ),
+        base.fields + (SourceField("Details", "supporting details"),),
+    )
+    preferences.set_field_profile(
+        content.identity,
+        TemplateFieldProfile(("Question",), ("Answer", "Details")),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "G", "space")
+        await pilot.pause()
+        assert isinstance(app.screen, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "K", "enter")
+
+        assert preferences.field_profile(content.identity) == TemplateFieldProfile(
+            ("Question",),
+            ("Details", "Answer"),
+        )
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        await pilot.press("enter")
+        flow = rendered_text(review)
+        assert flow.index("supporting details") < flow.index("actual answer")
+
+
+@pytest.mark.asyncio
+async def test_failed_field_profile_save_stays_recoverable(tmp_path, monkeypatch) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, TemplateFieldSetupScreen)
+
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+        await pilot.press("enter")
+
+        assert isinstance(app.screen, TemplateFieldSetupScreen)
+        assert str(app.screen.query_one("#field-profile-footer").render()) == (
+            "[err] field profile not saved"
+        )
+        assert preferences.field_profile(content.identity) is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_field_setup_keeps_safe_inference_without_reprompting(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, TemplateFieldSetupScreen)
+
+        await pilot.press("escape")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "actual question" in rendered_text(review)
+        assert "internal-id" not in rendered_text(review)
+        assert "template controls" not in rendered_text(review)
+
+        review.load_next()
+        await pilot.pause()
+        assert app.screen is review
+        assert preferences.field_profile(content.identity) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_key", ("q", "u", "1", "s", "escape"))
+async def test_enabled_completion_celebration_takes_over_full_pane_and_consumes_skip(
+    tmp_path, skip_key
+) -> None:
+    app, backend = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        assert celebration.query_one("#completion-art").region == (0, 0, 40, 6)
+        rendered = str(celebration.query_one("#completion-art").render())
+        assert "deck complete" in rendered
+        assert "Japanese" in rendered
+        assert isinstance(app.screen_stack[-2], DeckScreen)
+        assert not any(isinstance(screen, ReviewScreen) for screen in app.screen_stack)
+        assert backend.rating == 3
+
+        await pilot.press(skip_key)
+
+        assert isinstance(app.screen, DeckScreen)
+        assert backend.rating == 3
+        assert backend.undo_calls == 0
+        assert app.syncing is False
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_waits_for_the_final_due_card(tmp_path) -> None:
+    backend = TwoCardBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None and review.card.id == 43
+
+        await pilot.press("enter", "3")
+
+        assert isinstance(app.screen, CompletionCelebrationScreen)
+        assert review not in app.screen_stack
+        assert isinstance(app.screen_stack[-2], DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_adapts_to_narrow_resize_and_stays_skippable(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+    app.add_ons.set_setting("completion-celebration", "duration", "long")
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        assert isinstance(app.screen_stack[-2], DeckScreen)
+
+        await pilot.resize_terminal(8, 4)
+        rendered = str(celebration.query_one("#completion-art").render())
+        assert "complete" in rendered
+
+        await pilot.press("escape")
+        assert isinstance(app.screen, DeckScreen)
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_duration_returns_to_decks(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+    app.add_ons.set_setting("completion-celebration", "duration", "short")
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        assert isinstance(app.screen_stack[-2], DeckScreen)
+
+        await pilot.pause(0.9)
+        assert isinstance(app.screen, DeckScreen)
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_refreshes_counts_before_showing_decks(
+    tmp_path,
+) -> None:
+    class CountsChangeAfterAnswerBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__(
+                decks=[Deck(1, "Japanese", 0, DueCounts(0, 0, 1))],
+                counts=DueCounts(0, 0, 1),
+            )
+
+        def answer(self, rating: int) -> None:
+            super().answer(rating)
+            self._decks = [Deck(1, "Japanese", 0, DueCounts(0, 0, 0))]
+
+    backend = CountsChangeAfterAnswerBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        assert "0/0/1" in str(decks.query_one(".deck-row").render())
+
+        await pilot.press("enter", "enter", "3", "escape")
+
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_cleans_timers_on_application_shutdown(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        app.exit()
+        await pilot.pause()
+
+    assert celebration._frame_timer is None
+    assert celebration._finish_timer is None
+    assert app.backend.is_open is False
+
+
+@pytest.mark.asyncio
+async def test_completion_celebration_is_discarded_if_another_screen_takes_over(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        celebration = app.screen
+        assert isinstance(celebration, CompletionCelebrationScreen)
+        decks = app.screen_stack[-2]
+        assert isinstance(decks, DeckScreen)
+
+        app.push_screen(SettingsScreen())
+        await pilot.pause()
+        assert celebration._frame_timer is None
+        assert celebration._finish_timer is None
+
+        app.pop_screen()
+        await pilot.pause()
+        assert app.screen is decks
+
+
+@pytest.mark.asyncio
+async def test_disabled_completion_celebration_reaches_done_without_takeover(
+    tmp_path,
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", (False, True))
+async def test_completion_add_on_without_a_cue_keeps_done_screen(
+    tmp_path, fails
+) -> None:
+    def handle(_event, _settings):
+        if fails:
+            raise RuntimeError("private completion detail")
+        return None
+
+    definition = AddOnDefinition(
+        id="quiet-completion",
+        name="Quiet Completion",
+        description="Observe completion without presenting a cue.",
+        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
+        settings=(),
+        handle=handle,
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+async def test_completion_duration_uses_the_shared_add_ons_settings_surface(
+    tmp_path,
+) -> None:
+    app, _ = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("?", "h", "enter")
+
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        detail = settings.query_one("#settings-add-on-detail")
+        assert [
+            (
+                str(item.query_one(".add-on-setting-label").render()),
+                str(item.query_one(".add-on-setting-value").render()),
+            )
+            for item in detail.children
+        ] == [("enabled", "off"), ("Duration", "medium")]
+
+
+@pytest.mark.asyncio
+async def test_already_empty_and_reopened_review_never_celebrate(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+    backend.card_available = False
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+
+        await pilot.press("escape", "enter")
+        reopened = app.screen
+        assert isinstance(reopened, ReviewScreen)
+        assert reopened.card is None
+        assert backend.rating is None
 
 
 def real_kanji_card() -> RawCardContent:
@@ -241,7 +826,7 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, DeckScreen)
-        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.3"
+        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6b"
         assert screen.query_one("#deck-header").region.y == 0
         assert len(screen.query("#logo")) == 0
         assert len(screen.query(".quiet-footer")) == 0
@@ -437,6 +1022,54 @@ async def test_sync_reload_keeps_expansion_and_selected_deck(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_refresh_frames_never_expose_internal_deck_item_text(tmp_path) -> None:
+    app, _ = make_app(
+        tmp_path,
+        decks=[Deck(1, "Japanese::WK", 0, DueCounts(0, 0, 117))],
+        syncer=lambda _profile: SyncOutcome(SyncStatus.UP_TO_DATE),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        for _ in range(80):
+            assert "DeckItem.-highlight" not in app.export_screenshot()
+            await pilot.pause(0.02)
+
+        assert isinstance(app.screen, DeckScreen)
+        assert "0/0/117" in str(app.screen.query_one(".deck-row").render())
+
+
+def test_pending_selected_deck_item_never_renders_its_internal_identifier() -> None:
+    row = VisibleDeckRow(
+        Deck(1, "Japanese::WK", 0, DueCounts(0, 0, 117)),
+        is_parent=False,
+        expanded=False,
+    )
+    item = DeckItem(row)
+    item.add_class("-highlight")
+
+    rendered = item.render()
+    pending_content = getattr(rendered, "plain", str(rendered))
+
+    assert "DeckItem" not in pending_content
+    assert "-highlight" not in pending_content
+
+
+def test_all_repetui_list_rows_override_textual_identifier_fallback() -> None:
+    row_types = {
+        value
+        for value in vars(app_module).values()
+        if isinstance(value, type)
+        and value.__module__ == app_module.__name__
+        and value is not ListItem
+        and issubclass(value, ListItem)
+    }
+
+    assert row_types
+    assert all(row_type.render is not ListItem.render for row_type in row_types)
+
+
+@pytest.mark.asyncio
 async def test_complete_keyboard_review_loop(tmp_path) -> None:
     app, backend = make_app(tmp_path)
 
@@ -460,6 +1093,81 @@ async def test_complete_keyboard_review_loop(tmp_path) -> None:
         assert backend.rating == 3
         assert "Nothing due" in str(review.query_one("#card").render())
         assert str(review.query_one("#card").render()).startswith("done · Japanese")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "rating", "label"),
+    (
+        ("1", 1, "again"),
+        ("2", 2, "hard"),
+        ("3", 3, "good"),
+        ("4", 4, "easy"),
+        ("enter", 3, "good"),
+    ),
+)
+async def test_successful_rating_is_confirmed_on_the_completed_deck(
+    tmp_path, key, rating, label
+) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", key)
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+
+        actions = review.query_one("#review-actions")
+        assert backend.rating == rating
+        assert review.card is None
+        assert actions.display is True
+        assert str(actions.render()) == f"rated · {rating} {label}"
+
+
+@pytest.mark.asyncio
+async def test_rebound_rating_confirms_the_action_instead_of_the_pressed_key(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    controls = ReviewControls.defaults().with_binding(ReviewAction.EASY, "e")
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    preferences.set_review_controls(profile, controls)
+    app, backend = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "e")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+
+        assert backend.rating == 4
+        assert str(review.query_one("#review-actions").render()) == "rated · 4 easy"
+
+
+@pytest.mark.asyncio
+async def test_newest_rating_feedback_survives_rapid_review_and_then_clears(
+    tmp_path,
+) -> None:
+    backend = TwoCardBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "1")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        actions = review.query_one("#review-actions")
+        assert review.card is not None and review.card.id == 43
+        assert str(actions.render()) == "rated · 1 again"
+
+        await pilot.press("enter", "4")
+        assert review.card is None
+        assert str(actions.render()) == "rated · 4 easy"
+
+        await pilot.pause(1.05)
+        assert actions.display is False
 
 
 @pytest.mark.asyncio
@@ -596,6 +1304,110 @@ async def test_operation_status_dismisses_after_roughly_one_second(tmp_path) -> 
         assert app.screen is popup
         await pilot.pause(0.3)
         assert app.screen is review
+
+
+@pytest.mark.asyncio
+async def test_saved_brief_feedback_duration_controls_success_timeout_at_40x6(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.BRIEF
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "b")
+        popup = app.screen
+        assert isinstance(popup, OperationStatusPill)
+        assert popup.size == (40, 6)
+
+        await pilot.pause(0.25)
+        assert app.screen is popup
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, ReviewScreen)
+
+
+@pytest.mark.asyncio
+async def test_instant_feedback_duration_auto_dismisses_success_at_40x6(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.INSTANT
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "b")
+        await pilot.pause()
+
+        assert isinstance(app.screen, ReviewScreen)
+        assert backend.operations == ["bury"]
+
+
+@pytest.mark.asyncio
+async def test_undo_enter_continues_once_without_reapplying_or_rating(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        assert isinstance(app.screen, OperationStatusPill)
+
+        await pilot.press("enter", "enter")
+        await pilot.pause(0.2)
+
+        assert app.screen is review
+        assert backend.undo_calls == 1
+        assert backend.rating == 3
+        assert review.card is not None
+        assert review.revealed is True
+
+
+@pytest.mark.asyncio
+async def test_escape_dismisses_success_feedback_without_forwarding_primary(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+
+        await pilot.press("escape")
+
+        assert app.screen is review
+        assert backend.undo_calls == 1
+        assert review.card is not None
+        assert review.revealed is False
+
+
+@pytest.mark.asyncio
+async def test_instant_success_preference_does_not_hide_or_forward_error_feedback(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+    preferences.set_action_feedback_duration(
+        app.profile, ActionFeedbackDuration.INSTANT
+    )
+    backend.undo_available = False
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "u")
+        review = app.screen_stack[-2]
+        assert isinstance(review, ReviewScreen)
+        assert isinstance(app.screen, OperationStatusPill)
+
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, OperationStatusPill)
+        await pilot.press("enter")
+
+        assert app.screen is review
+        assert review.card is not None
+        assert review.revealed is False
+        assert backend.undo_calls == 1
 
 
 @pytest.mark.asyncio
@@ -759,10 +1571,12 @@ async def test_real_kanji_card_flows_and_scrolls_at_40_by_6(tmp_path) -> None:
 
         await pilot.press("enter")
         flow = rendered_text(review)
-        assert flow.splitlines()[1].startswith(
-            "Meaning: Stylish  ·  On'yomi: すい  ·  Kun'yomi: いき"
-        )
-        assert "Radicals: 米, 九, 十 (rice, nine, cross)" in flow
+        assert flow.splitlines()[1:5] == [
+            "Stylish  · Meaning",
+            "すい  · On'yomi",
+            "いき  · Kun'yomi",
+            "米, 九, 十 (rice, nine, cross)  · Radicals",
+        ]
         assert "Meaning Mnemonic · A stylish rice ceremony" in flow
         assert flow.count("makes the unusual shape memorable.") == 6
         assert "Reading Mnemonic · すい sounds like a stylish suit." in flow
@@ -973,8 +1787,8 @@ async def test_back_sections_show_fold_hide_and_expand_temporarily(tmp_path) -> 
 
         flow = rendered_text(review)
         first_row = rendered_card_row(review, 0)
-        assert "Reading · そう" in flow
-        assert "Meaning · burial; interment" in flow
+        assert "そう  · Reading" in flow
+        assert "burial; interment  · Meaning" in flow
         assert "› Mnemonic" in flow
         assert "Flowers laid upon a grave." not in flow
         assert "Examples" not in flow
@@ -1008,7 +1822,7 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
         assert settings.size.height == 6
         assert str(settings.query_one("#settings-header").render()) == "settings"
 
-        await pilot.press("space")
+        await pilot.press("j", "space")
         assert preferences.mode(
             content.identity, "back:heading:reading"
         ) is SectionMode.FOLD
@@ -1028,6 +1842,44 @@ async def test_settings_replace_tiny_screen_and_edit_the_current_template(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_sections_settings_toggle_answer_layout_for_the_current_template(
+    tmp_path,
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = japanese_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        layout_row = settings.query_one("#settings-sections").children[0]
+        assert str(layout_row.query_one(".setting-label").render()) == "answer layout"
+        assert str(layout_row.query_one(".setting-mode").render()) == "stacked"
+
+        await pilot.press("space")
+        assert preferences.answer_layout(content.identity) is AnswerLayout.COMPACT
+        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
+
+        await pilot.press("escape", "enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "Reading · そう" in rendered_text(review)
+
+        await pilot.press("?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        layout_row = settings.query_one("#settings-sections").children[0]
+        assert str(layout_row.query_one(".setting-mode").render()) == "compact"
+
+        await pilot.press("space", "escape")
+        assert preferences.answer_layout(content.identity) is AnswerLayout.STACKED
+        flow = rendered_text(review)
+        assert "そう  · Reading\nburial; interment  · Meaning" in flow
+        assert "Meaning · burial; interment" not in flow
+
+
+@pytest.mark.asyncio
 async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_path) -> None:
     app, _ = make_app(tmp_path)
 
@@ -1040,7 +1892,7 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
         assert controls.display is True
         assert controls.region == (0, 2, 40, 3)
         rows = list(controls.children)
-        assert len(rows) == 10
+        assert len(rows) == 11
         rendered_rows = [
             (
                 str(row.query_one(".control-label").render()),
@@ -1059,8 +1911,199 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
             ("Suspend", "x"),
             ("Flag", "f"),
             ("Sync", "s"),
+            ("Action feedback duration", "Normal"),
         ]
         assert settings.query_one("#settings-footer").region == (0, 5, 40, 1)
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "j/k · enter/space · bs default · esc"
+        )
+
+
+@pytest.mark.asyncio
+async def test_action_feedback_duration_cycles_in_settings_and_recovers_from_write_failure(
+    tmp_path, monkeypatch
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?", "h", "G")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        row = settings.query_one("#settings-controls").children[-1]
+        assert str(row.query_one(".control-label").render()) == (
+            "Action feedback duration"
+        )
+        assert str(row.query_one(".control-binding").render()) == "Normal"
+
+        await pilot.press("space")
+        assert (
+            preferences.action_feedback_duration(app.profile)
+            is ActionFeedbackDuration.RELAXED
+        )
+        assert str(row.query_one(".control-binding").render()) == "Relaxed"
+
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+        await pilot.press("space")
+
+        assert app.screen is settings
+        assert (
+            preferences.action_feedback_duration(app.profile)
+            is ActionFeedbackDuration.RELAXED
+        )
+        assert str(settings.query_one("#settings-footer").render()) == (
+            "[err] feedback duration not saved"
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_ons_tab_enables_and_configures_registered_add_on_at_40x6(
+    tmp_path,
+) -> None:
+    definition = AddOnDefinition(
+        id="completion-celebration",
+        name="Completion Celebration",
+        description="Celebrate the final due card.",
+        events=frozenset({AddOnEventType.RATING_ACCEPTED}),
+        settings=(
+            ToggleSetting("sparkles", "Sparkles"),
+            ChoiceSetting("duration", "Duration", ("short", "long"), "short"),
+            NumberSetting("density", "Density", 1, 3, 1, 1),
+        ),
+        handle=lambda _event, _settings: None,
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences, add_ons=(definition,))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("?", "h")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        registry = settings.query_one("#settings-add-ons")
+        assert registry.region == (0, 2, 40, 3)
+        row = registry.children[0]
+        assert str(row.query_one(".add-on-label").render()) == "Completion Celebration"
+        assert str(row.query_one(".add-on-state").render()) == "off"
+
+        await pilot.press("space", "enter")
+        assert app.add_ons.is_enabled(definition.id) is True
+        detail = settings.query_one("#settings-add-on-detail")
+        assert detail.display is True
+        assert [
+            str(item.query_one(".add-on-setting-label").render())
+            for item in detail.children
+        ] == ["enabled", "Sparkles", "Duration", "Density"]
+
+        await pilot.press("j", "space")
+        assert app.add_ons.setting_values(definition.id)["sparkles"] is True
+
+        await pilot.press("escape")
+        assert registry.display is True
+
+        await pilot.press("escape", "enter", "?", "l")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        assert settings.tab == "add-ons"
+        assert settings.query_one("#settings-add-ons").display is True
+
+
+@pytest.mark.asyncio
+async def test_enabled_add_on_receives_review_events_at_accepted_transitions(
+    tmp_path,
+) -> None:
+    received: list[AddOnEvent] = []
+    definition = AddOnDefinition(
+        id="review-observer",
+        name="Review Observer",
+        description="Observe review transitions.",
+        events=frozenset(AddOnEventType),
+        settings=(),
+        handle=lambda event, _settings: received.append(event),
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        assert backend.rating == 3
+        assert received == [
+            AddOnEvent(AddOnEventType.REVIEW_STARTED, deck_name="Japanese"),
+            AddOnEvent(
+                AddOnEventType.RATING_ACCEPTED,
+                deck_name="Japanese",
+                rating=3,
+            ),
+            AddOnEvent(AddOnEventType.REVIEW_COMPLETED, deck_name="Japanese"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_add_on_presentation_cue_is_rendered_by_repetui(tmp_path, monkeypatch) -> None:
+    definition = AddOnDefinition(
+        id="review-acknowledgement",
+        name="Review Acknowledgement",
+        description="Acknowledge starting a review.",
+        events=frozenset({AddOnEventType.REVIEW_STARTED}),
+        settings=(),
+        handle=lambda _event, _settings: PresentationCue(
+            PresentationCueType.NOTICE,
+            message="Review started.",
+        ),
+    )
+    app, _ = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+    notifications = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+
+        assert notifications == [(('Review started.',), {})]
+
+
+@pytest.mark.asyncio
+async def test_failing_add_on_cannot_interrupt_rating_or_expose_private_error(
+    tmp_path, monkeypatch
+) -> None:
+    def fail(_event, _settings):
+        raise RuntimeError("private add-on detail")
+
+    definition = AddOnDefinition(
+        id="broken-feedback",
+        name="Broken Feedback",
+        description="A failing test add-on.",
+        events=frozenset({AddOnEventType.REVIEW_COMPLETED}),
+        settings=(),
+        handle=fail,
+    )
+    app, backend = make_app(tmp_path, add_ons=(definition,))
+    app.add_ons.set_enabled(definition.id, True)
+    notifications = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+
+        assert backend.rating == 3
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert notifications == [
+            (("Broken Feedback add-on failed.",), {"severity": "warning"})
+        ]
 
 
 @pytest.mark.asyncio
@@ -1168,7 +2211,7 @@ async def test_capture_rejects_fixed_navigation_and_escape_cancels_it(
         await pilot.press("escape")
         assert app.screen is settings
         assert str(settings.query_one("#settings-footer").render()) == (
-            "j/k · enter bind · bs default · esc"
+            "j/k · enter/space · bs default · esc"
         )
 
         await pilot.press("escape")
@@ -1383,6 +2426,133 @@ class CountsChangeWhenReopenedBackend(FakeBackend):
             self._decks = [Deck(1, "Japanese", 0, DueCounts(0, 0, 0))]
 
 
+class ReviewEmptiesWhenReopenedBackend(FakeBackend):
+    """Make an active review empty only after a sync reopen."""
+
+    def __init__(self) -> None:
+        super().__init__(counts=DueCounts(0, 0, 1))
+        self.open_calls = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+        super().open()
+        if self.open_calls > 1:
+            self.card_available = False
+
+
+class ClosedAwareBackend(FakeBackend):
+    """Reject collection reads while a held sync owns the closed backend."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed_count_calls = 0
+
+    def counts(self) -> DueCounts:
+        if not self.is_open:
+            self.closed_count_calls += 1
+            raise BackendError("The Anki collection is not open.")
+        return super().counts()
+
+
+def make_held_sync_app(
+    tmp_path: Path, started: Event, release: Event
+) -> tuple[RepetuiApp, ClosedAwareBackend]:
+    def held_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=3)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    backend = ClosedAwareBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=held_sync,
+    )
+    return app, backend
+
+
+@pytest.mark.asyncio
+async def test_rating_feedback_expiry_does_not_read_closed_backend_during_sync(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("enter", "enter", "3")
+            review = app.screen
+            assert isinstance(review, ReviewScreen)
+            frozen_content = str(review.query_one("#card").render())
+            frozen_actions = str(review.query_one("#review-actions").render())
+
+            await pilot.press("s")
+            assert started.wait(timeout=1)
+            assert backend.is_open is False
+
+            await pilot.pause(1.05)
+
+            assert isinstance(app.screen, SyncPopup)
+            assert backend.closed_count_calls == 0
+            assert str(review.query_one("#card").render()) == frozen_content
+            assert str(review.query_one("#review-actions").render()) == frozen_actions
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_resize_does_not_read_closed_review_backend_during_sync(
+    tmp_path,
+) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        try:
+            await pilot.press("enter", "s")
+            assert started.wait(timeout=1)
+            assert backend.is_open is False
+
+            await pilot.resize_terminal(41, 6)
+            await pilot.pause()
+
+            assert isinstance(app.screen, SyncPopup)
+            assert backend.closed_count_calls == 0
+        finally:
+            release.set()
+            await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_review_refreshes_once_after_held_sync_popup_closes(tmp_path) -> None:
+    started = Event()
+    release = Event()
+    app, backend = make_held_sync_app(tmp_path, started, release)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert backend.begun_deck_ids == [1]
+
+        await pilot.press("s")
+        assert started.wait(timeout=1)
+        assert backend.is_open is False
+        assert backend.begun_deck_ids == [1]
+
+        release.set()
+        await pilot.pause(1.2)
+
+        assert app.screen is review
+        assert backend.is_open is True
+        assert backend.begun_deck_ids == [1, 1]
+
+
 @pytest.mark.asyncio
 async def test_startup_error_is_a_plain_full_screen_surface(tmp_path) -> None:
     backend = FailingBackend()
@@ -1492,6 +2662,73 @@ async def test_sync_completion_replaces_progress_then_dismisses_after_one_second
         await pilot.pause(0.3)
         assert app.screen is origin
         assert app.syncing is False
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_background_frozen_until_popup_closes(tmp_path) -> None:
+    started = Event()
+    release = Event()
+
+    def fake_sync(_profile: ProfilePaths) -> SyncOutcome:
+        started.set()
+        release.wait(timeout=2)
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    backend = CountsChangeWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=fake_sync,
+    )
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        decks = app.screen
+        assert isinstance(decks, DeckScreen)
+        before = str(decks.query_one(".deck-row").render())
+        assert "0/0/1" in before
+
+        await pilot.press("s")
+        assert started.wait(timeout=1)
+        release.set()
+        await pilot.pause(0.15)
+
+        popup = app.screen
+        assert isinstance(popup, SyncPopup)
+        assert str(popup.query_one("#sync-popup").render()) == "[ok] synced"
+        assert str(decks.query_one(".deck-row").render()) == before
+
+        await pilot.pause(1.0)
+        assert app.screen is decks
+        assert "0/0/0" in str(decks.query_one(".deck-row").render())
+
+
+@pytest.mark.asyncio
+async def test_sync_to_zero_never_triggers_completion_celebration(tmp_path) -> None:
+    backend = ReviewEmptiesWhenReopenedBackend()
+    profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
+    app = RepetuiApp(
+        backend,
+        profile,
+        JsonPreferences(tmp_path / "preferences.json"),
+        syncer=lambda _profile: SyncOutcome(SyncStatus.SYNCED),
+    )
+    app.add_ons.set_enabled("completion-celebration", True)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None
+
+        await pilot.press("s")
+        await pilot.pause(1.2)
+
+        assert app.screen is review
+        assert review.card is None
+        assert backend.rating is None
 
 
 @pytest.mark.asyncio
@@ -1650,8 +2887,11 @@ async def test_collection_close_failure_becomes_dismissible_without_running_sync
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [SyncStatus.OFFLINE, SyncStatus.FULL_SYNC_REQUIRED, SyncStatus.SYNCED]
+)
 async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal(
-    tmp_path,
+    tmp_path, status,
 ) -> None:
     backend = ReopenFailingBackend()
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
@@ -1659,7 +2899,7 @@ async def test_collection_reopen_failure_routes_to_fatal_surface_after_dismissal
         backend,
         profile,
         JsonPreferences(tmp_path / "preferences.json"),
-        lambda _profile: SyncOutcome(SyncStatus.OFFLINE, "network problem"),
+        lambda _profile: SyncOutcome(status, "sync problem"),
     )
 
     async with app.run_test(size=(40, 6)) as pilot:
@@ -1836,3 +3076,256 @@ async def test_failed_sync_reopens_collection_and_clears_busy_state(tmp_path) ->
         await pilot.press("enter")
         assert app.syncing is False
         assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_review", [False, True])
+async def test_full_sync_conflict_stays_visible_and_can_be_dismissed_and_retried(
+    tmp_path, in_review
+) -> None:
+    calls = []
+
+    def conflict(profile):
+        calls.append(profile)
+        return SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+
+    app, backend = make_app(tmp_path, syncer=conflict)
+    async with app.run_test(size=(40, 6)) as pilot:
+        if in_review:
+            await pilot.press("enter")
+        origin = app.screen
+        await pilot.press("s")
+        await pilot.pause(1.2)
+
+        assert isinstance(app.screen, SyncPopup)
+        surface = app.screen.query_one("#sync-recovery")
+        assert surface.display
+        message = str(surface.query_one(Static).render())
+        assert "Cards were not synced" in message
+        assert "d: download" in message
+        assert "u: upload" in message
+        assert "replaces one side" in message
+        assert "Esc/Enter: back" in message
+        assert surface.region.height <= 6
+        assert surface.virtual_size.height <= surface.size.height
+        assert backend.is_open
+        assert not app.screen.query_one("#sync-popup").display
+
+        await pilot.resize_terminal(20, 4)
+        assert surface.region.width <= 20
+        assert surface.region.height <= 4
+        assert surface.max_scroll_y > 0
+        await pilot.press("end")
+        await pilot.pause()
+        assert surface.scroll_y == surface.max_scroll_y
+        await pilot.resize_terminal(40, 6)
+
+        await pilot.press("enter")
+        assert app.screen is origin
+        assert not app.syncing
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        assert len(calls) == 2
+        await pilot.press("escape")
+        assert app.screen is origin
+        assert backend.rating is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", list(FullSyncDirection))
+async def test_full_sync_requires_exact_typed_confirmation(tmp_path, direction):
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+    )
+    calls = []
+
+    def resolve(profile, selected):
+        assert not backend.is_open
+        calls.append((profile, selected))
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app.full_syncer = resolve
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press(direction.value[0])
+        text = str(app.screen.query_one("#sync-recovery Static").render())
+        assert "Profile: test" in text
+        assert "LOCAL" in text if direction is FullSyncDirection.DOWNLOAD else "WEB" in text
+        confirm = app.screen.query_one("#sync-confirm", Input)
+        assert confirm.has_focus
+        assert confirm.region.bottom <= 6
+        await pilot.resize_terminal(20, 4)
+        await pilot.pause()
+        assert confirm.region.bottom <= 4
+        await pilot.resize_terminal(40, 6)
+        await pilot.press("enter")
+        assert not calls
+        confirm.value = "yes"
+        await pilot.press("enter")
+        assert not calls
+        confirm.value = direction.value.upper()
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert calls == [(app.profile, direction)]
+        assert backend.is_open
+        assert str(app.screen.query_one("#sync-popup").render()) == "[ok] synced"
+        await pilot.pause(1.1)
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_cancel_full_sync_confirmation_never_transfers(tmp_path):
+    app, _ = make_app(tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED))
+    calls = []
+    app.full_syncer = lambda *args: calls.append(args)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press("u", "escape")
+        assert isinstance(app.screen, DeckScreen)
+        assert not calls
+        assert not app.syncing
+
+
+@pytest.mark.asyncio
+async def test_failed_backup_can_be_dismissed_and_retried_with_fresh_confirmation(tmp_path):
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
+    )
+    calls = []
+
+    def fail_backup(profile, direction):
+        calls.append(direction)
+        return SyncOutcome(SyncStatus.BACKUP_FAILED)
+
+    app.full_syncer = fail_backup
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(0.1)
+        await pilot.press("d")
+        app.screen.query_one("#sync-confirm", Input).value = "DOWNLOAD"
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert "backup failed" in str(app.screen.query_one("#sync-popup").render())
+        assert backend.is_open
+        await pilot.press("escape", "s")
+        await pilot.pause(0.1)
+        await pilot.press("d")
+        assert app.screen.query_one("#sync-confirm", Input).value == ""
+        await pilot.press("escape")
+        assert calls == [FullSyncDirection.DOWNLOAD]
+
+
+class BusyStartupBackend(FakeBackend):
+    busy = True
+
+    def open(self):
+        if self.busy:
+            raise CollectionInUseError("Collection is in use.")
+        super().open()
+
+
+def startup_recovery_app(tmp_path):
+    backend = BusyStartupBackend()
+    profile = ProfilePaths(tmp_path, "test", tmp_path / "collection.anki2")
+    return RepetuiApp(backend, profile, JsonPreferences(tmp_path / "prefs.json")), backend
+
+
+@pytest.mark.asyncio
+async def test_unknown_startup_owner_allows_manual_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: None)
+    app, backend = startup_recovery_app(tmp_path)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, StartupRecoveryScreen)
+        assert "cannot be verified" in str(app.screen.query_one("#recovery-message").render())
+        await pilot.press("c", "f")
+        assert not app.screen.query_one("#force-confirm").display
+        backend.busy = False
+        await pilot.press("r")
+        await pilot.pause()
+        assert isinstance(app.screen, DeckScreen)
+        assert backend.is_open
+
+
+@pytest.mark.asyncio
+async def test_close_verified_owner_then_retry_opens_once(tmp_path, monkeypatch):
+    owner = CollectionOwner(123, "start", "repetui", "/python", ("repetui",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    app, backend = startup_recovery_app(tmp_path)
+    calls = []
+
+    def close(path, selected):
+        calls.append(selected)
+        backend.busy = False
+        return True
+
+    monkeypatch.setattr("repetui.app.request_close", close)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("c", "c", "r")
+        await pilot.pause()
+        assert calls == [owner]
+        assert isinstance(app.screen, DeckScreen)
+        assert len([screen for screen in app.screen_stack if isinstance(screen, DeckScreen)]) == 1
+
+
+@pytest.mark.asyncio
+async def test_force_close_requires_separate_exact_confirmation(tmp_path, monkeypatch):
+    owner = CollectionOwner(123, "start", "Anki Desktop", "/anki", ("anki",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    monkeypatch.setattr("repetui.app.request_close", lambda *_: False)
+    app, backend = startup_recovery_app(tmp_path)
+    calls = []
+
+    def force(path, selected):
+        calls.append(selected)
+        backend.busy = False
+        return True
+
+    monkeypatch.setattr("repetui.app.force_close", force)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("f")
+        assert not app.screen.query_one("#force-confirm").display
+        await pilot.press("c", "f")
+        field = app.screen.query_one("#force-confirm", Input)
+        assert field.display
+        assert "PID 123" in str(app.screen.query_one("#recovery-message").render())
+        field.value = "yes"
+        await pilot.press("enter", "escape")
+        assert not calls
+        await pilot.press("f")
+        assert field.value == ""
+        await pilot.resize_terminal(20, 4)
+        await pilot.pause()
+        assert field.region.bottom <= 4
+        field.value = "FORCE"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert calls == [owner]
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_startup_close_timeout_is_recoverable_and_cancel_does_not_force(
+    tmp_path, monkeypatch
+):
+    owner = CollectionOwner(123, "start", "repetui", "/python", ("repetui",))
+    monkeypatch.setattr("repetui.app.find_owner", lambda _: owner)
+    monkeypatch.setattr("repetui.app.request_close", lambda *_: True)
+    calls = []
+    monkeypatch.setattr("repetui.app.force_close", lambda *args: calls.append(args))
+    app, _ = startup_recovery_app(tmp_path)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.pause()
+        await pilot.press("c", "c")
+        await pilot.pause(3.5)
+        assert "Still in use" in str(app.screen.query_one("#recovery-message").render())
+        await pilot.press("f", "escape")
+        assert not calls
+        await pilot.press("c", "escape")
+        await pilot.pause(0.3)
+        assert isinstance(app.screen, StartupRecoveryScreen)
+        assert not calls
