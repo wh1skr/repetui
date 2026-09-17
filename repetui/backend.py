@@ -206,6 +206,7 @@ class AnkiBackend:
             fields=tuple(SourceField(name, html) for name, html in note.items()),
             front_av=_av_references(rendered.question_av_tags),
             back_av=_av_references(rendered.answer_av_tags),
+            card_css=str(note_type.get("css") or ""),
         )
 
     def sample_cards(

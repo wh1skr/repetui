@@ -49,6 +49,20 @@ class FakeCard:
         self.timer_started = True
 
 
+def test_raw_card_keeps_note_type_css_for_terminal_emphasis() -> None:
+    class StyledCard(FakeCard):
+        def note_type(self) -> dict[str, object]:
+            return {
+                "id": 123,
+                "name": "Grammar",
+                "css": ".target { text-decoration: underline; }",
+            }
+
+    raw = AnkiBackend._raw_content_for_card(StyledCard())
+
+    assert raw.card_css == ".target { text-decoration: underline; }"
+
+
 class FakeScheduler:
     def __init__(self) -> None:
         child = SimpleNamespace(

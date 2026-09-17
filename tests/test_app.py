@@ -272,6 +272,50 @@ async def test_review_uses_the_saved_field_profile_for_a_dynamic_template(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_grammar_profile_keeps_answer_underlines_at_40x6(tmp_path) -> None:
+    identity = CardTemplateIdentity(73, "Grammar", 0, "Meaning")
+    content = RawCardContent(
+        identity,
+        "<div>日本語の文</div><p>What is happening?</p>",
+        '<div>日本語の<span class="grammar-phrase">文</span></div>'
+        '<p><span class="grammar-meaning">Meaning</span> here.</p>',
+        (
+            SourceField("Sentence", "日本語の文"),
+            SourceField("Question", "What is happening?"),
+            SourceField("Answer", '日本語の<span class="grammar-phrase">文</span>'),
+            SourceField(
+                "Translation",
+                '<span class="grammar-meaning">Meaning</span> here.',
+            ),
+        ),
+        card_css=(
+            ".grammar-phrase,.grammar-meaning{text-decoration:underline}"
+        ),
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    preferences.set_field_profile(
+        identity,
+        TemplateFieldProfile(("Sentence",), ("Answer", "Translation"), ("Question",)),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "What is happening?" not in rendered_text(review)
+
+        await pilot.press("enter")
+        card = review.query_one("#card", Static).render()
+        underlined = {
+            card.plain[span.start : span.end]
+            for span in card.spans
+            if "underline" in str(span.style)
+        }
+        assert underlined == {"文", "Meaning"}
+
+
+@pytest.mark.asyncio
 async def test_field_profile_answer_sections_keep_saved_fold_behavior(tmp_path) -> None:
     preferences = JsonPreferences(tmp_path / "preferences.json")
     content = dynamic_card()
@@ -1141,7 +1185,7 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, DeckScreen)
-        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6b"
+        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6"
         assert screen.query_one("#deck-header").region.y == 0
         assert len(screen.query("#logo")) == 0
         assert len(screen.query(".quiet-footer")) == 0

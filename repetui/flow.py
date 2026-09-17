@@ -67,6 +67,25 @@ def _front_content(presentation: CardPresentation) -> tuple[str, bool]:
     return "\n\n".join(rows), len(blocks) > 1
 
 
+def _apply_section_underlines(
+    result: Text,
+    section: PresentationSection,
+    *,
+    start: int = 0,
+    end: int | None = None,
+) -> None:
+    region = result.plain[start:end]
+    position = region.find(section.text)
+    if position >= 0 and region.find(section.text, position + 1) < 0:
+        for underline_start, underline_end in section.underlines:
+            if 0 <= underline_start < underline_end <= len(section.text):
+                result.stylize(
+                    "underline",
+                    start + position + underline_start,
+                    start + position + underline_end,
+                )
+
+
 def _header(
     presentation: CardPresentation,
     deck_name: str,
@@ -151,6 +170,13 @@ def _header(
     if remaining_front:
         result.append("\n")
         result.append(remaining_front, style="bold #eee9e0")
+    for section in presentation.front.sections:
+        if first_front:
+            _apply_section_underlines(result, section, end=len(first_front))
+        if remaining_front:
+            _apply_section_underlines(
+                result, section, start=len(result.plain) - len(remaining_front)
+            )
     return result
 
 
@@ -183,9 +209,15 @@ def _is_unlabelled_section(section: PresentationSection) -> bool:
     return section.id.endswith(":fallback")
 
 
+def _styled_section(section: PresentationSection, text: str, style: str) -> Text:
+    result = Text(text, style=style, overflow="fold")
+    _apply_section_underlines(result, section)
+    return result
+
+
 def _stacked_section(section: PresentationSection) -> Text:
     body = _expanded_body(section)
-    result = Text(body, style="#d9d5ce", overflow="fold")
+    result = _styled_section(section, body, "#d9d5ce")
     if _is_unlabelled_section(section):
         return result
     result.append("  · ", style="#817d76")
@@ -210,11 +242,16 @@ def _back(
     answer_layout: AnswerLayout,
 ) -> Text:
     rows: list[Text] = []
-    compact: list[str] = []
+    compact: list[Text] = []
 
     def flush_compact() -> None:
         if compact:
-            rows.append(Text("  ·  ".join(compact), style="#d9d5ce"))
+            row = Text(overflow="fold")
+            for index, part in enumerate(compact):
+                if index:
+                    row.append("  ·  ", style="#d9d5ce")
+                row.append_text(part)
+            rows.append(row)
             compact.clear()
 
     for state in states:
@@ -236,10 +273,10 @@ def _back(
                 flush_compact()
                 rows.append(_stacked_section(section))
             elif _is_compact_section(section, shown):
-                compact.append(shown)
+                compact.append(_styled_section(section, shown, "#d9d5ce"))
             else:
                 flush_compact()
-                rows.append(Text(shown, style="#d9d5ce"))
+                rows.append(_styled_section(section, shown, "#d9d5ce"))
             continue
 
         flush_compact()
@@ -247,9 +284,10 @@ def _back(
         if state.expanded:
             body = _expanded_body(section)
             rows.append(
-                Text(
+                _styled_section(
+                    section,
                     f"▾ {name}\n{body}",
-                    style="#c6d8d0" if state.selected else "#aaa49b",
+                    "#c6d8d0" if state.selected else "#aaa49b",
                 )
             )
         else:

@@ -44,16 +44,12 @@ def grammar_card(index: int) -> RawCardContent:
     )
 
 
-def test_multi_card_suggestion_maps_visible_fields_and_skips_duplicates() -> None:
+def test_styled_duplicate_without_side_evidence_is_not_suggested() -> None:
     result = suggest_field_layout(tuple(grammar_card(index) for index in range(3)))
 
-    assert result.confidence == "high"
-    assert result.profile == TemplateFieldProfile(
-        ("Sentence", "Question"),
-        ("Translation", "Explanation", "Title", "Structure", "Audio"),
-        ("Key", "Answer", "Kind", "SourceURL"),
-    )
-    assert "Optional" in result.unresolved_fields
+    assert result.confidence == "low"
+    assert result.profile is None
+    assert {"Sentence", "Answer", "Question"} <= set(result.unresolved_fields)
     assert result.reasons
 
 
@@ -150,3 +146,32 @@ def test_duplicate_metadata_field_does_not_beat_visible_word() -> None:
     assert result.profile == TemplateFieldProfile(
         ("Word",), ("Meaning",), ("Key",)
     )
+
+
+def test_styled_answer_is_not_discarded_as_duplicate_of_plain_prompt() -> None:
+    samples = tuple(
+        RawCardContent(
+            IDENTITY,
+            f"<div>文{index}を読む。</div><p>What is happening?</p>",
+            (
+                f'<div><span class="grammar-phrase">文{index}</span>を読む。</div>'
+                f"<p>Meaning {index}.</p>"
+            ),
+            (
+                SourceField("Sentence", f"文{index}を読む。"),
+                SourceField(
+                    "Answer", f'<span class="grammar-phrase">文{index}</span>を読む。'
+                ),
+                SourceField("Question", "What is happening?"),
+                SourceField("Translation", f"Meaning {index}."),
+            ),
+        )
+        for index in range(1, 4)
+    )
+
+    result = suggest_field_layout(samples)
+
+    assert result.profile is not None
+    assert result.profile.prompt_fields == ("Sentence",)
+    assert result.profile.answer_fields == ("Answer", "Translation")
+    assert "Question" not in result.profile.prompt_fields

@@ -486,7 +486,7 @@ wheels = [
 
 [[package]]
 name = "repetui"
-version = "0.1.6b0"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "anki" },

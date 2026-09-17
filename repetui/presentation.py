@@ -24,6 +24,9 @@ _SOUND = re.compile(r"\[sound:([^\]]+)\]", re.IGNORECASE)
 _AV_REFERENCE = re.compile(r"\[anki:play:[^:\]]+:(\d+)\]", re.IGNORECASE)
 _TYPE_MARKER = re.compile(r"\[\[type:[^\]]+\]\]", re.IGNORECASE)
 _SPACE = re.compile(r"[ \t]+")
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+_SIMPLE_CLASS = re.compile(r"(?:[a-z][\w-]*)?\.([\w-]+)", re.IGNORECASE)
 _FURIGANA_HINT = re.compile(r"(?:\[[ぁ-んァ-ンー]{1,30}\]|（[ぁ-んァ-ンー]{1,30}）)")
 _MACHINE_VALUE = re.compile(
     r"(?:https?://\S+|[0-9]{3,}|[0-9a-f]{12,}(?::[0-9]+)?)",
@@ -100,6 +103,7 @@ class RawCardContent:
     fields: tuple[SourceField, ...] = ()
     front_av: tuple[AVReference, ...] = ()
     back_av: tuple[AVReference, ...] = ()
+    card_css: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,7 @@ class PresentationSection:
     label: str | None = None
     source_label: str | None = None
     label_is_content: bool = False
+    underlines: tuple[tuple[int, int], ...] = ()
 
     @property
     def display_text(self) -> str:
@@ -192,7 +197,7 @@ class _RenderedHTMLParser(HTMLParser):
         "wbr",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, underline_classes: frozenset[str] = frozenset()) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.prelude: list[str] = []
@@ -206,8 +211,21 @@ class _RenderedHTMLParser(HTMLParser):
         self._media_tag: str | None = None
         self._media_emitted = False
         self._row_cells = 0
+        self._underline_classes = underline_classes
+        self._underline_depth = 0
+        self._underline_stack: list[tuple[str, bool]] = []
+        self._raw_length = 0
+        self.underline_ranges: list[tuple[int, int]] = []
 
     def _emit(self, text: str) -> None:
+        start = self._raw_length
+        self._raw_length += len(text)
+        if self._underline_depth and text:
+            if self.underline_ranges and self.underline_ranges[-1][1] == start:
+                previous, _ = self.underline_ranges[-1]
+                self.underline_ranges[-1] = (previous, self._raw_length)
+            else:
+                self.underline_ranges.append((start, self._raw_length))
         self.parts.append(text)
         if self._heading_depth and self._active is not None:
             self._active.label_parts.append(text)
@@ -235,6 +253,20 @@ class _RenderedHTMLParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attributes = dict(attrs)
+        if tag not in self._VOID:
+            active = (
+                not self._ignored_depth
+                and self._math_tag is None
+                and tag not in self._SUPPRESSED
+                and not self._is_hidden(attributes)
+            )
+            underlined = active and (
+                tag in {"u", "ins"}
+                or _declares_underline(attributes.get("style") or "") is True
+                or bool(self._classes(attributes) & self._underline_classes)
+            )
+            self._underline_stack.append((tag, underlined))
+            self._underline_depth += int(underlined)
         if self._ignored_depth:
             if tag not in self._VOID:
                 self._ignored_depth += 1
@@ -311,6 +343,12 @@ class _RenderedHTMLParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        for index in range(len(self._underline_stack) - 1, -1, -1):
+            if self._underline_stack[index][0] == tag:
+                for _, underlined in self._underline_stack[index:]:
+                    self._underline_depth -= int(underlined)
+                del self._underline_stack[index:]
+                break
         if self._ignored_depth:
             self._ignored_depth -= 1
             return
@@ -344,12 +382,75 @@ class _RenderedHTMLParser(HTMLParser):
             self._emit(data)
 
 
+class _ClassCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.classes: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.classes.update((dict(attrs).get("class") or "").casefold().split())
+
+
+def _html_classes(html: str) -> frozenset[str]:
+    parser = _ClassCollector()
+    parser.feed(html)
+    return frozenset(parser.classes)
+
+
 @dataclass(frozen=True)
 class _RenderedDocument:
     text: str
     structural_sections: tuple[tuple[str, str, str], ...]
     prelude: str
     atoms: tuple[str, ...]
+    underlines: tuple[tuple[int, int], ...] = ()
+
+
+def _declares_underline(declarations: str) -> bool | None:
+    result: bool | None = None
+    for declaration in declarations.split(";"):
+        name, separator, value = declaration.partition(":")
+        if separator and name.strip().casefold() in {
+            "text-decoration",
+            "text-decoration-line",
+        }:
+            result = bool(re.search(r"\bunderline\b", value, re.IGNORECASE))
+    return result
+
+
+def _underlined_classes(css: str) -> frozenset[str]:
+    """Recognize only simple class selectors with explicit underline rules."""
+    result: set[str] = set()
+    for selectors, declarations in _CSS_RULE.findall(_CSS_COMMENT.sub("", css)):
+        underlined = _declares_underline(declarations)
+        if underlined is None:
+            continue
+        for selector in selectors.split(","):
+            match = _SIMPLE_CLASS.fullmatch(selector.strip())
+            if match:
+                name = match.group(1).casefold()
+                if underlined:
+                    result.add(name)
+                else:
+                    result.discard(name)
+    return frozenset(result)
+
+
+def _normalised_underlines(
+    raw: str,
+    ranges: list[tuple[int, int]],
+    text: str,
+    av: tuple[AVReference, ...],
+) -> tuple[tuple[int, int], ...]:
+    result: set[tuple[int, int]] = set()
+    for start, end in ranges:
+        fragment = _normalise(raw[start:end], av)
+        if not fragment:
+            continue
+        position = text.find(fragment)
+        if position >= 0 and text.find(fragment, position + 1) < 0:
+            result.add((position, position + len(fragment)))
+    return tuple(sorted(result))
 
 
 def _promote_structural_labels(html: str) -> str:
@@ -359,11 +460,17 @@ def _promote_structural_labels(html: str) -> str:
     )
 
 
-def _render_document(html: str, av: tuple[AVReference, ...] = ()) -> _RenderedDocument:
-    parser = _RenderedHTMLParser()
+def _render_document(
+    html: str,
+    av: tuple[AVReference, ...] = (),
+    *,
+    card_css: str = "",
+) -> _RenderedDocument:
+    parser = _RenderedHTMLParser(_underlined_classes(card_css))
     parser.feed(_promote_structural_labels(html))
     parser.close()
-    text = _normalise("".join(parser.parts), av)
+    raw_text = "".join(parser.parts)
+    text = _normalise(raw_text, av)
     sections = tuple(
         (
             section.kind,
@@ -382,6 +489,7 @@ def _render_document(html: str, av: tuple[AVReference, ...] = ()) -> _RenderedDo
         sections,
         _normalise("".join(parser.prelude), av),
         atoms,
+        _normalised_underlines(raw_text, parser.underline_ranges, text, av),
     )
 
 
@@ -672,14 +780,20 @@ def suggest_field_layout(samples: Sequence[RawCardContent]) -> FieldLayoutSugges
     values: dict[str, list[str]] = {name: [] for name in names}
     front_positions: dict[str, list[int]] = {name: [] for name in names}
     back_positions: dict[str, list[int]] = {name: [] for name in names}
+    back_only_markup_hits: dict[str, int] = {name: 0 for name in names}
     for sample in samples:
         front = _render_document(sample.front_html, sample.front_av)
         back = _render_document(sample.back_html, sample.back_av)
+        front_classes = _html_classes(sample.front_html)
+        back_classes = _html_classes(sample.back_html)
         for field in sample.fields:
             rendered = _render_document(field.html)
             values[field.name].append(_suggestion_key(rendered.text))
             if not rendered.text:
                 continue
+            classes = _html_classes(field.html)
+            if classes and classes <= back_classes and classes.isdisjoint(front_classes):
+                back_only_markup_hits[field.name] += 1
             front_position = _suggestion_position(rendered, front)
             back_position = _suggestion_position(rendered, back)
             if front_position >= 0:
@@ -688,12 +802,37 @@ def suggest_field_layout(samples: Sequence[RawCardContent]) -> FieldLayoutSugges
                 back_positions[field.name].append(back_position)
 
     duplicates: set[str] = set()
+    ambiguous_duplicates: set[str] = set()
+    split_prompt: set[str] = set()
+    split_answer: set[str] = set()
     by_values: dict[tuple[str, ...], list[str]] = {}
     for name in names:
         if any(values[name]):
             by_values.setdefault(tuple(values[name]), []).append(name)
     for group in by_values.values():
         if len(group) < 2:
+            continue
+        if len(group) == 2:
+            back_styled = [
+                name
+                for name in group
+                if back_only_markup_hits[name] == sum(bool(value) for value in values[name])
+                and back_only_markup_hits[name] >= 2
+            ]
+            if len(back_styled) == 1:
+                back_name = back_styled[0]
+                front_name = next(name for name in group if name != back_name)
+                if not _metadata_hint(front_name) and len(front_positions[front_name]) >= 2:
+                    split_prompt.add(front_name)
+                    split_answer.add(back_name)
+                    continue
+        if len(
+            {
+                tuple(sample.fields[names.index(name)].html for sample in samples)
+                for name in group
+            }
+        ) > 1:
+            ambiguous_duplicates.update(group)
             continue
         preferred = min(
             group,
@@ -713,8 +852,12 @@ def suggest_field_layout(samples: Sequence[RawCardContent]) -> FieldLayoutSugges
         back_hits = len(back_positions[name])
         if name in duplicates:
             ignored.append(name)
-        elif populated == 0:
+        elif name in ambiguous_duplicates or populated == 0:
             unresolved.append(name)
+        elif name in split_prompt:
+            prompt.append(name)
+        elif name in split_answer:
+            answer.append(name)
         elif front_hits == populated and front_hits >= 2:
             prompt.append(name)
         elif _metadata_evidence(name, values[name]) and front_hits == 0:
@@ -723,6 +866,10 @@ def suggest_field_layout(samples: Sequence[RawCardContent]) -> FieldLayoutSugges
             answer.append(name)
         else:
             unresolved.append(name)
+
+    varied_prompt = [name for name in prompt if len(set(values[name])) > 1]
+    unresolved.extend(name for name in prompt if name not in varied_prompt)
+    prompt = varied_prompt
 
     if not prompt or not answer:
         return FieldLayoutSuggestion(
@@ -827,6 +974,7 @@ def _field_side(
     auto_names: frozenset[str] = frozenset(),
     rendered_side: _RenderedDocument | None = None,
     excluded_auto_content: frozenset[str] = frozenset(),
+    card_css: str = "",
 ) -> CardSide:
     available = {field.name: field for field in fields}
     seen: dict[str, int] = {}
@@ -836,7 +984,7 @@ def _field_side(
         field = available.get(name)
         if field is None:
             continue
-        rendered = _render_document(field.html)
+        rendered = _render_document(field.html, card_css=card_css)
         text = rendered.text
         if not text:
             continue
@@ -852,6 +1000,7 @@ def _field_side(
                 _unique_id(f"{side}:field", name, seen),
                 text,
                 source_label=name,
+                underlines=rendered.underlines,
             )
         )
     if sections:
@@ -866,7 +1015,9 @@ def _present_fields(
     *,
     suggested: bool = False,
 ) -> CardPresentation:
-    front = _field_side("front", profile.prompt_fields, raw.fields)
+    front = _field_side(
+        "front", profile.prompt_fields, raw.fields, card_css=raw.card_css
+    )
     assigned = set(
         profile.prompt_fields + profile.answer_fields + profile.ignored_fields
     )
@@ -882,6 +1033,7 @@ def _present_fields(
             auto_names=frozenset(auto_fields),
             rendered_side=_render_document(raw.back_html, raw.back_av),
             excluded_auto_content=front_content,
+            card_css=raw.card_css,
         ),
         profile if suggested else None,
     )
