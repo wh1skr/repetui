@@ -72,7 +72,11 @@ after reveal.
   evolve without another configuration pass. Field roles and order update an
   unsaved preview through the same presentation and Flow composition modules
   as review. Narrow panes toggle between fields and preview; wide panes show
-  both. Save applies the draft; Escape discards it.
+  both. A separate explicit Suggest layout action compares several cards of
+  the same template and proposes only field roles supported by repeated
+  rendered-side evidence. Ambiguous fields remain Auto, and low-confidence
+  results do not overwrite the draft. Save applies the draft; Escape discards
+  it.
 
 ### Settings
 

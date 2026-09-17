@@ -75,6 +75,7 @@ class FakeBackend:
         self.flags: list[int] = []
         self.fail_operation: str | None = None
         self.fail_refresh_after_operation = False
+        self.sample_contents: tuple[RawCardContent, ...] = ()
 
     def open(self) -> None:
         self.is_open = True
@@ -106,6 +107,15 @@ class FakeBackend:
             presentation = present_card(content)
             return ReviewCard(42, presentation, raw_content=content)
         return None
+
+    def sample_cards(
+        self,
+        identity: CardTemplateIdentity,
+        *,
+        exclude_card_id: int,
+        limit: int = 4,
+    ) -> tuple[RawCardContent, ...]:
+        return self.sample_contents[:limit]
 
     def answer(self, rating: int) -> None:
         self.rating = rating
@@ -529,6 +539,93 @@ async def test_field_setup_preview_does_not_read_backend_on_draft_changes(
 
         preview = str(setup.query_one("#field-profile-preview-card", Static).render())
         assert "internal-id" in preview
+
+
+@pytest.mark.asyncio
+async def test_suggest_layout_updates_only_draft_until_saved_at_40x6(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, backend = make_app(tmp_path, content, preferences)
+
+    def variant(index: int) -> RawCardContent:
+        return RawCardContent(
+            content.identity,
+            content.front_html.replace("actual question", f"question {index}"),
+            content.back_html.replace("actual question", f"question {index}").replace(
+                "actual answer", f"answer {index}"
+            ),
+            (
+                SourceField("Identifier", f"internal-{index}"),
+                SourceField("Question", f"question {index}"),
+                SourceField("Answer", f"answer {index}"),
+            ),
+        )
+
+    backend.sample_contents = (variant(1), variant(2))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "space")
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+
+        await pilot.press("a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "auto"
+        assert preferences.field_profile(content.identity) is None
+        await pilot.press("p")
+        assert "internal-id" not in str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+
+        await pilot.press("enter")
+        assert preferences.field_profile(content.identity) == TemplateFieldProfile(
+            ("Question",), ("Answer",)
+        )
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_suggestion_preserves_manual_draft(tmp_path) -> None:
+    content = dynamic_card()
+    app, backend = make_app(tmp_path, content)
+    assert backend.sample_contents == ()
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        await pilot.press("j", "j", "space", "a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+        assert app.screen is setup
+
+
+@pytest.mark.asyncio
+async def test_failed_suggestion_read_preserves_manual_draft(tmp_path, monkeypatch) -> None:
+    app, backend = make_app(tmp_path, dynamic_card())
+
+    def unavailable_samples(*_args, **_kwargs):
+        raise BackendError("collection intentionally unavailable")
+
+    monkeypatch.setattr(backend, "sample_cards", unavailable_samples)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "space", "a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+        assert app.screen is setup
 
 
 @pytest.mark.asyncio

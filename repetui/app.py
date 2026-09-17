@@ -65,6 +65,7 @@ from .presentation import (
     TemplateFieldProfile,
     default_field_profile,
     present_card,
+    suggest_field_layout,
 )
 from .recovery import CollectionOwner, InstanceControl, find_owner, force_close, request_close
 from .sync import (
@@ -682,6 +683,7 @@ class TemplateFieldSetupScreen(Screen[None]):
         Binding("p", "toggle_pane", "Fields/preview", show=False),
         Binding("tab", "toggle_pane", "Fields/preview", show=False),
         Binding("v", "toggle_preview_side", "Question/answer", show=False),
+        Binding("a", "suggest_layout", "Suggest layout", show=False),
         Binding("enter", "save", "Save", show=False, priority=True),
     ]
 
@@ -775,13 +777,13 @@ class TemplateFieldSetupScreen(Screen[None]):
         )
         if self._side_by_side:
             header = "adapt card fields"
-            footer = "space role · J/K order · v q/a · enter save"
+            footer = "space role · J/K order · a suggest · v q/a · enter save"
         elif self.preview_only:
             header = f"preview · {side} · widen for split"
             footer = "j/k scroll · v q/a · p fields · enter"
         else:
-            header = "adapt fields · p preview · widen pane"
-            footer = "space role · J/K order · p view · enter"
+            header = "adapt fields · J/K order · widen pane"
+            footer = "space role · a suggest · p view · enter"
         self.query_one("#field-profile-header", Static).update(
             Text(header, style="#eee9e0", no_wrap=True)
         )
@@ -936,6 +938,57 @@ class TemplateFieldSetupScreen(Screen[None]):
         self.preview_revealed = not self.preview_revealed
         self._refresh_responsive_layout()
         self._refresh_preview()
+
+    def action_suggest_layout(self) -> None:
+        assert self.review.card is not None
+        raw = self.review.card.raw_content
+        assert raw is not None
+        try:
+            samples = (raw,) + self.review.repetui.backend.sample_cards(
+                raw.identity,
+                exclude_card_id=self.review.card.id,
+                limit=4,
+            )
+            suggestion = suggest_field_layout(samples)
+        except (BackendError, ValueError):
+            self.notify("Could not inspect this template's cards.", severity="warning")
+            return
+        if suggestion.profile is None:
+            self.notify(
+                f"No safe suggestion. {suggestion.reasons[0]}",
+                severity="warning",
+            )
+            return
+
+        by_name = {row.field.name: row.field for row in self.query(FieldProfileItem)}
+        profile = suggestion.profile
+        assigned = (
+            profile.prompt_fields + profile.answer_fields + profile.ignored_fields
+        )
+        order = assigned + tuple(name for name in by_name if name not in assigned)
+        selected = self._selected()
+        selected_name = selected.field.name if selected is not None else None
+        rows = tuple(self.query(FieldProfileItem))
+        for row, name in zip(rows, order, strict=True):
+            row.field = by_name[name]
+            row.role = (
+                FieldRole.PROMPT
+                if name in profile.prompt_fields
+                else FieldRole.ANSWER
+                if name in profile.answer_fields
+                else FieldRole.IGNORE
+                if name in profile.ignored_fields
+                else FieldRole.AUTO
+            )
+            row.refresh_role()
+        if selected_name is not None:
+            self._view().index = order.index(selected_name)
+        self._refresh_preview()
+        unresolved = len(suggestion.unresolved_fields)
+        detail = f"; {unresolved} left Auto" if unresolved else ""
+        self.notify(
+            f"Suggested from {len(samples)} cards{detail}. Enter saves; Esc discards."
+        )
 
     def action_save(self) -> None:
         profile = self._draft_profile()

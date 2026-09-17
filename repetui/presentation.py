@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from typing import Literal
 from urllib.parse import urlsplit
 
 from rich.cells import cell_len
@@ -22,6 +24,11 @@ _SOUND = re.compile(r"\[sound:([^\]]+)\]", re.IGNORECASE)
 _AV_REFERENCE = re.compile(r"\[anki:play:[^:\]]+:(\d+)\]", re.IGNORECASE)
 _TYPE_MARKER = re.compile(r"\[\[type:[^\]]+\]\]", re.IGNORECASE)
 _SPACE = re.compile(r"[ \t]+")
+_FURIGANA_HINT = re.compile(r"(?:\[[ぁ-んァ-ンー]{1,30}\]|（[ぁ-んァ-ンー]{1,30}）)")
+_MACHINE_VALUE = re.compile(
+    r"(?:https?://\S+|[0-9]{3,}|[0-9a-f]{12,}(?::[0-9]+)?)",
+    re.IGNORECASE,
+)
 _UNDERLINED_HEADING = re.compile(
     r"<u\b[^>]*>\s*(?:<span\b[^>]*>\s*)?"
     r"<(?P<tag>b|strong)\b[^>]*>(?P<label>[^<>]{1,80})</(?P=tag)>"
@@ -59,6 +66,16 @@ class TemplateFieldProfile:
     prompt_fields: tuple[str, ...]
     answer_fields: tuple[str, ...]
     ignored_fields: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FieldLayoutSuggestion:
+    """A conservative multi-card proposal and the evidence behind it."""
+
+    profile: TemplateFieldProfile | None
+    confidence: Literal["high", "low"]
+    reasons: tuple[str, ...]
+    unresolved_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -578,6 +595,168 @@ def _field_is_present(field: _RenderedDocument, side: _RenderedDocument) -> bool
     if len(key) <= 2 and key.isascii() and key.isalnum():
         return any(_reconcile_key(atom) == key for atom in side.atoms)
     return key in _reconcile_key(side.text)
+
+
+def _suggestion_key(text: str) -> str:
+    """Compare field and rendered-side text despite common ruby/furigana forms."""
+    without_readings = _FURIGANA_HINT.sub("", text)
+    return re.sub(r"\s+", "", without_readings).casefold()
+
+
+def _suggestion_position(field: _RenderedDocument, side: _RenderedDocument) -> int:
+    key = _suggestion_key(field.text)
+    if not key:
+        return -1
+    if (
+        len(key) <= 2
+        and key.isascii()
+        and key.isalnum()
+        and not any(_suggestion_key(atom) == key for atom in side.atoms)
+    ):
+        return -1
+    return _suggestion_key(side.text).find(key)
+
+
+def _metadata_hint(name: str) -> bool:
+    return name.casefold() in {
+        "key",
+        "kind",
+        "after",
+        "id",
+        "pointid",
+        "releaseday",
+        "releasedate",
+        "sourceurl",
+        "url",
+        "timestamp",
+    } or name.endswith(("ID", "Id", "URL", "Url", "Timestamp"))
+
+
+def _metadata_evidence(name: str, values: Sequence[str]) -> bool:
+    populated = [value for value in values if value]
+    return _metadata_hint(name) and bool(populated) and (
+        len(set(populated)) == 1
+        or all(_MACHINE_VALUE.fullmatch(value) for value in populated)
+    )
+
+
+def suggest_field_layout(samples: Sequence[RawCardContent]) -> FieldLayoutSuggestion:
+    """Propose only fields supported by repeated rendered-side evidence.
+
+    Every sample must belong to one note type/template and expose the same field
+    names. Unresolved fields remain Auto rather than being silently discarded.
+    """
+    if not samples:
+        return FieldLayoutSuggestion(None, "low", ("More cards are needed to compare.",))
+    first = samples[0]
+    identity = (first.identity.note_type_id, first.identity.template_ordinal)
+    names = tuple(field.name for field in first.fields)
+    if any(
+        (sample.identity.note_type_id, sample.identity.template_ordinal) != identity
+        or tuple(field.name for field in sample.fields) != names
+        for sample in samples
+    ):
+        raise ValueError("Samples must use the same template and source fields.")
+    if len(samples) < 2:
+        return FieldLayoutSuggestion(
+            None, "low", ("More cards are needed for a reliable layout suggestion.",), names
+        )
+    if len({tuple(field.html for field in sample.fields) for sample in samples}) < 2:
+        return FieldLayoutSuggestion(
+            None,
+            "low",
+            ("More varied cards are needed for a reliable layout suggestion.",),
+            names,
+        )
+
+    values: dict[str, list[str]] = {name: [] for name in names}
+    front_positions: dict[str, list[int]] = {name: [] for name in names}
+    back_positions: dict[str, list[int]] = {name: [] for name in names}
+    for sample in samples:
+        front = _render_document(sample.front_html, sample.front_av)
+        back = _render_document(sample.back_html, sample.back_av)
+        for field in sample.fields:
+            rendered = _render_document(field.html)
+            values[field.name].append(_suggestion_key(rendered.text))
+            if not rendered.text:
+                continue
+            front_position = _suggestion_position(rendered, front)
+            back_position = _suggestion_position(rendered, back)
+            if front_position >= 0:
+                front_positions[field.name].append(front_position)
+            if back_position >= 0:
+                back_positions[field.name].append(back_position)
+
+    duplicates: set[str] = set()
+    by_values: dict[tuple[str, ...], list[str]] = {}
+    for name in names:
+        if any(values[name]):
+            by_values.setdefault(tuple(values[name]), []).append(name)
+    for group in by_values.values():
+        if len(group) < 2:
+            continue
+        preferred = min(
+            group,
+            key=lambda name: (
+                _metadata_hint(name), names.index(name)
+            ),
+        )
+        duplicates.update(name for name in group if name != preferred)
+
+    prompt: list[str] = []
+    answer: list[str] = []
+    ignored: list[str] = []
+    unresolved: list[str] = []
+    for name in names:
+        populated = sum(bool(value) for value in values[name])
+        front_hits = len(front_positions[name])
+        back_hits = len(back_positions[name])
+        if name in duplicates:
+            ignored.append(name)
+        elif populated == 0:
+            unresolved.append(name)
+        elif front_hits == populated and front_hits >= 2:
+            prompt.append(name)
+        elif _metadata_evidence(name, values[name]) and front_hits == 0:
+            ignored.append(name)
+        elif back_hits == populated and front_hits == 0 and back_hits >= 2:
+            answer.append(name)
+        else:
+            unresolved.append(name)
+
+    if not prompt or not answer:
+        return FieldLayoutSuggestion(
+            None,
+            "low",
+            ("No clear prompt and answer fields were confirmed across the cards.",),
+            tuple(unresolved),
+        )
+    if len(unresolved) > max(3, len(names) // 3):
+        return FieldLayoutSuggestion(
+            None,
+            "low",
+            ("Too many fields could not be classified safely; keep editing manually.",),
+            tuple(unresolved),
+        )
+
+    def order(name: str, positions: dict[str, list[int]]) -> tuple[float, int]:
+        hits = positions[name]
+        return sum(hits) / len(hits), names.index(name)
+
+    prompt.sort(key=lambda name: order(name, front_positions))
+    answer.sort(key=lambda name: order(name, back_positions))
+    reasons = (
+        f"Compared {len(samples)} cards from this template.",
+        f"Matched {len(prompt)} prompt and {len(answer)} answer fields to rendered sides.",
+    )
+    if unresolved:
+        reasons += (f"Left {len(unresolved)} uncertain fields on Auto.",)
+    return FieldLayoutSuggestion(
+        TemplateFieldProfile(tuple(prompt), tuple(answer), tuple(ignored)),
+        "high",
+        reasons,
+        tuple(unresolved),
+    )
 
 
 def _shared_word_ratio(front: str, back: str) -> float:
