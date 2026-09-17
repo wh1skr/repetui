@@ -16,6 +16,7 @@ class ReviewAction(str, Enum):
     BURY = "bury"
     SUSPEND = "suspend"
     FLAG = "flag"
+    READINGS = "readings"
     SYNC = "sync"
 
     @property
@@ -30,6 +31,7 @@ class ReviewAction(str, Enum):
             ReviewAction.BURY: "Bury",
             ReviewAction.SUSPEND: "Suspend",
             ReviewAction.FLAG: "Flag",
+            ReviewAction.READINGS: "Readings",
             ReviewAction.SYNC: "Sync",
         }[self]
 
@@ -44,6 +46,7 @@ DEFAULT_REVIEW_BINDINGS: dict[ReviewAction, str] = {
     ReviewAction.BURY: "b",
     ReviewAction.SUSPEND: "x",
     ReviewAction.FLAG: "f",
+    ReviewAction.READINGS: "r",
     ReviewAction.SYNC: "s",
 }
 
@@ -96,6 +99,12 @@ class ReviewControls:
             ):
                 return cls.defaults()
             bindings[action] = key
+        if "readings" not in saved and any(
+            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.READINGS]
+            for action_name, key in saved.items()
+            if action_name != "readings"
+        ):
+            bindings[ReviewAction.READINGS] = None
         assigned = [key for key in bindings.values() if key is not None]
         if len(assigned) != len(set(assigned)):
             return cls.defaults()
@@ -150,4 +159,3 @@ class ReviewControls:
             bindings[conflict] = None
         bindings[action] = key
         return ReviewControls(tuple(bindings.items()))
-

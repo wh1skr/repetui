@@ -18,6 +18,10 @@ def test_renders_blocks_lists_and_ruby_without_browser_noise() -> None:
     assert "alert" not in rendered
 
 
+def test_standalone_plain_text_keeps_inline_readings() -> None:
+    assert html_to_text("道[みち]と<ruby>気<rt>き</rt></ruby>") == "道（みち）と気（き）"
+
+
 def test_answer_drops_duplicated_front_side() -> None:
     html = "question<hr id=answer><div>actual answer</div>"
 

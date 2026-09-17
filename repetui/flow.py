@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from rich.cells import cell_len
+from rich.style import Style
 from rich.text import Text
 
 from .backend import DueCounts, ReviewQueue
@@ -83,6 +84,25 @@ def _apply_section_underlines(
                     "underline",
                     start + position + underline_start,
                     start + position + underline_end,
+                )
+
+
+def _apply_section_furigana(
+    result: Text,
+    section: PresentationSection,
+    *,
+    start: int = 0,
+    end: int | None = None,
+) -> None:
+    region = result.plain[start:end]
+    position = region.find(section.text)
+    if position >= 0 and region.find(section.text, position + 1) < 0:
+        for reading_start, reading_end, reading in section.furigana:
+            if 0 <= reading_start < reading_end <= len(section.text):
+                result.stylize(
+                    Style(meta={"repetui_furigana": reading}),
+                    start + position + reading_start,
+                    start + position + reading_end,
                 )
 
 
@@ -173,8 +193,12 @@ def _header(
     for section in presentation.front.sections:
         if first_front:
             _apply_section_underlines(result, section, end=len(first_front))
+            _apply_section_furigana(result, section, end=len(first_front))
         if remaining_front:
             _apply_section_underlines(
+                result, section, start=len(result.plain) - len(remaining_front)
+            )
+            _apply_section_furigana(
                 result, section, start=len(result.plain) - len(remaining_front)
             )
     return result
@@ -212,6 +236,7 @@ def _is_unlabelled_section(section: PresentationSection) -> bool:
 def _styled_section(section: PresentationSection, text: str, style: str) -> Text:
     result = Text(text, style=style, overflow="fold")
     _apply_section_underlines(result, section)
+    _apply_section_furigana(result, section)
     return result
 
 

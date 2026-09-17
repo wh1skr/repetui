@@ -51,6 +51,40 @@ def real_kanji_presentation():
     )
 
 
+def test_flow_keeps_furigana_on_kanji_without_printing_readings() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
+            "道[みち]へ。",
+            "<hr id=answer><ruby>気<rt>き</rt></ruby>をつける。",
+        )
+    )
+    result = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(0, 0, 1),
+        40,
+        revealed=True,
+        sections=tuple(
+            SectionState(section, SectionMode.SHOW)
+            for section in presentation.back.sections
+        ),
+    )
+
+    assert "道へ。" in result.plain
+    assert "気をつける。" in result.plain
+    assert "みち" not in result.plain
+    assert "（き）" not in result.plain
+    assert {
+        (
+            result.plain[span.start : span.end],
+            span.style.meta["repetui_furigana"],
+        )
+        for span in result.spans
+        if "repetui_furigana" in getattr(span.style, "meta", {})
+    } == {("道", "みち"), ("気", "き")}
+
+
 def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
     presentation = real_kanji_presentation()
     states = tuple(

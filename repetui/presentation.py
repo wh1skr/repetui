@@ -12,7 +12,8 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from html.parser import HTMLParser
 from typing import Literal
 from urllib.parse import urlsplit
@@ -28,6 +29,10 @@ _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
 _SIMPLE_CLASS = re.compile(r"(?:[a-z][\w-]*)?\.([\w-]+)", re.IGNORECASE)
 _FURIGANA_HINT = re.compile(r"(?:\[[ぁ-んァ-ンー]{1,30}\]|（[ぁ-んァ-ンー]{1,30}）)")
+_INLINE_FURIGANA = re.compile(
+    r"(?P<base>[㐀-鿿豈-﫿々〆ヵヶ𠀀-𪛟]+)"
+    r"\[(?P<reading>[ぁ-ゖァ-ヺー・]+)\]"
+)
 _MACHINE_VALUE = re.compile(
     r"(?:https?://\S+|[0-9]{3,}|[0-9a-f]{12,}(?::[0-9]+)?)",
     re.IGNORECASE,
@@ -116,6 +121,7 @@ class PresentationSection:
     source_label: str | None = None
     label_is_content: bool = False
     underlines: tuple[tuple[int, int], ...] = ()
+    furigana: tuple[tuple[int, int, str], ...] = ()
 
     @property
     def display_text(self) -> str:
@@ -154,6 +160,15 @@ class _RawSection:
     kind: str
     label_parts: list[str]
     body_parts: list[str]
+
+
+@dataclass
+class _RubyCapture:
+    base_start: int
+    rt_depth: int = 0
+    rp_depth: int = 0
+    rt_base_end: int = 0
+    reading_parts: list[str] = dataclass_field(default_factory=list)
 
 
 class _RenderedHTMLParser(HTMLParser):
@@ -216,6 +231,8 @@ class _RenderedHTMLParser(HTMLParser):
         self._underline_stack: list[tuple[str, bool]] = []
         self._raw_length = 0
         self.underline_ranges: list[tuple[int, int]] = []
+        self._ruby_stack: list[_RubyCapture] = []
+        self.ruby_ranges: list[tuple[int, int, str]] = []
 
     def _emit(self, text: str) -> None:
         start = self._raw_length
@@ -278,6 +295,27 @@ class _RenderedHTMLParser(HTMLParser):
         if self._math_tag is not None:
             if tag not in self._VOID:
                 self._math_nested_depth += 1
+            return
+
+        ruby = self._ruby_stack[-1] if self._ruby_stack else None
+        if ruby is not None and ruby.rt_depth:
+            if tag not in self._VOID:
+                ruby.rt_depth += 1
+            return
+        if ruby is not None and ruby.rp_depth:
+            if tag not in self._VOID:
+                ruby.rp_depth += 1
+            return
+        if tag == "ruby":
+            self._ruby_stack.append(_RubyCapture(self._raw_length))
+            return
+        if ruby is not None and tag == "rt":
+            ruby.rt_base_end = self._raw_length
+            ruby.rt_depth = 1
+            ruby.reading_parts.clear()
+            return
+        if ruby is not None and tag == "rp":
+            ruby.rp_depth = 1
             return
 
         classes = self._classes(attributes)
@@ -359,6 +397,25 @@ class _RenderedHTMLParser(HTMLParser):
                 self._emit("]")
                 self._math_tag = None
             return
+        ruby = self._ruby_stack[-1] if self._ruby_stack else None
+        if ruby is not None and ruby.rt_depth:
+            ruby.rt_depth -= 1
+            if not ruby.rt_depth:
+                reading = _normalise("".join(ruby.reading_parts))
+                if reading and ruby.base_start < ruby.rt_base_end:
+                    self.ruby_ranges.append(
+                        (ruby.base_start, ruby.rt_base_end, reading)
+                    )
+                elif reading:
+                    self._emit(f"（{reading}）")
+                ruby.base_start = self._raw_length
+            return
+        if ruby is not None and ruby.rp_depth:
+            ruby.rp_depth -= 1
+            return
+        if ruby is not None and tag == "ruby":
+            self._ruby_stack.pop()
+            return
         if tag in self._HEADINGS and self._heading_depth:
             self._heading_depth = 0
             self._emit("\n")
@@ -378,7 +435,12 @@ class _RenderedHTMLParser(HTMLParser):
             self._emit("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self._ignored_depth:
+        if self._ignored_depth:
+            return
+        ruby = self._ruby_stack[-1] if self._ruby_stack else None
+        if ruby is not None and ruby.rt_depth:
+            ruby.reading_parts.append(data)
+        elif ruby is None or not ruby.rp_depth:
             self._emit(data)
 
 
@@ -404,6 +466,7 @@ class _RenderedDocument:
     prelude: str
     atoms: tuple[str, ...]
     underlines: tuple[tuple[int, int], ...] = ()
+    furigana: tuple[tuple[int, int, str], ...] = ()
 
 
 def _declares_underline(declarations: str) -> bool | None:
@@ -453,6 +516,74 @@ def _normalised_underlines(
     return tuple(sorted(result))
 
 
+def _normalised_ruby(
+    raw: str,
+    ranges: list[tuple[int, int, str]],
+    text: str,
+    av: tuple[AVReference, ...],
+) -> tuple[tuple[int, int, str], ...]:
+    result: list[tuple[int, int, str]] = []
+    for start, end, reading in ranges:
+        base = _normalise(raw[start:end], av)
+        if not base:
+            continue
+        after_prefix = len(_normalise(raw[:start], av))
+        position = text.find(base, after_prefix)
+        if position >= 0:
+            result.append((position, position + len(base), reading))
+    return tuple(result)
+
+
+def _without_inline_furigana(text: str) -> str:
+    return _INLINE_FURIGANA.sub(lambda match: match.group("base"), text)
+
+
+def _deannotate_furigana(
+    text: str,
+    underlines: tuple[tuple[int, int], ...],
+    ruby: tuple[tuple[int, int, str], ...],
+) -> tuple[str, tuple[tuple[int, int], ...], tuple[tuple[int, int, str], ...]]:
+    matches = tuple(_INLINE_FURIGANA.finditer(text))
+    if not matches:
+        return text, underlines, ruby
+
+    removed = tuple((match.end("base"), match.end()) for match in matches)
+
+    def position_after_removal(position: int) -> int:
+        skipped = 0
+        for start, end in removed:
+            if position <= start:
+                break
+            if position < end:
+                return start - skipped
+            skipped += end - start
+        return position - skipped
+
+    clean = _without_inline_furigana(text)
+    adjusted_underlines = tuple(
+        (new_start, new_end)
+        for start, end in underlines
+        for new_start, new_end in (
+            (position_after_removal(start), position_after_removal(end)),
+        )
+        if new_start < new_end
+    )
+    readings = [
+        (position_after_removal(start), position_after_removal(end), reading)
+        for start, end, reading in ruby
+        if position_after_removal(start) < position_after_removal(end)
+    ]
+    readings.extend(
+        (
+            position_after_removal(match.start("base")),
+            position_after_removal(match.end("base")),
+            match.group("reading"),
+        )
+        for match in matches
+    )
+    return clean, adjusted_underlines, tuple(sorted(set(readings)))
+
+
 def _promote_structural_labels(html: str) -> str:
     html = _UNDERLINED_HEADING.sub(lambda match: f"<h6>{match.group('label')}</h6>", html)
     return _INLINE_LABEL.sub(
@@ -470,26 +601,32 @@ def _render_document(
     parser.feed(_promote_structural_labels(html))
     parser.close()
     raw_text = "".join(parser.parts)
-    text = _normalise(raw_text, av)
+    annotated_text = _normalise(raw_text, av)
+    text, underlines, furigana = _deannotate_furigana(
+        annotated_text,
+        _normalised_underlines(raw_text, parser.underline_ranges, annotated_text, av),
+        _normalised_ruby(raw_text, parser.ruby_ranges, annotated_text, av),
+    )
     sections = tuple(
         (
             section.kind,
-            _normalise("".join(section.label_parts), av),
-            _normalise("".join(section.body_parts), av),
+            _without_inline_furigana(_normalise("".join(section.label_parts), av)),
+            _without_inline_furigana(_normalise("".join(section.body_parts), av)),
         )
         for section in parser.sections
     )
     atoms = tuple(
         atom
         for part in parser.parts
-        if (atom := _normalise(part, av))
+        if (atom := _without_inline_furigana(_normalise(part, av)))
     )
     return _RenderedDocument(
         text,
         sections,
-        _normalise("".join(parser.prelude), av),
+        _without_inline_furigana(_normalise("".join(parser.prelude), av)),
         atoms,
-        _normalised_underlines(raw_text, parser.underline_ranges, text, av),
+        underlines,
+        furigana,
     )
 
 
@@ -547,6 +684,35 @@ def _unique_id(prefix: str, value: str, seen: dict[str, int]) -> str:
     return base if seen[base] == 1 else f"{base}:{seen[base]}"
 
 
+def _with_document_marks(
+    section: PresentationSection,
+    document: _RenderedDocument,
+    offset: int | None = None,
+) -> PresentationSection:
+    if not section.text:
+        return section
+    if offset is None:
+        offset = document.text.find(section.text)
+        if offset < 0 or document.text.find(section.text, offset + 1) >= 0:
+            return section
+    if document.text[offset : offset + len(section.text)] != section.text:
+        return section
+    end = offset + len(section.text)
+    return replace(
+        section,
+        underlines=tuple(
+            (start - offset, stop - offset)
+            for start, stop in document.underlines
+            if offset <= start < stop <= end
+        ),
+        furigana=tuple(
+            (start - offset, stop - offset, reading)
+            for start, stop, reading in document.furigana
+            if offset <= start < stop <= end
+        ),
+    )
+
+
 def _structural_sections(side: str, document: _RenderedDocument) -> tuple[PresentationSection, ...]:
     if not document.structural_sections:
         return ()
@@ -576,7 +742,16 @@ def _structural_sections(side: str, document: _RenderedDocument) -> tuple[Presen
                     )
                 )
     joined = "\n\n".join(section.display_text for section in result)
-    return tuple(result) if _reconcile_key(joined) == _reconcile_key(document.text) else ()
+    if _reconcile_key(joined) != _reconcile_key(document.text):
+        return ()
+    marked: list[PresentationSection] = []
+    cursor = 0
+    for section in result:
+        offset = document.text.find(section.text, cursor)
+        marked.append(_with_document_marks(section, document, offset) if offset >= 0 else section)
+        if offset >= 0:
+            cursor = offset + len(section.text)
+    return tuple(marked)
 
 
 def _field_sections(
@@ -616,7 +791,14 @@ def _field_sections(
         for text in (document.text[start:end],)
     )
     joined = "\n\n".join(section.display_text for section in sections)
-    return sections if _reconcile_key(joined) == _reconcile_key(document.text) else ()
+    return (
+        tuple(
+            _with_document_marks(section, document, start)
+            for section, (start, _end, _name) in zip(sections, matches, strict=True)
+        )
+        if _reconcile_key(joined) == _reconcile_key(document.text)
+        else ()
+    )
 
 
 def _with_source_labels(
@@ -637,15 +819,7 @@ def _with_source_labels(
             ),
             None,
         )
-        result.append(
-            PresentationSection(
-                section.id,
-                section.text,
-                section.label,
-                source_label,
-                section.label_is_content,
-            )
-        )
+        result.append(replace(section, source_label=source_label))
     return tuple(result)
 
 
@@ -668,7 +842,17 @@ def _present_side(
         return CardSide(sections)
 
     label = "Question" if side == "front" else "Answer"
-    return CardSide((PresentationSection(f"{side}:fallback", document.text, label),))
+    return CardSide(
+        (
+            PresentationSection(
+                f"{side}:fallback",
+                document.text,
+                label,
+                underlines=document.underlines,
+                furigana=document.furigana,
+            ),
+        )
+    )
 
 
 def _strip_answer_html(back_html: str) -> tuple[str, bool]:
@@ -690,6 +874,31 @@ def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
     ):
         remainder = back_text[len(front_text) :].lstrip("\n ─")
         if remainder:
+            if len(back.sections) == 1:
+                section = back.sections[0]
+                offset = section.text.find(remainder)
+                if offset >= 0:
+                    end = offset + len(remainder)
+                    return CardSide(
+                        (
+                            replace(
+                                section,
+                                id="back:fallback",
+                                text=remainder,
+                                label="Answer",
+                                underlines=tuple(
+                                    (start - offset, stop - offset)
+                                    for start, stop in section.underlines
+                                    if offset <= start < stop <= end
+                                ),
+                                furigana=tuple(
+                                    (start - offset, stop - offset, reading)
+                                    for start, stop, reading in section.furigana
+                                    if offset <= start < stop <= end
+                                ),
+                            ),
+                        )
+                    )
             return CardSide((PresentationSection("back:fallback", remainder, "Answer"),))
     return back
 
@@ -1001,6 +1210,7 @@ def _field_side(
                 text,
                 source_label=name,
                 underlines=rendered.underlines,
+                furigana=rendered.furigana,
             )
         )
     if sections:
@@ -1096,6 +1306,10 @@ def present_card(
 
 
 def html_to_text(html: str, *, answer: bool = False) -> str:
-    """Render standalone Anki HTML with the card-presentation policy."""
+    """Render standalone Anki HTML with readings inline for plain-text consumers."""
     source = _strip_answer_html(html)[0] if answer else html
-    return _render_document(source).text or "(empty card)"
+    document = _render_document(source)
+    text = document.text
+    for _start, end, reading in sorted(set(document.furigana), reverse=True):
+        text = f"{text[:end]}（{reading}）{text[end:]}"
+    return text or "(empty card)"

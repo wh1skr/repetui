@@ -15,7 +15,15 @@ def test_review_controls_start_with_terminal_defaults() -> None:
     assert controls.binding(ReviewAction.BURY) == "b"
     assert controls.binding(ReviewAction.SUSPEND) == "x"
     assert controls.binding(ReviewAction.FLAG) == "f"
+    assert controls.binding(ReviewAction.READINGS) == "r"
     assert controls.binding(ReviewAction.SYNC) == "s"
+
+
+def test_existing_r_binding_is_preserved_when_readings_action_is_added() -> None:
+    controls = ReviewControls.from_saved({"again": "r", "sync": "s"})
+
+    assert controls.binding(ReviewAction.AGAIN) == "r"
+    assert controls.binding(ReviewAction.READINGS) is None
 
 
 def test_binding_conflict_requires_confirmation_and_unbinds_displaced_action() -> None:
@@ -40,4 +48,3 @@ def test_selected_action_can_restore_its_default_binding() -> None:
     restored = customized.with_default(ReviewAction.UNDO)
 
     assert restored.binding(ReviewAction.UNDO) == "u"
-

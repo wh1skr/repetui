@@ -170,7 +170,9 @@ def test_represents_ruby_lists_tables_code_math_typed_answers_and_media() -> Non
         )
     )
 
-    assert "言葉（ことば）" in card.front.text
+    assert "言葉" in card.front.text
+    assert "ことば" not in card.front.text
+    assert card.front.sections[0].furigana == ((0, 2, "ことば"),)
     assert "[type answer]" in card.front.text
     assert "• first" in card.back.text
     assert "A │ B" in card.back.text
@@ -178,6 +180,50 @@ def test_represents_ruby_lists_tables_code_math_typed_answers_and_media() -> Non
     assert "[math: x^2 + y^2]" in card.back.text
     assert "[image: memory diagram]" in card.back.text
     assert "[audio: voice.mp3]" in card.back.text
+
+
+def test_bracket_and_ruby_furigana_keep_each_reading_on_its_base() -> None:
+    card = present_card(
+        raw(
+            "道[みち]と<ruby>道<rt>どう</rt></ruby>を読む。",
+            "<hr id=answer><u>気[き]をつける</u>",
+        )
+    )
+
+    assert card.front.text == "道と道を読む。"
+    assert card.front.sections[0].furigana == (
+        (0, 1, "みち"),
+        (2, 3, "どう"),
+    )
+    assert card.back.text == "気をつける"
+    assert card.back.sections[0].furigana == ((0, 1, "き"),)
+    assert card.back.sections[0].underlines == ((0, 5),)
+
+
+def test_grammar_field_profile_hides_reading_annotations_but_keeps_emphasis() -> None:
+    sentence = "道[みち]を 間違[まちが]えたような 気[き]がします。"
+    card = present_card(
+        RawCardContent(
+            IDENTITY,
+            sentence,
+            f'<span class="grammar-phrase">{sentence}</span>',
+            (
+                SourceField("Sentence", sentence),
+                SourceField("Answer", f'<span class="grammar-phrase">{sentence}</span>'),
+            ),
+            card_css=".grammar-phrase { text-decoration: underline; }",
+        ),
+        TemplateFieldProfile(("Sentence",), ("Answer",)),
+    )
+
+    assert card.front.text == "道を 間違えたような 気がします。"
+    assert [reading for _start, _end, reading in card.front.sections[0].furigana] == [
+        "みち",
+        "まちが",
+        "き",
+    ]
+    assert card.back.text == card.front.text
+    assert card.back.sections[0].underlines == ((0, len(card.back.text)),)
 
 
 def test_resolves_indexed_anki_av_and_html_source_fallbacks() -> None:

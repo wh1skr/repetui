@@ -63,6 +63,7 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Review | `1`–`4` | Again, Hard, Good, Easy |
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
+| Review | `r` | Show this card's readings without a mouse |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
 | Card-field setup | `Space`, `J` / `K`, `a`, `p`, `v`, `Enter` | Change role, reorder, suggest a layout, preview, flip question/answer, save |
 | Decks / review | `s` | Sync with AnkiWeb |
@@ -101,9 +102,13 @@ Esc/Enter returns to study; press `s` to retry and make a fresh choice.
 
 Anki cards are HTML documents designed for a browser. `repetui` translates
 their rendered content into terminal-native text while preserving ordered text,
-headings, ruby readings, lists, tables, code, math labels, and media references
-where possible. Unknown markup falls back to its visible text rather than being
-silently discarded.
+headings, lists, tables, code, math labels, and media references where possible.
+Ruby and Japanese `漢字[かんじ]` readings stay attached to their base text instead
+of appearing after every kanji. Hover over the base text to see its reading;
+press `r` during review to open a keyboard-accessible reading list. The reading
+list shows only content already visible on that side of the card. Mouse hover
+depends on terminal mouse support. Unknown markup falls back to its visible
+text rather than being silently discarded.
 
 If a script-heavy template cannot be separated safely, `repetui` derives a
 field-based terminal layout and opens a one-time setup. Assign fields to Prompt,
@@ -119,8 +124,9 @@ they do not execute card JavaScript or promise to understand every card type.
 Repeated instructions may be left on Auto, and separately styled prompt and
 answer fields are kept distinct when the rendered sides support that choice.
 The field-based view preserves underlines from `<u>`, inline text decoration,
-and simple underlined class rules in the card stylesheet. Other CSS and hover
-effects are not reproduced; check the live preview before saving.
+and simple underlined class rules in the card stylesheet. Other card-template
+CSS and JavaScript hover effects are not reproduced; check the live preview
+before saving.
 Auto fields appear only when that field's content is present on the
 rendered card, so optional fields can start being used later without another
 setup. The mapping is remembered per note type and card template and can be
