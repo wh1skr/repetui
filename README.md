@@ -64,7 +64,7 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
-| Card-field setup | `Space`, `J` / `K`, `Enter` | Change role, reorder, save |
+| Card-field setup | `Space`, `J` / `K`, `a`, `p`, `v`, `Enter` | Change role, reorder, suggest a layout, preview, flip question/answer, save |
 | Decks / review | `s` | Sync with AnkiWeb |
 | Anywhere | `?` | Help, controls, and section settings |
 | Anywhere | `q` | Quit |
@@ -108,7 +108,20 @@ silently discarded.
 If a script-heavy template cannot be separated safely, `repetui` derives a
 field-based terminal layout and opens a one-time setup. Assign fields to Prompt,
 Answer, Auto, or Ignore with `Space`, reorder them with `J` / `K`, and save with
-`Enter`. Auto fields appear only when that field's content is present on the
+`Enter`. The live preview updates before you save: `v` flips between question
+and answer, and `p` swaps between fields and preview in a narrow terminal.
+Widen the terminal to see both side by side. `Escape` discards unsaved edits.
+Press `a` to suggest a layout from several cards of the same template. A
+high-confidence suggestion changes only the draft; `Enter` is still required
+to save it. If the cards are too ambiguous, the current draft is kept for
+manual editing. Suggestions inspect Anki's rendered sides and source fields;
+they do not execute card JavaScript or promise to understand every card type.
+Repeated instructions may be left on Auto, and separately styled prompt and
+answer fields are kept distinct when the rendered sides support that choice.
+The field-based view preserves underlines from `<u>`, inline text decoration,
+and simple underlined class rules in the card stylesheet. Other CSS and hover
+effects are not reproduced; check the live preview before saving.
+Auto fields appear only when that field's content is present on the
 rendered card, so optional fields can start being used later without another
 setup. The mapping is remembered per note type and card template and can be
 edited under `?` → `Sections` → `card fields`. This adapts complex card types

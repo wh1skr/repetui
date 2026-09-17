@@ -13,6 +13,7 @@ from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
     SourceField,
+    TemplateFieldProfile,
     present_card,
 )
 
@@ -289,6 +290,145 @@ def test_current_queue_underlines_only_its_count(
     ]
 
     assert underlined == [underlined_count]
+
+
+def test_formatted_answer_keeps_inline_underline_without_template_filler() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
+            "<div>荷物が多すぎて、バッグに入りそうもない。</div>"
+            "<p>What is happening?</p><p>Readings on hover or tap.</p>",
+            "<div>荷物が多すぎて、バッグに入り<u>そうもない</u>。</div>"
+            "<p>It is <u>very unlikely</u> to fit.</p>",
+            (
+                SourceField("Sentence", "荷物が多すぎて、バッグに入りそうもない。"),
+                SourceField("Question", "What is happening?"),
+                SourceField("Answer", "荷物が多すぎて、バッグに入り<u>そうもない</u>。"),
+                SourceField("Translation", "It is <u>very unlikely</u> to fit."),
+            ),
+        ),
+        TemplateFieldProfile(
+            ("Sentence",),
+            ("Answer", "Translation"),
+            ("Question",),
+        ),
+    )
+    result = compose_review(
+        presentation,
+        "Grammar",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=tuple(
+            SectionState(section, SectionMode.SHOW)
+            for section in presentation.back.sections
+        ),
+    )
+
+    underlined = {
+        result.plain[span.start : span.end]
+        for span in result.spans
+        if "underline" in str(span.style)
+    }
+    assert {"そうもない", "very unlikely"} <= underlined
+    assert "What is happening?" not in result.plain
+    assert "Readings on hover or tap." not in result.plain
+
+
+def test_grammar_css_class_underlines_only_the_emphasized_phrases() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
+            "荷物が多すぎて、バッグに入りそうもない。",
+            "荷物が多すぎて、バッグに入りそうもない。 It is very unlikely to fit.",
+            (
+                SourceField("Sentence", "荷物が多すぎて、バッグに入りそうもない。"),
+                SourceField(
+                    "Answer",
+                    '荷物が多すぎて、バッグに入り<span class="grammar-phrase">'
+                    "そうもない</span>。",
+                ),
+                SourceField(
+                    "Translation",
+                    'It is <span class="grammar-meaning">very unlikely</span> to fit.',
+                ),
+            ),
+            card_css=(
+                ".grammar-phrase,.grammar-meaning {"
+                "text-decoration: underline; text-decoration-color: #aaa787}"
+            ),
+        ),
+        TemplateFieldProfile(("Sentence",), ("Answer", "Translation")),
+    )
+    result = compose_review(
+        presentation,
+        "Grammar",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=True,
+        sections=tuple(
+            SectionState(section, SectionMode.SHOW)
+            for section in presentation.back.sections
+        ),
+    )
+
+    underlined = {
+        result.plain[span.start : span.end]
+        for span in result.spans
+        if "underline" in str(span.style)
+    }
+    assert underlined == {"そうもない", "very unlikely"}
+
+
+def test_prompt_field_underline_survives_compact_header() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(1, "Basic", 0, "Card 1"),
+            "<u>important</u> prompt",
+            "answer",
+            (
+                SourceField("Prompt", "<u>important</u> prompt"),
+                SourceField("Answer", "answer"),
+            ),
+        ),
+        TemplateFieldProfile(("Prompt",), ("Answer",)),
+    )
+
+    result = compose_review(
+        presentation,
+        "Deck",
+        DueCounts(1, 0, 0),
+        40,
+        revealed=False,
+    )
+
+    assert [
+        result.plain[span.start : span.end]
+        for span in result.spans
+        if "underline" in str(span.style)
+    ] == ["important"]
+
+
+def test_prompt_underline_does_not_style_matching_due_count() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(1, "Basic", 0, "Card 1"),
+            "<u>1</u>",
+            "answer",
+            (SourceField("Prompt", "<u>1</u>"), SourceField("Answer", "answer")),
+        ),
+        TemplateFieldProfile(("Prompt",), ("Answer",)),
+    )
+
+    result = compose_review(
+        presentation, "Deck", DueCounts(1, 0, 0), 40, revealed=False
+    )
+
+    assert [
+        (span.start, result.plain[span.start : span.end])
+        for span in result.spans
+        if "underline" in str(span.style)
+    ] == [(0, "1")]
 
 
 def test_expanded_inline_label_does_not_repeat_its_heading() -> None:

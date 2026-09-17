@@ -179,11 +179,22 @@ class AnkiBackend:
 
         queued_card = queued.cards[0]
         card = collection.get_card(queued_card.card.id)
+        raw_content = self._raw_content_for_card(card)
+        self._current = (card, queued_card.states)
+        return ReviewCard(
+            id=card.id,
+            presentation=present_card(raw_content),
+            queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
+            raw_content=raw_content,
+        )
+
+    @staticmethod
+    def _raw_content_for_card(card: Any) -> RawCardContent:
         rendered = card.render_output()
         note_type = card.note_type()
         template = card.template()
         note = card.note()
-        raw_content = RawCardContent(
+        return RawCardContent(
             identity=CardTemplateIdentity(
                 note_type_id=int(note_type["id"]),
                 note_type_name=str(note_type["name"]),
@@ -195,14 +206,42 @@ class AnkiBackend:
             fields=tuple(SourceField(name, html) for name, html in note.items()),
             front_av=_av_references(rendered.question_av_tags),
             back_av=_av_references(rendered.answer_av_tags),
+            card_css=str(note_type.get("css") or ""),
         )
-        self._current = (card, queued_card.states)
-        return ReviewCard(
-            id=card.id,
-            presentation=present_card(raw_content),
-            queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
-            raw_content=raw_content,
-        )
+
+    def sample_cards(
+        self,
+        identity: CardTemplateIdentity,
+        *,
+        exclude_card_id: int,
+        limit: int = 4,
+    ) -> tuple[RawCardContent, ...]:
+        """Read a few newer and older cards without touching the review queue."""
+        collection = self._require_collection()
+        count = max(0, min(limit, 8))
+        if count == 0:
+            return ()
+        try:
+            ids: list[int] = []
+            for direction, part in (("DESC", (count + 1) // 2), ("ASC", count // 2)):
+                if part == 0:
+                    continue
+                rows = collection.db.list(
+                    "SELECT c.id FROM cards c JOIN notes n ON n.id = c.nid "
+                    "WHERE n.mid = ? AND c.ord = ? AND c.id != ? "
+                    f"ORDER BY c.id {direction} LIMIT ?",
+                    identity.note_type_id,
+                    identity.template_ordinal,
+                    exclude_card_id,
+                    part,
+                )
+                ids.extend(int(card_id) for card_id in rows if card_id not in ids)
+            return tuple(
+                self._raw_content_for_card(collection.get_card(card_id))
+                for card_id in ids
+            )
+        except Exception as exc:
+            raise BackendError("Could not inspect sample cards.") from exc
 
     def answer(self, rating: int) -> None:
         collection = self._require_collection()

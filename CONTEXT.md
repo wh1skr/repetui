@@ -69,7 +69,18 @@ after reveal.
   setup assigns ordered Prompt, Answer, Auto, or Ignore roles without executing
   card JavaScript or adding note-type-specific rules. Auto fields appear only
   when their content is detected on that card, allowing optional fields to
-  evolve without another configuration pass.
+  evolve without another configuration pass. Field roles and order update an
+  unsaved preview through the same presentation and Flow composition modules
+  as review. Narrow panes toggle between fields and preview; wide panes show
+  both. A separate explicit Suggest layout action compares several cards of
+  the same template and proposes only field roles supported by repeated
+  rendered-side evidence. Repeated instructions remain Auto when a varying
+  prompt is available; separately styled prompt and answer fields stay distinct
+  only with side-specific markup evidence. Ambiguous fields remain Auto, and
+  low-confidence results do not overwrite the draft. A narrow, non-executing
+  HTML/CSS subset preserves inline underlines in the terminal without trying
+  to reproduce Anki's full browser styling. Save applies the draft; Escape
+  discards it.
 
 ### Settings
 

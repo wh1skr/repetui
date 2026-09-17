@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from repetui.backend import AnkiBackend, DueCounts, ReviewQueue
+import pytest
+
+from repetui.backend import AnkiBackend, BackendError, DueCounts, ReviewQueue
 
 
 class FakeRendered:
@@ -45,6 +47,20 @@ class FakeCard:
 
     def start_timer(self) -> None:
         self.timer_started = True
+
+
+def test_raw_card_keeps_note_type_css_for_terminal_emphasis() -> None:
+    class StyledCard(FakeCard):
+        def note_type(self) -> dict[str, object]:
+            return {
+                "id": 123,
+                "name": "Grammar",
+                "css": ".target { text-decoration: underline; }",
+            }
+
+    raw = AnkiBackend._raw_content_for_card(StyledCard())
+
+    assert raw.card_css == ".target { text-decoration: underline; }"
 
 
 class FakeScheduler:
@@ -178,6 +194,52 @@ def test_review_uses_anki_rendering_and_scheduler() -> None:
     assert collection.sched.fake_card.timer_started is True
     assert collection.sched.answered is not None
     assert service.next_card() is None
+
+
+def test_sample_cards_reads_same_template_without_touching_scheduler() -> None:
+    service, collection = backend()
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def list_ids(query: str, *params: int) -> list[int]:
+        calls.append((query, params))
+        return [101] if "DESC" in query else [102]
+
+    collection.db = SimpleNamespace(list=list_ids)
+    requested: list[int] = []
+
+    def get_card(card_id: int) -> FakeCard:
+        requested.append(card_id)
+        return FakeCard()
+
+    collection.get_card = get_card
+    identity = service._raw_content_for_card(FakeCard()).identity
+
+    samples = service.sample_cards(identity, exclude_card_id=99, limit=4)
+
+    assert len(samples) == 2
+    assert all(sample.identity == identity for sample in samples)
+    assert requested == [101, 102]
+    assert [params for _query, params in calls] == [
+        (123, 0, 99, 2),
+        (123, 0, 99, 2),
+    ]
+    assert collection.sched.queue_calls == 0
+    assert service._current is None
+
+
+def test_sample_card_read_failure_is_a_recoverable_backend_error() -> None:
+    service, collection = backend()
+
+    def fail_list(_query: str, *_params: int) -> list[int]:
+        raise OSError("private database detail")
+
+    collection.db = SimpleNamespace(list=fail_list)
+    identity = service._raw_content_for_card(FakeCard()).identity
+
+    with pytest.raises(BackendError, match="Could not inspect sample cards"):
+        service.sample_cards(identity, exclude_card_id=99)
+    assert collection.sched.queue_calls == 0
+    assert service._current is None
 
 
 def test_undo_routes_through_anki_and_invalidates_the_displayed_card() -> None:

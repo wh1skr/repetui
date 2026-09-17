@@ -75,6 +75,7 @@ class FakeBackend:
         self.flags: list[int] = []
         self.fail_operation: str | None = None
         self.fail_refresh_after_operation = False
+        self.sample_contents: tuple[RawCardContent, ...] = ()
 
     def open(self) -> None:
         self.is_open = True
@@ -106,6 +107,15 @@ class FakeBackend:
             presentation = present_card(content)
             return ReviewCard(42, presentation, raw_content=content)
         return None
+
+    def sample_cards(
+        self,
+        identity: CardTemplateIdentity,
+        *,
+        exclude_card_id: int,
+        limit: int = 4,
+    ) -> tuple[RawCardContent, ...]:
+        return self.sample_contents[:limit]
 
     def answer(self, rating: int) -> None:
         self.rating = rating
@@ -262,6 +272,50 @@ async def test_review_uses_the_saved_field_profile_for_a_dynamic_template(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_grammar_profile_keeps_answer_underlines_at_40x6(tmp_path) -> None:
+    identity = CardTemplateIdentity(73, "Grammar", 0, "Meaning")
+    content = RawCardContent(
+        identity,
+        "<div>日本語の文</div><p>What is happening?</p>",
+        '<div>日本語の<span class="grammar-phrase">文</span></div>'
+        '<p><span class="grammar-meaning">Meaning</span> here.</p>',
+        (
+            SourceField("Sentence", "日本語の文"),
+            SourceField("Question", "What is happening?"),
+            SourceField("Answer", '日本語の<span class="grammar-phrase">文</span>'),
+            SourceField(
+                "Translation",
+                '<span class="grammar-meaning">Meaning</span> here.',
+            ),
+        ),
+        card_css=(
+            ".grammar-phrase,.grammar-meaning{text-decoration:underline}"
+        ),
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    preferences.set_field_profile(
+        identity,
+        TemplateFieldProfile(("Sentence",), ("Answer", "Translation"), ("Question",)),
+    )
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert "What is happening?" not in rendered_text(review)
+
+        await pilot.press("enter")
+        card = review.query_one("#card", Static).render()
+        underlined = {
+            card.plain[span.start : span.end]
+            for span in card.spans
+            if "underline" in str(span.style)
+        }
+        assert underlined == {"文", "Meaning"}
+
+
+@pytest.mark.asyncio
 async def test_field_profile_answer_sections_keep_saved_fold_behavior(tmp_path) -> None:
     preferences = JsonPreferences(tmp_path / "preferences.json")
     content = dynamic_card()
@@ -322,6 +376,300 @@ async def test_dynamic_template_offers_one_time_field_setup_at_40x6(tmp_path) ->
             ("Question",),
             ("Answer",),
         )
+
+
+@pytest.mark.asyncio
+async def test_field_setup_live_preview_tracks_unsaved_role_changes(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        fields = setup.query_one("#field-profile-fields")
+        preview = setup.query_one("#field-profile-preview-pane")
+        preview_card = setup.query_one("#field-profile-preview-card", Static)
+        assert fields.display is True
+        assert preview.display is True
+        assert "actual question" in str(preview_card.render())
+        assert "actual answer" not in str(preview_card.render())
+
+        await pilot.press("v")
+        assert "actual answer" in str(preview_card.render())
+
+        await pilot.press("j", "j", "space")
+        assert "internal-id" in str(preview_card.render())
+        assert preferences.field_profile(content.identity) is None
+
+
+@pytest.mark.asyncio
+async def test_field_setup_live_preview_uses_saved_section_modes(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    preferences.set_mode(content.identity, "back:field:answer", SectionMode.FOLD)
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("v")
+
+        preview = str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+        assert "› Answer" in preview
+        assert "actual answer" not in preview
+
+
+@pytest.mark.asyncio
+async def test_field_setup_live_preview_uses_current_review_counts(tmp_path) -> None:
+    app, _ = make_app(
+        tmp_path,
+        dynamic_card(),
+        counts=DueCounts(1, 0, 3),
+    )
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        preview = str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+        assert "1/0/3" in preview
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("layout", "expected"),
+    (
+        (AnswerLayout.COMPACT, "one  ·  two"),
+        (AnswerLayout.STACKED, "one  · First\ntwo  · Second"),
+    ),
+)
+async def test_field_setup_live_preview_uses_saved_answer_layout(
+    tmp_path, layout, expected
+) -> None:
+    identity = CardTemplateIdentity(902, "Multi", 0, "Card 1")
+    content = RawCardContent(
+        identity,
+        "question",
+        "<hr id=answer>one two",
+        (
+            SourceField("Question", "question"),
+            SourceField("First", "one"),
+            SourceField("Second", "two"),
+        ),
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    preferences.set_field_profile(
+        identity, TemplateFieldProfile(("Question",), ("First", "Second"))
+    )
+    preferences.set_answer_layout(identity, layout)
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter", "?", "G", "space")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("v")
+
+        preview = str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+        assert expected in preview
+
+
+@pytest.mark.asyncio
+async def test_field_setup_switches_between_fields_and_preview_at_40x6(tmp_path) -> None:
+    app, _ = make_app(tmp_path, dynamic_card())
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        fields = setup.query_one("#field-profile-fields")
+        preview = setup.query_one("#field-profile-preview-pane")
+        assert fields.display is True
+        assert preview.display is False
+
+        await pilot.press("p")
+        assert fields.display is False
+        assert preview.display is True
+        assert preview.region == (0, 1, 40, 4)
+
+        await pilot.resize_terminal(100, 14)
+        await pilot.pause()
+        assert fields.display is True
+        assert preview.display is True
+
+
+@pytest.mark.asyncio
+async def test_field_setup_invalid_draft_cannot_be_saved(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("space")
+
+        preview = str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+        assert "choose at least one prompt and answer field" in preview.lower()
+
+        await pilot.press("enter")
+        assert app.screen is setup
+        assert preferences.field_profile(content.identity) is None
+
+
+@pytest.mark.asyncio
+async def test_field_setup_cancel_discards_modified_draft(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, _ = make_app(tmp_path, content, preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "space", "p", "v")
+        preview = str(setup.query_one("#field-profile-preview-card", Static).render())
+        assert "internal-id" in preview
+
+        await pilot.press("escape")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert preferences.field_profile(content.identity) is None
+        assert "internal-id" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_field_setup_preview_does_not_read_backend_on_draft_changes(
+    tmp_path, monkeypatch
+) -> None:
+    app, backend = make_app(tmp_path, dynamic_card())
+
+    async with app.run_test(size=(100, 14)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        def unavailable_counts() -> DueCounts:
+            raise BackendError("collection intentionally unavailable")
+
+        monkeypatch.setattr(backend, "counts", unavailable_counts)
+        await pilot.press("j", "j", "space", "v")
+
+        preview = str(setup.query_one("#field-profile-preview-card", Static).render())
+        assert "internal-id" in preview
+
+
+@pytest.mark.asyncio
+async def test_suggest_layout_updates_only_draft_until_saved_at_40x6(tmp_path) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    content = dynamic_card()
+    app, backend = make_app(tmp_path, content, preferences)
+
+    def variant(index: int) -> RawCardContent:
+        return RawCardContent(
+            content.identity,
+            content.front_html.replace("actual question", f"question {index}"),
+            content.back_html.replace("actual question", f"question {index}").replace(
+                "actual answer", f"answer {index}"
+            ),
+            (
+                SourceField("Identifier", f"internal-{index}"),
+                SourceField("Question", f"question {index}"),
+                SourceField("Answer", f"answer {index}"),
+            ),
+        )
+
+    backend.sample_contents = (variant(1), variant(2))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "space")
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+
+        await pilot.press("a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "auto"
+        assert preferences.field_profile(content.identity) is None
+        await pilot.press("p")
+        assert "internal-id" not in str(
+            setup.query_one("#field-profile-preview-card", Static).render()
+        )
+
+        await pilot.press("enter")
+        assert preferences.field_profile(content.identity) == TemplateFieldProfile(
+            ("Question",), ("Answer",)
+        )
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_suggestion_preserves_manual_draft(tmp_path) -> None:
+    content = dynamic_card()
+    app, backend = make_app(tmp_path, content)
+    assert backend.sample_contents == ()
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+        await pilot.press("j", "j", "space", "a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+        assert app.screen is setup
+
+
+@pytest.mark.asyncio
+async def test_failed_suggestion_read_preserves_manual_draft(tmp_path, monkeypatch) -> None:
+    app, backend = make_app(tmp_path, dynamic_card())
+
+    def unavailable_samples(*_args, **_kwargs):
+        raise BackendError("collection intentionally unavailable")
+
+    monkeypatch.setattr(backend, "sample_cards", unavailable_samples)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, TemplateFieldSetupScreen)
+
+        await pilot.press("j", "j", "space", "a")
+
+        rows = tuple(setup.query("FieldProfileItem"))
+        assert rows[2].role.value == "prompt"
+        assert app.screen is setup
 
 
 @pytest.mark.asyncio
@@ -445,7 +793,18 @@ async def test_field_setup_reorders_answer_fields_before_saving(tmp_path) -> Non
         await pilot.pause()
         assert isinstance(app.screen, TemplateFieldSetupScreen)
 
-        await pilot.press("j", "j", "K", "enter")
+        await pilot.press("j", "j", "K", "p", "v")
+
+        preview = str(
+            app.screen.query_one("#field-profile-preview-card", Static).render()
+        )
+        assert preview.index("supporting details") < preview.index("actual answer")
+        assert preferences.field_profile(content.identity) == TemplateFieldProfile(
+            ("Question",),
+            ("Answer", "Details"),
+        )
+
+        await pilot.press("enter")
 
         assert preferences.field_profile(content.identity) == TemplateFieldProfile(
             ("Question",),
@@ -826,7 +1185,7 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, DeckScreen)
-        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6b"
+        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6"
         assert screen.query_one("#deck-header").region.y == 0
         assert len(screen.query("#logo")) == 0
         assert len(screen.query(".quiet-footer")) == 0

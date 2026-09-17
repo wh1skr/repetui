@@ -15,7 +15,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
@@ -58,12 +58,14 @@ from .preferences import (
     SectionMode,
 )
 from .presentation import (
+    CardPresentation,
     CardTemplateIdentity,
     PresentationSection,
     SourceField,
     TemplateFieldProfile,
     default_field_profile,
     present_card,
+    suggest_field_layout,
 )
 from .recovery import CollectionOwner, InstanceControl, find_owner, force_close, request_close
 from .sync import (
@@ -669,6 +671,8 @@ class FieldProfileItem(RepetuiListItem):
 class TemplateFieldSetupScreen(Screen[None]):
     """One-time, editable mapping from Anki fields to terminal roles."""
 
+    SIDE_BY_SIDE_MIN_WIDTH = 80
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=False),
         Binding("j", "down", "Down", show=False),
@@ -676,6 +680,10 @@ class TemplateFieldSetupScreen(Screen[None]):
         Binding("space", "cycle_role", "Role", show=False),
         Binding("J", "move_down", "Move down", show=False),
         Binding("K", "move_up", "Move up", show=False),
+        Binding("p", "toggle_pane", "Fields/preview", show=False),
+        Binding("tab", "toggle_pane", "Fields/preview", show=False),
+        Binding("v", "toggle_preview_side", "Question/answer", show=False),
+        Binding("a", "suggest_layout", "Suggest layout", show=False),
         Binding("enter", "save", "Save", show=False, priority=True),
     ]
 
@@ -687,6 +695,8 @@ class TemplateFieldSetupScreen(Screen[None]):
         super().__init__()
         self.review = review
         self.profile = profile
+        self.preview_revealed = False
+        self.preview_only = False
 
     def compose(self) -> ComposeResult:
         assert self.review.card is not None
@@ -713,10 +723,20 @@ class TemplateFieldSetupScreen(Screen[None]):
             )
             rows.append(FieldProfileItem(field, role))
         yield Vertical(
-            Static("adapt card fields", id="field-profile-header"),
-            ListView(*rows, id="field-profile-fields"),
+            Static(id="field-profile-header"),
+            Horizontal(
+                ListView(*rows, id="field-profile-fields"),
+                Vertical(
+                    Static(id="field-profile-preview-header"),
+                    VerticalScroll(
+                        Static(id="field-profile-preview-card"),
+                        id="field-profile-preview-scroll",
+                    ),
+                    id="field-profile-preview-pane",
+                ),
+                id="field-profile-body",
+            ),
             Static(
-                "space role · J/K order · enter save",
                 id="field-profile-footer",
                 classes="surface-footer",
             ),
@@ -728,6 +748,48 @@ class TemplateFieldSetupScreen(Screen[None]):
         if fields.children:
             fields.index = 0
         fields.focus()
+        self._refresh_responsive_layout()
+        self.call_after_refresh(self._refresh_preview)
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._refresh_responsive_layout()
+            self.call_after_refresh(self._refresh_preview)
+
+    @property
+    def _side_by_side(self) -> bool:
+        return self.size.width >= self.SIDE_BY_SIDE_MIN_WIDTH
+
+    def _showing_preview_only(self) -> bool:
+        return not self._side_by_side and self.preview_only
+
+    def _refresh_responsive_layout(self) -> None:
+        fields = self.query_one("#field-profile-fields", ListView)
+        preview = self.query_one("#field-profile-preview-pane", Vertical)
+        preview_header = self.query_one("#field-profile-preview-header", Static)
+        fields.display = self._side_by_side or not self.preview_only
+        preview.display = self._side_by_side or self.preview_only
+        preview_header.display = self._side_by_side
+
+        side = "answer" if self.preview_revealed else "question"
+        preview_header.update(
+            Text(f"preview · {side}", style="#aaa49b", no_wrap=True)
+        )
+        if self._side_by_side:
+            header = "adapt card fields"
+            footer = "space role · J/K order · a suggest · v q/a · enter save"
+        elif self.preview_only:
+            header = f"preview · {side} · widen for split"
+            footer = "j/k scroll · v q/a · p fields · enter"
+        else:
+            header = "adapt fields · J/K order · widen pane"
+            footer = "space role · a suggest · p view · enter"
+        self.query_one("#field-profile-header", Static).update(
+            Text(header, style="#eee9e0", no_wrap=True)
+        )
+        self.query_one("#field-profile-footer", Static).update(
+            Text(footer, style="#817d76", no_wrap=True)
+        )
 
     def _view(self) -> ListView:
         return self.query_one("#field-profile-fields", ListView)
@@ -739,19 +801,109 @@ class TemplateFieldSetupScreen(Screen[None]):
         item = view.children[view.index]
         return item if isinstance(item, FieldProfileItem) else None
 
+    def _draft_profile(self) -> TemplateFieldProfile | None:
+        rows = tuple(self.query(FieldProfileItem))
+        profile = TemplateFieldProfile(
+            tuple(row.field.name for row in rows if row.role is FieldRole.PROMPT),
+            tuple(row.field.name for row in rows if row.role is FieldRole.ANSWER),
+            tuple(row.field.name for row in rows if row.role is FieldRole.IGNORE),
+        )
+        return profile if profile.prompt_fields and profile.answer_fields else None
+
+    def _preview_states(
+        self, presentation: CardPresentation
+    ) -> tuple[SectionState, ...]:
+        identity = presentation.identity
+        modes = tuple(
+            self.review.repetui.preferences.mode(identity, section.id)
+            for section in presentation.back.sections
+        )
+        folded_ids = tuple(
+            section.id
+            for section, mode in zip(presentation.back.sections, modes, strict=True)
+            if mode is SectionMode.FOLD
+        )
+        selected_fold = (
+            folded_ids[self.review.selected_folded % len(folded_ids)]
+            if folded_ids
+            else None
+        )
+        return tuple(
+            SectionState(
+                section=section,
+                mode=mode,
+                selected=section.id == selected_fold,
+            )
+            for section, mode in zip(presentation.back.sections, modes, strict=True)
+        )
+
+    def _refresh_preview(self) -> None:
+        if not self.is_mounted:
+            return
+        preview = self.query_one("#field-profile-preview-card", Static)
+        profile = self._draft_profile()
+        if profile is None:
+            preview.update(
+                Text(
+                    "[?] choose at least one prompt and answer field",
+                    style="#d7b85a",
+                )
+            )
+            return
+        assert self.review.card is not None
+        raw = self.review.card.raw_content
+        assert raw is not None
+        presentation = present_card(raw, profile)
+        width = preview.size.width
+        if width <= 0:
+            width = self.size.width // 2 if self._side_by_side else self.size.width
+        preview.update(
+            compose_review(
+                presentation,
+                self.review.deck.name,
+                self.review._displayed_counts,
+                max(width, 1),
+                revealed=self.preview_revealed,
+                sections=(
+                    self._preview_states(presentation)
+                    if self.preview_revealed
+                    else ()
+                ),
+                current_queue=self.review.card.queue,
+                answer_layout=self.review.repetui.preferences.answer_layout(
+                    presentation.identity
+                ),
+            )
+        )
+
     def action_down(self) -> None:
+        if self._showing_preview_only():
+            self.query_one(
+                "#field-profile-preview-scroll", VerticalScroll
+            ).scroll_down(animate=False)
+            return
         self._view().action_cursor_down()
 
     def action_up(self) -> None:
+        if self._showing_preview_only():
+            self.query_one(
+                "#field-profile-preview-scroll", VerticalScroll
+            ).scroll_up(animate=False)
+            return
         self._view().action_cursor_up()
 
     def action_cycle_role(self) -> None:
+        if self._showing_preview_only():
+            return
         item = self._selected()
         if item is not None:
             item.role = item.role.next
             item.refresh_role()
+            self._refresh_preview()
 
     def _move(self, offset: int) -> None:
+        if self._showing_preview_only():
+            return
         view = self._view()
         if view.index is None:
             return
@@ -763,6 +915,7 @@ class TemplateFieldSetupScreen(Screen[None]):
         if isinstance(current, FieldProfileItem) and isinstance(other, FieldProfileItem):
             current.swap_with(other)
             view.index = destination
+            self._refresh_preview()
 
     def action_move_down(self) -> None:
         self._move(1)
@@ -770,14 +923,76 @@ class TemplateFieldSetupScreen(Screen[None]):
     def action_move_up(self) -> None:
         self._move(-1)
 
-    def action_save(self) -> None:
-        rows = tuple(self.query(FieldProfileItem))
-        profile = TemplateFieldProfile(
-            tuple(row.field.name for row in rows if row.role is FieldRole.PROMPT),
-            tuple(row.field.name for row in rows if row.role is FieldRole.ANSWER),
-            tuple(row.field.name for row in rows if row.role is FieldRole.IGNORE),
+    def action_toggle_pane(self) -> None:
+        if self._side_by_side:
+            return
+        self.preview_only = not self.preview_only
+        self._refresh_responsive_layout()
+        if self.preview_only:
+            self.query_one("#field-profile-preview-scroll", VerticalScroll).focus()
+        else:
+            self._view().focus()
+        self.call_after_refresh(self._refresh_preview)
+
+    def action_toggle_preview_side(self) -> None:
+        self.preview_revealed = not self.preview_revealed
+        self._refresh_responsive_layout()
+        self._refresh_preview()
+
+    def action_suggest_layout(self) -> None:
+        assert self.review.card is not None
+        raw = self.review.card.raw_content
+        assert raw is not None
+        try:
+            samples = (raw,) + self.review.repetui.backend.sample_cards(
+                raw.identity,
+                exclude_card_id=self.review.card.id,
+                limit=4,
+            )
+            suggestion = suggest_field_layout(samples)
+        except (BackendError, ValueError):
+            self.notify("Could not inspect this template's cards.", severity="warning")
+            return
+        if suggestion.profile is None:
+            self.notify(
+                f"No safe suggestion. {suggestion.reasons[0]}",
+                severity="warning",
+            )
+            return
+
+        by_name = {row.field.name: row.field for row in self.query(FieldProfileItem)}
+        profile = suggestion.profile
+        assigned = (
+            profile.prompt_fields + profile.answer_fields + profile.ignored_fields
         )
-        if not profile.prompt_fields or not profile.answer_fields:
+        order = assigned + tuple(name for name in by_name if name not in assigned)
+        selected = self._selected()
+        selected_name = selected.field.name if selected is not None else None
+        rows = tuple(self.query(FieldProfileItem))
+        for row, name in zip(rows, order, strict=True):
+            row.field = by_name[name]
+            row.role = (
+                FieldRole.PROMPT
+                if name in profile.prompt_fields
+                else FieldRole.ANSWER
+                if name in profile.answer_fields
+                else FieldRole.IGNORE
+                if name in profile.ignored_fields
+                else FieldRole.AUTO
+            )
+            row.refresh_role()
+        if selected_name is not None:
+            self._view().index = order.index(selected_name)
+        self._refresh_preview()
+        unresolved = len(suggestion.unresolved_fields)
+        detail = f"; {unresolved} left Auto" if unresolved else ""
+        self.notify(
+            f"Suggested from {len(samples)} cards{detail}. Enter saves; Esc discards."
+        )
+
+    def action_save(self) -> None:
+        profile = self._draft_profile()
+        if profile is None:
             self.notify("Choose at least one prompt and answer field.", severity="warning")
             return
         try:
@@ -1404,6 +1619,7 @@ class ReviewScreen(Screen[None]):
         self.revealed = False
         self.expanded_sections: set[str] = set()
         self.selected_folded = 0
+        self._displayed_counts = deck.counts
         self._rendered_card_width = 0
         self._rating_feedback: int | None = None
         self._rating_feedback_timer: Timer | None = None
@@ -1517,6 +1733,7 @@ class ReviewScreen(Screen[None]):
         if self.repetui.syncing:
             return
         counts = self.repetui.backend.counts()
+        self._displayed_counts = counts
         content = self.query_one("#card", Static)
         actions = self.query_one("#review-actions", Static)
         if self.card is None:
@@ -2183,15 +2400,47 @@ class RepetuiApp(App[None]):
         background: #111416;
     }
 
+    #field-profile-body {
+        width: 100%;
+        height: 1fr;
+    }
+
     #field-profile-header {
         height: 1;
         color: #eee9e0;
     }
 
     #field-profile-fields {
-        height: 1fr;
+        width: 1fr;
+        height: 100%;
         background: #111416;
         scrollbar-size-vertical: 1;
+    }
+
+    #field-profile-preview-pane {
+        width: 1fr;
+        height: 100%;
+        background: #111416;
+    }
+
+    #field-profile-preview-header {
+        width: 100%;
+        height: 1;
+        color: #aaa49b;
+    }
+
+    #field-profile-preview-scroll {
+        width: 100%;
+        height: 1fr;
+        background: #111416;
+        scrollbar-gutter: stable;
+        scrollbar-size-vertical: 1;
+    }
+
+    #field-profile-preview-card {
+        width: 100%;
+        height: auto;
+        min-height: 1;
     }
 
     #field-profile-footer {
