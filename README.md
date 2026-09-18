@@ -63,7 +63,7 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Review | `1`–`4` | Again, Hard, Good, Easy |
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
-| Review | `r` | Show this card's readings without a mouse |
+| Review | `r` | Toggle bracketed readings directly on the card |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
 | Card-field setup | `Space`, `J` / `K`, `a`, `p`, `v`, `Enter` | Change role, reorder, suggest a layout, preview, flip question/answer, save |
 | Decks / review | `s` | Sync with AnkiWeb |
@@ -104,11 +104,10 @@ Anki cards are HTML documents designed for a browser. `repetui` translates
 their rendered content into terminal-native text while preserving ordered text,
 headings, lists, tables, code, math labels, and media references where possible.
 Ruby and Japanese `漢字[かんじ]` readings stay attached to their base text instead
-of appearing after every kanji. Hover over the base text to see its reading;
-press `r` during review to open a keyboard-accessible reading list. The reading
-list shows only content already visible on that side of the card. Mouse hover
-depends on terminal mouse support. Unknown markup falls back to its visible
-text rather than being silently discarded.
+of appearing after every kanji by default. Press `r` during review to show
+them inline as `漢字[かんじ]`; press `r` again to hide them. Only visible card
+content is annotated—unrevealed or hidden answers stay hidden. Unknown markup
+falls back to its visible text rather than being silently discarded.
 
 If a script-heavy template cannot be separated safely, `repetui` derives a
 field-based terminal layout and opens a one-time setup. Assign fields to Prompt,

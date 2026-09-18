@@ -16,7 +16,6 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
@@ -194,7 +193,7 @@ _HELP_TEXT = (
     "  b        bury\n"
     "  x        suspend\n"
     "  f        flag (then 0–7)\n"
-    "  r        readings for this card\n"
+    "  r        toggle inline readings\n"
     "  j / k    scroll and select folds\n"
     "  g / G    top / bottom\n"
     "  s        sync\n"
@@ -1580,70 +1579,10 @@ class SettingsScreen(Screen[None]):
 class ReviewContent(Static):
     """Card document that reports its gutter-adjusted width to the screen."""
 
-    def on_mouse_move(self, event: events.MouseMove) -> None:
-        reading = event.style.meta.get("repetui_furigana") if event.style else None
-        screen = self.screen
-        if isinstance(screen, ReviewScreen):
-            screen.show_furigana(
-                reading if isinstance(reading, str) else None,
-                event.screen_x,
-                event.screen_y,
-            )
-
-    def on_leave(self, _event: events.Leave) -> None:
-        screen = self.screen
-        if isinstance(screen, ReviewScreen):
-            screen.hide_furigana()
-
     def on_resize(self) -> None:
         screen = self.screen
         if isinstance(screen, ReviewScreen):
             screen.renderable_width_changed(self.size.width)
-
-
-class ReadingsScreen(Screen[None]):
-    """Keyboard-accessible readings without adding noise to the card."""
-
-    BINDINGS = [
-        Binding("escape", "back", "Back", show=False),
-        Binding("j", "scroll_down", "Down", show=False),
-        Binding("k", "scroll_up", "Up", show=False),
-        Binding("g", "scroll_top", "Top", show=False),
-        Binding("G", "scroll_bottom", "Bottom", show=False),
-    ]
-
-    def __init__(self, readings: tuple[tuple[str, str], ...]) -> None:
-        super().__init__()
-        self.readings = readings
-
-    def compose(self) -> ComposeResult:
-        rows = Text(overflow="fold")
-        for index, (base, reading) in enumerate(self.readings):
-            if index:
-                rows.append("\n")
-            rows.append(base, style="bold #eee9e0")
-            rows.append("  →  ", style="#817d76")
-            rows.append(reading, style="#c6d8d0")
-        with Vertical(id="readings-layout"):
-            yield Static("readings", id="readings-header")
-            with VerticalScroll(id="readings-scroll"):
-                yield Static(rows, id="readings-list")
-            yield Static("j/k scroll · Esc back", id="readings-footer")
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-    def action_scroll_down(self) -> None:
-        self.query_one("#readings-scroll", VerticalScroll).scroll_down(animate=False)
-
-    def action_scroll_up(self) -> None:
-        self.query_one("#readings-scroll", VerticalScroll).scroll_up(animate=False)
-
-    def action_scroll_top(self) -> None:
-        self.query_one("#readings-scroll", VerticalScroll).scroll_home(animate=False)
-
-    def action_scroll_bottom(self) -> None:
-        self.query_one("#readings-scroll", VerticalScroll).scroll_end(animate=False)
 
 
 class ReviewScreen(Screen[None]):
@@ -1680,6 +1619,7 @@ class ReviewScreen(Screen[None]):
         self.deck = deck
         self.card: ReviewCard | None = None
         self.revealed = False
+        self.show_readings = False
         self.expanded_sections: set[str] = set()
         self.selected_folded = 0
         self._displayed_counts = deck.counts
@@ -1691,33 +1631,12 @@ class ReviewScreen(Screen[None]):
     def repetui(self) -> RepetuiApp:
         return cast("RepetuiApp", self.app)
 
-    @property
-    def layers(self) -> tuple[str, ...]:
-        return (*super().layers, "furigana")
-
     def compose(self) -> ComposeResult:
         yield Vertical(
             VerticalScroll(ReviewContent(id="card"), id="card-scroll"),
             Static(id="review-actions"),
             id="review-layout",
         )
-        yield Static(id="furigana-tip")
-
-    def show_furigana(self, reading: str | None, x: int, y: int) -> None:
-        tip = self.query_one("#furigana-tip", Static)
-        if not reading:
-            tip.display = False
-            return
-        card_region = self.query_one("#card-scroll", VerticalScroll).region
-        tip.update(reading)
-        tip.absolute_offset = Offset(
-            min(max(x, 0), max(0, self.size.width - cell_len(reading) - 2)),
-            y + 1 if y + 1 < card_region.bottom else max(0, y - 1),
-        )
-        tip.display = True
-
-    def hide_furigana(self) -> None:
-        self.query_one("#furigana-tip", Static).display = False
 
     def on_mount(self) -> None:
         self.repetui.backend.begin_review(self.deck.id)
@@ -1747,9 +1666,9 @@ class ReviewScreen(Screen[None]):
                 presentation=present_card(self.card.raw_content, profile),
             )
         self.revealed = False
+        self.show_readings = False
         self.expanded_sections.clear()
         self.selected_folded = 0
-        self.hide_furigana()
         self._refresh_view()
         if self.card is not None and self.card.presentation.suggested_profile is not None:
             self.call_after_refresh(self._offer_field_setup)
@@ -1817,7 +1736,6 @@ class ReviewScreen(Screen[None]):
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
         if self.repetui.syncing:
             return
-        self.hide_furigana()
         counts = self.repetui.backend.counts()
         self._displayed_counts = counts
         content = self.query_one("#card", Static)
@@ -1843,6 +1761,7 @@ class ReviewScreen(Screen[None]):
             answer_layout=self.repetui.preferences.answer_layout(
                 self.card.presentation.identity
             ),
+            show_readings=self.show_readings,
         )
         self._refresh_action_row(actions)
         content.update(flow)
@@ -1918,26 +1837,8 @@ class ReviewScreen(Screen[None]):
     def action_readings(self) -> None:
         if self._busy() or self.card is None:
             return
-        sections = self.card.presentation.front.sections
-        if self.revealed:
-            sections += tuple(
-                state.section
-                for state in self._section_states()
-                if state.mode is SectionMode.SHOW or state.expanded
-            )
-        readings = tuple(
-            dict.fromkeys(
-                (section.text[start:end], reading)
-                for section in sections
-                for start, end, reading in section.furigana
-                if 0 <= start < end <= len(section.text)
-            )
-        )
-        if readings:
-            self.hide_furigana()
-            self.app.push_screen(ReadingsScreen(readings))
-        else:
-            self.notify("No readings on this side.")
+        self.show_readings = not self.show_readings
+        self._refresh_view(reset_scroll=False)
 
     def action_toggle_fold(self) -> None:
         if not self.revealed:
@@ -2440,31 +2341,9 @@ class RepetuiApp(App[None]):
         height: 100%;
     }
 
-    #review-layout, #readings-layout {
+    #review-layout {
         width: 100%;
         height: 100%;
-    }
-
-    #readings-header, #readings-footer {
-        height: 1;
-    }
-
-    #readings-header {
-        color: #eee9e0;
-    }
-
-    #readings-footer {
-        color: #817d76;
-    }
-
-    #readings-scroll {
-        height: 1fr;
-        scrollbar-gutter: stable;
-        scrollbar-size-vertical: 1;
-    }
-
-    #readings-list {
-        height: auto;
     }
 
     CompletionCelebrationScreen, #completion-art {
@@ -2512,17 +2391,6 @@ class RepetuiApp(App[None]):
     #card {
         height: auto;
         min-height: 1;
-    }
-
-    #furigana-tip {
-        layer: furigana;
-        display: none;
-        width: auto;
-        height: 1;
-        padding: 0 1;
-        background: #293034;
-        color: #c6d8d0;
-        constrain: inside;
     }
 
     #review-actions {

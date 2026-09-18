@@ -85,6 +85,48 @@ def test_flow_keeps_furigana_on_kanji_without_printing_readings() -> None:
     } == {("道", "みち"), ("気", "き")}
 
 
+def test_flow_can_show_furigana_inline_without_leaking_hidden_answer() -> None:
+    presentation = present_card(
+        RawCardContent(
+            CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
+            "道[みち]へ。",
+            "<hr id=answer><u><ruby>気<rt>き</rt></ruby></u>をつける。",
+        )
+    )
+    front = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(0, 0, 1),
+        40,
+        revealed=False,
+        show_readings=True,
+    )
+    assert "道[みち]へ。" in front.plain
+    assert "気[き]" not in front.plain
+
+    answer = compose_review(
+        presentation,
+        "Japanese",
+        DueCounts(0, 0, 1),
+        40,
+        revealed=True,
+        sections=tuple(
+            SectionState(section, SectionMode.SHOW)
+            for section in presentation.back.sections
+        ),
+        show_readings=True,
+    )
+    assert "道[みち]へ。" in answer.plain
+    assert "気[き]をつける。" in answer.plain
+    assert "道[みち][みち]" not in answer.plain
+    assert "気[き][き]" not in answer.plain
+    assert {
+        answer.plain[span.start : span.end]
+        for span in answer.spans
+        if "underline" in str(span.style)
+    } == {"気"}
+
+
 def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:
     presentation = real_kanji_presentation()
     states = tuple(

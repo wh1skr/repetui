@@ -24,7 +24,6 @@ from repetui.app import (
     ErrorScreen,
     FlagSelectionPill,
     OperationStatusPill,
-    ReadingsScreen,
     RepetuiApp,
     ReviewScreen,
     SettingsScreen,
@@ -317,7 +316,7 @@ async def test_grammar_profile_keeps_answer_underlines_at_40x6(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_furigana_tooltip_follows_the_hovered_kanji_at_40x6(tmp_path) -> None:
+async def test_readings_toggle_inline_on_current_card_at_40x6(tmp_path) -> None:
     content = RawCardContent(
         CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
         "道[みち]へ。",
@@ -330,64 +329,42 @@ async def test_furigana_tooltip_follows_the_hovered_kanji_at_40x6(tmp_path) -> N
         review = app.screen
         assert isinstance(review, ReviewScreen)
         card = review.query_one("#card", Static)
-        assert "道へ。" in str(card.render())
-        assert "みち" not in str(card.render())
-
-        await pilot.hover(card, offset=(0, 0))
-        await pilot.pause()
-        tip = review.query_one("#furigana-tip", Static)
-        assert tip.display
-        assert str(tip.render()) == "みち"
-        assert tip.region.y == 1
-
-        await pilot.hover(card, offset=(2, 0))
-        await pilot.pause()
-        assert not tip.display
+        assert "道[みち]へ。" not in str(card.render())
 
         await pilot.press("r")
-        readings = app.screen
-        assert isinstance(readings, ReadingsScreen)
-        assert readings.query_one("#readings-layout").region == (0, 0, 40, 6)
-        assert "道  →  みち" in str(readings.query_one("#readings-list").render())
-        assert "気" not in str(readings.query_one("#readings-list").render())
+        assert app.screen is review
+        assert "道[みち]へ。" in str(card.render())
+        assert "気[き]" not in str(card.render())
 
-        await pilot.press("escape", "enter")
-        await pilot.hover(card, offset=(0, 1))
-        await pilot.pause()
-        assert tip.display
-        assert str(tip.render()) == "き"
+        await pilot.press("enter")
+        assert "気[き]をつける。" in str(card.render())
 
         await pilot.press("r")
-        readings = app.screen
-        assert isinstance(readings, ReadingsScreen)
-        assert "気  →  き" in str(readings.query_one("#readings-list").render())
+        assert app.screen is review
+        assert "道[みち]へ。" not in str(card.render())
+        assert "気[き]をつける。" not in str(card.render())
 
 
 @pytest.mark.asyncio
-async def test_hover_switches_between_adjacent_furigana_readings(tmp_path) -> None:
+async def test_hover_does_not_open_a_furigana_overlay(tmp_path) -> None:
     content = RawCardContent(
         CardTemplateIdentity(73, "Grammar", 0, "Meaning"),
-        "道[みち]と気[き]",
+        "道[みち]へ。",
         "answer",
     )
     app, _ = make_app(tmp_path, content)
 
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press("enter")
-        card = app.screen.query_one("#card", Static)
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        card = review.query_one("#card", Static)
         await pilot.hover(card, offset=(0, 0))
         await pilot.pause()
-        tip = app.screen.query_one("#furigana-tip", Static)
-        assert tip.display
-        assert str(tip.render()) == "みち"
-
-        await pilot.hover(card, offset=(4, 0))
-        await pilot.pause()
-        assert tip.display
-        assert str(tip.render()) == "き"
-
-        await pilot.press("enter")
-        assert not tip.display
+        assert app.screen is review
+        assert "道へ。" in str(card.render())
+        assert "みち" not in str(card.render())
+        assert not review.query("#furigana-tip")
 
 
 @pytest.mark.asyncio

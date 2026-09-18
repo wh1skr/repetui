@@ -57,9 +57,9 @@ permanent help line competes with card content. Ratings consume one row only
 after reveal.
 
 - Card content always wraps and remains scrollable.
-- Ruby and Japanese bracket furigana are metadata on the base text, revealed
-  on terminal mouse hover. `r` opens a keyboard reading list without exposing
-  hidden or unrevealed answer sections.
+- Ruby and Japanese bracket furigana are metadata on the base text. `r` toggles
+  bracketed readings inline on the current card without exposing hidden or
+  unrevealed answer sections; no mouse hover or separate reading screen is used.
 - Metadata disappears in this order as width shrinks: deck, template name,
   then total due. The coloured split stays on row one whenever it physically
   fits, and prompt content then wraps below without truncation.

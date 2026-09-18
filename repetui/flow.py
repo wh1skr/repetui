@@ -333,6 +333,19 @@ def _back(
     return result
 
 
+def _with_inline_readings(result: Text) -> Text:
+    """Insert bracketed readings after their base text, preserving Rich styles."""
+    positions: set[tuple[int, str]] = set()
+    for span in result.spans:
+        meta = getattr(span.style, "meta", None)
+        reading = meta.get("repetui_furigana") if isinstance(meta, dict) else None
+        if isinstance(reading, str) and 0 <= span.start < span.end <= len(result.plain):
+            positions.add((span.end, reading))
+    for end, reading in sorted(positions, reverse=True):
+        result = result[:end] + Text(f"[{reading}]", style="#aaa49b") + result[end:]
+    return result
+
+
 def compose_review(
     presentation: CardPresentation,
     deck_name: str,
@@ -343,13 +356,14 @@ def compose_review(
     sections: tuple[SectionState, ...] = (),
     current_queue: ReviewQueue | None = None,
     answer_layout: AnswerLayout = AnswerLayout.COMPACT,
+    show_readings: bool = False,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
     result = _header(presentation, deck_name, counts, width, current_queue)
     if revealed:
         result.append("\n")
         result.append_text(_back(sections, answer_layout))
-    return result
+    return _with_inline_readings(result) if show_readings else result
 
 
 def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:
