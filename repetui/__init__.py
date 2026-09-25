@@ -1,3 +1,3 @@
 """repetui: a calm terminal interface for Anki review."""
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
