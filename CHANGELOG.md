@@ -4,6 +4,24 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+## 0.1.7 - 2026-09-25
+
+Maintenance release: bug fixes and internal cleanup.
+
+- Fixed review durations recorded as nearly zero by starting Anki's timer when
+  a card is presented.
+- Fixed sync skipping media when cards were already up to date. A failed
+  collection close now blocks transfer, and reopen failures are shown clearly.
+- Fixed a crash when full sync removes the active deck; review returns to the
+  refreshed deck list.
+- Kept active layout, section, add-on, and deck expansion settings unchanged
+  when saving fails. Layout, section, and deck errors have retryable UI feedback.
+- Preserved underlines and furigana through repeated text, whitespace
+  normalization, compact and multiline cards. `r` now toggles bracketed
+  readings inline on the current card.
+- Consolidated collection lifecycle, card-text transformations, and preference
+  persistence in focused modules. No preference migration is needed.
+
 ## 0.1.6b - 2026-09-16
 
 - Prevented review-screen timers and resizes from reading the Anki collection
