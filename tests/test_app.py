@@ -156,17 +156,19 @@ def make_app(
     counts: DueCounts | None = None,
     syncer: Callable[[ProfilePaths], SyncOutcome] | None = None,
     add_ons: tuple[AddOnDefinition, ...] | None = None,
+    full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] | None = None,
 ) -> tuple[RepetuiApp, FakeBackend]:
     backend = FakeBackend(card_content, decks, counts)
     profile = ProfilePaths(Path("/tmp"), "test", Path("/tmp/collection.anki2"))
     store = preferences or JsonPreferences(
         (tmp_path or Path("/tmp")) / "preferences.json"
     )
-    app = (
-        RepetuiApp(backend, profile, store, add_ons=add_ons)
-        if syncer is None
-        else RepetuiApp(backend, profile, store, syncer, add_ons=add_ons)
-    )
+    options = {"add_ons": add_ons}
+    if syncer is not None:
+        options["syncer"] = syncer
+    if full_syncer is not None:
+        options["full_syncer"] = full_syncer
+    app = RepetuiApp(backend, profile, store, **options)
     return app, backend
 
 
@@ -1367,6 +1369,31 @@ async def test_enter_reviews_selected_parent_and_leaf(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_deck_expansion_recovers_from_write_failure(tmp_path, monkeypatch) -> None:
+    decks = [
+        Deck(1, "Japanese", 0, DueCounts(0, 0, 1)),
+        Deck(2, "Japanese::Kanji", 1, DueCounts(0, 0, 1)),
+    ]
+    app, _ = make_app(tmp_path, decks=decks)
+    notifications = []
+    monkeypatch.setattr(app, "notify", lambda message, **kwargs: notifications.append(message))
+    async with app.run_test(size=(40, 6)) as pilot:
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        with monkeypatch.context() as failure:
+            failure.setattr(Path, "replace", fail_replace)
+            await pilot.press("tab")
+
+        assert isinstance(app.screen, DeckScreen)
+        assert [item.deck.id for item in app.screen.query(DeckItem)] == [1]
+        assert not app.preferences.expanded_deck_ids(app.profile)
+        assert notifications == ["Deck expansion not saved. Try again."]
+        await pilot.press("tab")
+        assert [item.deck.id for item in app.screen.query(DeckItem)] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_tree_state_survives_review_return_restart_and_backend_refresh(
     tmp_path,
 ) -> None:
@@ -2332,6 +2359,41 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("section", [False, True])
+async def test_section_settings_recover_from_write_failure(
+    tmp_path, monkeypatch, section
+) -> None:
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, _ = make_app(tmp_path, preferences=preferences)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        if section:
+            await pilot.press("j")
+        identity = settings.card.identity
+
+        def fail_replace(_source, _destination):
+            raise OSError("disk unavailable")
+
+        with monkeypatch.context() as failure:
+            failure.setattr(Path, "replace", fail_replace)
+            await pilot.press("space")
+
+        assert app.screen is settings
+        assert "not saved" in str(settings.query_one("#settings-footer").render())
+        assert preferences.answer_layout(identity) is AnswerLayout.STACKED
+        section_id = settings.card.presentation.back.sections[0].id
+        assert preferences.mode(identity, section_id) is SectionMode.SHOW
+        await pilot.press("space")
+        if section:
+            assert preferences.mode(identity, section_id) is SectionMode.FOLD
+        else:
+            assert preferences.answer_layout(identity) is AnswerLayout.COMPACT
+
+
+@pytest.mark.asyncio
 async def test_action_feedback_duration_cycles_in_settings_and_recovers_from_write_failure(
     tmp_path, monkeypatch
 ) -> None:
@@ -2941,6 +3003,24 @@ async def test_resize_does_not_read_closed_review_backend_during_sync(
 
 
 @pytest.mark.asyncio
+async def test_sync_removing_active_deck_returns_to_refreshed_decks(tmp_path) -> None:
+    def replace_decks(_profile):
+        backend._decks = [Deck(2, "Replacement", 0, DueCounts(0, 0, 1))]
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app, backend = make_app(tmp_path, syncer=replace_decks)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "s")
+        await pilot.pause(1.2)
+        assert isinstance(app.screen, DeckScreen)
+        assert not app.syncing
+        assert [item.deck.id for item in app.screen.query(DeckItem)] == [2]
+        await pilot.press("enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert app.screen.deck.id == 2
+
+
+@pytest.mark.asyncio
 async def test_review_refreshes_once_after_held_sync_popup_closes(tmp_path) -> None:
     started = Event()
     release = Event()
@@ -3546,9 +3626,6 @@ async def test_full_sync_conflict_stays_visible_and_can_be_dismissed_and_retried
 @pytest.mark.asyncio
 @pytest.mark.parametrize("direction", list(FullSyncDirection))
 async def test_full_sync_requires_exact_typed_confirmation(tmp_path, direction):
-    app, backend = make_app(
-        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
-    )
     calls = []
 
     def resolve(profile, selected):
@@ -3556,7 +3633,10 @@ async def test_full_sync_requires_exact_typed_confirmation(tmp_path, direction):
         calls.append((profile, selected))
         return SyncOutcome(SyncStatus.SYNCED)
 
-    app.full_syncer = resolve
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED),
+        full_syncer=resolve,
+    )
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press("s")
         await pilot.pause(0.1)
@@ -3588,9 +3668,11 @@ async def test_full_sync_requires_exact_typed_confirmation(tmp_path, direction):
 
 @pytest.mark.asyncio
 async def test_cancel_full_sync_confirmation_never_transfers(tmp_path):
-    app, _ = make_app(tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED))
     calls = []
-    app.full_syncer = lambda *args: calls.append(args)
+    app, _ = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED),
+        full_syncer=lambda *args: calls.append(args),
+    )
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press("s")
         await pilot.pause(0.1)
@@ -3602,16 +3684,16 @@ async def test_cancel_full_sync_confirmation_never_transfers(tmp_path):
 
 @pytest.mark.asyncio
 async def test_failed_backup_can_be_dismissed_and_retried_with_fresh_confirmation(tmp_path):
-    app, backend = make_app(
-        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED)
-    )
     calls = []
 
     def fail_backup(profile, direction):
         calls.append(direction)
         return SyncOutcome(SyncStatus.BACKUP_FAILED)
 
-    app.full_syncer = fail_backup
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.FULL_SYNC_REQUIRED),
+        full_syncer=fail_backup,
+    )
     async with app.run_test(size=(40, 6)) as pilot:
         await pilot.press("s")
         await pilot.pause(0.1)

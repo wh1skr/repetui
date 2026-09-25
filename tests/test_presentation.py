@@ -17,6 +17,37 @@ IDENTITY = CardTemplateIdentity(
 )
 
 
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [("<u>猫</u>と猫", ((0, 1),)), ("猫と<u>猫</u>", ((2, 3),))],
+)
+def test_repeated_text_keeps_underline_on_its_original_occurrence(html, expected) -> None:
+    card = present_card(RawCardContent(IDENTITY, html, "answer"))
+    assert card.front.text == "猫と猫"
+    assert card.front.sections[0].underlines == expected
+
+
+def test_structural_label_compaction_keeps_marks_without_matching_rendered_text() -> None:
+    card = present_card(raw(
+        "question",
+        "<h2>Example:</h2><u>猫[ねこ]</u><h2>Example:</h2>猫[びょう]",
+    ))
+    first, second = card.back.sections
+    assert first.text == second.text == "Example: 猫"
+    assert first.underlines == ((9, 10),)
+    assert second.underlines == ()
+    assert first.furigana == ((9, 10, "ねこ"),)
+    assert second.furigana == ((9, 10, "びょう"),)
+
+
+def test_heading_body_retains_partial_underline_spanning_section_edges() -> None:
+    card = present_card(raw("question", "<u><h2>First</h2>猫<h2>Second</h2>犬</u>"))
+    first, second = card.back.sections
+    assert first.text == "猫"
+    assert second.text == "犬"
+    assert first.underlines == second.underlines == ((0, 1),)
+
+
 def raw(front: str, back: str, *fields: SourceField) -> RawCardContent:
     return RawCardContent(IDENTITY, front, back, fields)
 

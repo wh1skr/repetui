@@ -7,7 +7,7 @@ import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
-from threading import Event, Lock, Thread
+from threading import Thread
 from typing import Protocol, cast
 
 from rich.cells import cell_len
@@ -50,6 +50,7 @@ from .flow import (
     compose_review,
     section_name,
 )
+from .lifecycle import CollectionLifecycle, SyncRunResult
 from .preferences import (
     ActionFeedbackDuration,
     AnswerLayout,
@@ -72,7 +73,6 @@ from .sync import (
     FullSyncDirection,
     SyncOutcome,
     SyncStatus,
-    failed_sync_outcome,
     full_sync_profile,
     sync_profile,
 )
@@ -159,12 +159,6 @@ class CompletionCelebrationScreen(Screen[None]):
     def _dismiss_effect(self) -> None:
         if self.is_mounted:
             cast("RepetuiApp", self.app).close_completion_celebration(self)
-
-
-@dataclass(frozen=True)
-class SyncRunResult:
-    outcome: SyncOutcome
-    reopen_error: str | None = None
 
 
 class SyncFinished(Message):
@@ -301,12 +295,6 @@ class StartupRecoveryScreen(ErrorScreen):
         self._cancelled = False
         self.run_worker(self._recover(mode), group="startup-recovery")
 
-    def _try_open(self, app: RepetuiApp) -> None:
-        with app._backend_lock:
-            if app._shutdown_requested.is_set() or self._cancelled:
-                return
-            app.backend.open()
-
     async def _recover(self, mode: str) -> None:
         app = cast("RepetuiApp", self.app)
         owner = self.owner
@@ -332,7 +320,7 @@ class StartupRecoveryScreen(ErrorScreen):
                 if self._cancelled or not self.is_mounted:
                     return
                 try:
-                    await asyncio.to_thread(self._try_open, app)
+                    await asyncio.to_thread(app.lifecycle.open, lambda: self._cancelled)
                 except CollectionInUseError:
                     await asyncio.sleep(0.15)
                     continue
@@ -340,8 +328,7 @@ class StartupRecoveryScreen(ErrorScreen):
                     self._show(str(exc))
                     return
                 if self._cancelled or not self.is_mounted:
-                    with app._backend_lock:
-                        app.backend.close()
+                    app.lifecycle.release()
                     return
                 if app.backend.is_open:
                     self._completed = True
@@ -553,11 +540,15 @@ class DeckScreen(Screen[None]):
         if not item.row.is_parent:
             item.flash_selection()
             return
-        self.repetui.preferences.set_deck_expanded(
-            self.repetui.profile,
-            item.deck.id,
-            expanded=not item.row.expanded,
-        )
+        try:
+            self.repetui.preferences.set_deck_expanded(
+                self.repetui.profile,
+                item.deck.id,
+                expanded=not item.row.expanded,
+            )
+        except OSError:
+            self.notify("Deck expansion not saved. Try again.", severity="error")
+            return
         self.reload(selected_deck_id=item.deck.id)
 
     def action_sync(self) -> None:
@@ -1354,8 +1345,13 @@ class SettingsScreen(Screen[None]):
         identity = self.card.presentation.identity
         if isinstance(item, AnswerLayoutSettingItem):
             layout = self.repetui.preferences.answer_layout(identity)
-            self.repetui.preferences.set_answer_layout(identity, layout.next)
+            try:
+                self.repetui.preferences.set_answer_layout(identity, layout.next)
+            except OSError:
+                self._show_footer("[err] answer layout not saved")
+                return
             item.refresh_layout(self.repetui.preferences, identity)
+            self._show_default_footer()
             return
         if isinstance(item, TemplateFieldsSettingItem):
             profile = self._field_profile_for_editor()
@@ -1367,8 +1363,13 @@ class SettingsScreen(Screen[None]):
         if not isinstance(item, SectionSettingItem):
             return
         mode = self.repetui.preferences.mode(identity, item.section.id)
-        self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
+        try:
+            self.repetui.preferences.set_mode(identity, item.section.id, mode.next)
+        except OSError:
+            self._show_footer("[err] section mode not saved")
+            return
         item.refresh_mode(self.repetui.preferences, identity)
+        self._show_default_footer()
 
     def _active_add_on_view(self) -> ListView:
         return self.query_one(
@@ -1810,6 +1811,15 @@ class ReviewScreen(Screen[None]):
             self._refresh_view(reset_scroll=False)
 
     def backend_refreshed(self) -> None:
+        deck = next(
+            (deck for deck in self.repetui.backend.decks() if deck.id == self.deck.id),
+            None,
+        )
+        if deck is None:
+            self.app.pop_screen()
+            self.notify("This deck is no longer available. Choose another deck.")
+            return
+        self.deck = deck
         self.repetui.backend.begin_review(self.deck.id)
         self.load_next()
 
@@ -2651,17 +2661,12 @@ class RepetuiApp(App[None]):
         )
         self.review_controls = self.preferences.review_controls(profile)
         self.set_keymap(self.review_controls.keymap())
-        self.syncer = syncer
-        self.full_syncer = full_syncer
-        self.syncing = False
-        self._sync_origin: Screen[None] | None = None
+        self.lifecycle = CollectionLifecycle(backend, profile, syncer, full_syncer)
         self._sync_popup: SyncPopup | None = None
         self._sync_thread: Thread | None = None
         self._sync_fatal_error: str | None = None
         self._completion_celebration: CompletionCelebrationScreen | None = None
         self.offered_field_setups: set[tuple[int, int]] = set()
-        self._shutdown_requested = Event()
-        self._backend_lock = Lock()
         self._instance_control = InstanceControl(
             lambda: self.post_message(InstanceCloseRequested())
         )
@@ -2723,15 +2728,15 @@ class RepetuiApp(App[None]):
 
     def on_mount(self) -> None:
         try:
-            self.backend.open()
-            self.startup_ready()
+            if self.lifecycle.open():
+                self.startup_ready()
         except CollectionInUseError as exc:
             self.push_screen(StartupRecoveryScreen(str(exc)))
         except BackendError as exc:
             self.push_screen(ErrorScreen(str(exc)))
 
     def startup_ready(self, *, replace: bool = False) -> None:
-        if self._shutdown_requested.is_set():
+        if self.lifecycle.stopped:
             return
         self._instance_control.start()
         if replace:
@@ -2744,13 +2749,11 @@ class RepetuiApp(App[None]):
             self.exit()
 
     def on_unmount(self) -> None:
-        self._shutdown_requested.set()
+        self.lifecycle.shutdown()
         self._instance_control.close()
         if self._completion_celebration is not None:
             self._completion_celebration.stop_animation()
             self._completion_celebration = None
-        with self._backend_lock:
-            self.backend.close()
 
     def action_help(self) -> None:
         if self.syncing or isinstance(self.screen, StartupRecoveryScreen):
@@ -2772,10 +2775,8 @@ class RepetuiApp(App[None]):
             self.exit()
 
     def action_sync(self) -> None:
-        if self.syncing:
+        if not self.lifecycle.begin_sync():
             return
-        self.syncing = True
-        self._sync_origin = self.screen
         self._sync_popup = SyncPopup()
         self.push_screen(self._sync_popup, self._sync_popup_closed)
         self.call_after_refresh(self._start_sync_thread)
@@ -2789,7 +2790,7 @@ class RepetuiApp(App[None]):
         self._sync_thread.start()
 
     def start_full_sync(self, direction: FullSyncDirection) -> None:
-        if not self.syncing or self._shutdown_requested.is_set():
+        if not self.syncing or self.lifecycle.stopped:
             return
         self._sync_thread = Thread(
             target=self._sync_in_thread, args=(direction,), name="repetui-full-sync", daemon=True
@@ -2797,40 +2798,14 @@ class RepetuiApp(App[None]):
         self._sync_thread.start()
 
     def _sync_in_thread(self, direction: FullSyncDirection | None = None) -> None:
-        self.post_message(SyncFinished(self._run_sync(direction)))
+        self.post_message(SyncFinished(self.lifecycle.sync(direction)))
 
     def on_sync_finished(self, message: SyncFinished) -> None:
         self._finish_sync(message.result)
 
-    def _run_sync(self, direction: FullSyncDirection | None = None) -> SyncRunResult:
-        """Run the blocking close/sync/reopen sequence without UI mutation."""
-        close_error = None
-        with self._backend_lock:
-            if self._shutdown_requested.is_set():
-                return SyncRunResult(SyncOutcome(SyncStatus.FAILED, "Sync cancelled."))
-            try:
-                self.backend.close()
-            except Exception as exc:
-                close_error = exc
-        if close_error is not None:
-            outcome = SyncOutcome(SyncStatus.COLLECTION_UNAVAILABLE, str(close_error))
-        else:
-            try:
-                outcome = (
-                    self.syncer(self.profile)
-                    if direction is None
-                    else self.full_syncer(self.profile, direction)
-                )
-            except Exception as exc:
-                outcome = failed_sync_outcome(exc)
-        reopen_error = None
-        with self._backend_lock:
-            if not self._shutdown_requested.is_set():
-                try:
-                    self.backend.open()
-                except Exception as exc:
-                    reopen_error = str(exc)
-        return SyncRunResult(outcome, reopen_error)
+    @property
+    def syncing(self) -> bool:
+        return self.lifecycle.busy
 
     def _finish_sync(self, result: SyncRunResult) -> None:
         self._sync_fatal_error = result.reopen_error
@@ -2839,13 +2814,12 @@ class RepetuiApp(App[None]):
 
     def _sync_popup_closed(self, fatal: bool | None) -> None:
         fatal_error = self._sync_fatal_error
-        self.syncing = False
+        self.lifecycle.finish_sync()
         if self.backend.is_open:
             for screen in self.screen_stack:
                 if hasattr(screen, "backend_refreshed"):
                     cast(Refreshable, screen).backend_refreshed()
         self._sync_popup = None
-        self._sync_origin = None
         self._sync_fatal_error = None
         if fatal and fatal_error is not None:
             self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))

@@ -6,10 +6,12 @@ import re
 from dataclasses import dataclass
 
 from rich.cells import cell_len
-from rich.style import Style
 from rich.text import Text
 
 from .backend import DueCounts, ReviewQueue
+from .card_text import annotated, inline_readings
+from .card_text import strip as _strip_text
+from .card_text import substitute as _replace_text
 from .controls import ReviewAction, ReviewControls
 from .preferences import AnswerLayout, SectionMode
 from .presentation import CardPresentation, PresentationSection
@@ -36,74 +38,61 @@ def section_name(section: PresentationSection) -> str:
     return label.replace("_", " ").strip()
 
 
-def _front_content(presentation: CardPresentation) -> tuple[str, bool]:
+def _section_text(section: PresentationSection, style: str, show_readings: bool) -> Text:
+    """Attach annotations before layout transforms the section text."""
+    result = annotated(section.text, section.underlines, section.furigana, style=style)
+    return inline_readings(result) if show_readings else result
+
+
+def _blocks(text: Text) -> list[Text]:
+    """Split blank-line blocks without losing annotation offsets."""
+    blocks: list[Text] = []
+    start = 0
+    for match in _BLOCK_BREAK.finditer(text.plain):
+        blocks.append(_strip_text(text[start:match.start()]))
+        start = match.end()
+    blocks.append(_strip_text(text[start:]))
+    return [block for block in blocks if block]
+
+
+def _front_content(presentation: CardPresentation, show_readings: bool) -> tuple[Text, bool]:
     """Compact rendered front blocks and remove a non-functional control marker."""
-    raw_blocks = [block.strip() for block in _BLOCK_BREAK.split(presentation.front.text)]
-    raw_blocks = [block for block in raw_blocks if block]
-    has_real_content = any(
-        block.replace(_TYPE_ANSWER_MARKER, "").strip() for block in raw_blocks
+    source = Text("\n\n").join(
+        _shown_section(section, "bold #eee9e0", show_readings, separator="\n")
+        for section in presentation.front.sections
     )
-    blocks: list[str] = []
+    raw_blocks = _blocks(source)
+    has_real_content = any(
+        block.plain.replace(_TYPE_ANSWER_MARKER, "").strip() for block in raw_blocks
+    )
+    blocks: list[Text] = []
     for raw_block in raw_blocks:
-        block = raw_block.replace(_TYPE_ANSWER_MARKER, "") if has_real_content else raw_block
-        block = " ".join(block.split()) if "\n" not in block else block.strip()
+        block = (
+            _replace_text(raw_block, re.escape(_TYPE_ANSWER_MARKER), "")
+            if has_real_content else raw_block
+        )
+        block = _strip_text(block)
+        if "\n" not in block.plain:
+            block = _replace_text(block, r"\s+", " ")
         if block:
             blocks.append(block)
 
-    rows: list[str] = []
-    compact: list[str] = []
+    rows: list[Text] = []
+    compact: list[Text] = []
 
     def flush_compact() -> None:
         if compact:
-            rows.append(" · ".join(compact))
+            rows.append(Text(" · ", style="bold #eee9e0").join(compact))
             compact.clear()
 
     for block in blocks:
-        if "\n" not in block and cell_len(block) <= _SHORT_BLOCK_WIDTH:
+        if "\n" not in block.plain and block.cell_len <= _SHORT_BLOCK_WIDTH:
             compact.append(block)
         else:
             flush_compact()
             rows.append(block)
     flush_compact()
-    return "\n\n".join(rows), len(blocks) > 1
-
-
-def _apply_section_underlines(
-    result: Text,
-    section: PresentationSection,
-    *,
-    start: int = 0,
-    end: int | None = None,
-) -> None:
-    region = result.plain[start:end]
-    position = region.find(section.text)
-    if position >= 0 and region.find(section.text, position + 1) < 0:
-        for underline_start, underline_end in section.underlines:
-            if 0 <= underline_start < underline_end <= len(section.text):
-                result.stylize(
-                    "underline",
-                    start + position + underline_start,
-                    start + position + underline_end,
-                )
-
-
-def _apply_section_furigana(
-    result: Text,
-    section: PresentationSection,
-    *,
-    start: int = 0,
-    end: int | None = None,
-) -> None:
-    region = result.plain[start:end]
-    position = region.find(section.text)
-    if position >= 0 and region.find(section.text, position + 1) < 0:
-        for reading_start, reading_end, reading in section.furigana:
-            if 0 <= reading_start < reading_end <= len(section.text):
-                result.stylize(
-                    Style(meta={"repetui_furigana": reading}),
-                    start + position + reading_start,
-                    start + position + reading_end,
-                )
+    return Text("\n\n").join(rows), len(blocks) > 1
 
 
 def _header(
@@ -112,10 +101,13 @@ def _header(
     counts: DueCounts,
     width: int,
     current_queue: ReviewQueue | None,
+    show_readings: bool,
 ) -> Text:
     """Build the first Flow line, shedding metadata before card content."""
-    front, multiple_front_blocks = _front_content(presentation)
-    first_front, _, remaining_front = front.partition("\n")
+    front, multiple_front_blocks = _front_content(presentation, show_readings)
+    first_break = front.plain.find("\n")
+    first_front = front if first_break < 0 else front[:first_break]
+    remaining_front = Text() if first_break < 0 else front[first_break + 1:]
     split = f"{counts.new}/{counts.learning}/{counts.review}"
     optional = {
         "deck": deck_name,
@@ -161,7 +153,7 @@ def _header(
         return result
 
     def first_row_width() -> int:
-        left = first_front + (
+        left = first_front.plain + (
             f"  · {optional['template']}" if optional["template"] else ""
         )
         right = right_text()
@@ -175,9 +167,10 @@ def _header(
 
     if first_row_width() > width:
         remaining_front = front
-        first_front = ""
+        first_front = Text()
 
-    result = Text(first_front, style="bold #eee9e0", overflow="fold")
+    result = first_front.copy()
+    result.overflow = "fold"
     if template := optional["template"]:
         result.append(f"  · {template}", style="#817d76")
 
@@ -189,29 +182,25 @@ def _header(
 
     if remaining_front:
         result.append("\n")
-        result.append(remaining_front, style="bold #eee9e0")
-    for section in presentation.front.sections:
-        if first_front:
-            _apply_section_underlines(result, section, end=len(first_front))
-            _apply_section_furigana(result, section, end=len(first_front))
-        if remaining_front:
-            _apply_section_underlines(
-                result, section, start=len(result.plain) - len(remaining_front)
-            )
-            _apply_section_furigana(
-                result, section, start=len(result.plain) - len(remaining_front)
-            )
+        result.append_text(remaining_front)
     return result
 
 
-def _shown_section(section: PresentationSection) -> str:
+def _shown_section(
+    section: PresentationSection, style: str, show_readings: bool, *, separator: str = " · "
+) -> Text:
+    body = _section_text(section, style, show_readings)
     if section.label_is_content and section.label:
-        return f"{section.label} · {section.text}" if section.text else section.label
-    return section.display_text
+        result = Text(section.label, style=style)
+        if body:
+            result.append(separator)
+            result.append_text(body)
+        return result
+    return body
 
 
-def _is_compact_section(section: PresentationSection, text: str) -> bool:
-    if "\n" in text or cell_len(text) > _SHORT_BLOCK_WIDTH:
+def _is_compact_section(section: PresentationSection, text: Text) -> bool:
+    if "\n" in text.plain or text.cell_len > _SHORT_BLOCK_WIDTH:
         return False
     return not (
         section.label_is_content
@@ -219,13 +208,13 @@ def _is_compact_section(section: PresentationSection, text: str) -> bool:
     )
 
 
-def _expanded_body(section: PresentationSection) -> str:
+def _expanded_body(section: PresentationSection, style: str, show_readings: bool) -> Text:
+    text = _section_text(section, style, show_readings)
     if section.label_is_content or not section.label:
-        return section.text if section.label_is_content else section.display_text
-    text = section.display_text
+        return text
     prefix = f"{section.label}:"
-    if text.casefold().startswith(prefix.casefold()):
-        return text[len(prefix) :].lstrip()
+    if text.plain.casefold().startswith(prefix.casefold()):
+        return _strip_text(text[len(prefix):])
     return text
 
 
@@ -233,16 +222,8 @@ def _is_unlabelled_section(section: PresentationSection) -> bool:
     return section.id.endswith(":fallback")
 
 
-def _styled_section(section: PresentationSection, text: str, style: str) -> Text:
-    result = Text(text, style=style, overflow="fold")
-    _apply_section_underlines(result, section)
-    _apply_section_furigana(result, section)
-    return result
-
-
-def _stacked_section(section: PresentationSection) -> Text:
-    body = _expanded_body(section)
-    result = _styled_section(section, body, "#d9d5ce")
+def _stacked_section(section: PresentationSection, show_readings: bool) -> Text:
+    result = _expanded_body(section, "#d9d5ce", show_readings)
     if _is_unlabelled_section(section):
         return result
     result.append("  · ", style="#817d76")
@@ -250,12 +231,12 @@ def _stacked_section(section: PresentationSection) -> Text:
     return result
 
 
-def _short_unlabelled_blocks(section: PresentationSection) -> tuple[str, ...]:
+def _short_unlabelled_blocks(section: PresentationSection, text: Text) -> tuple[Text, ...]:
     if not _is_unlabelled_section(section):
         return ()
-    blocks = tuple(block.strip() for block in _BLOCK_BREAK.split(section.text))
+    blocks = tuple(_blocks(text))
     if len(blocks) < 2 or any(
-        not block or "\n" in block or cell_len(block) > _SHORT_BLOCK_WIDTH
+        not block or "\n" in block.plain or block.cell_len > _SHORT_BLOCK_WIDTH
         for block in blocks
     ):
         return ()
@@ -265,6 +246,7 @@ def _short_unlabelled_blocks(section: PresentationSection) -> tuple[str, ...]:
 def _back(
     states: tuple[SectionState, ...],
     answer_layout: AnswerLayout,
+    show_readings: bool,
 ) -> Text:
     rows: list[Text] = []
     compact: list[Text] = []
@@ -284,37 +266,33 @@ def _back(
         if state.mode is SectionMode.HIDE:
             continue
         if state.mode is SectionMode.SHOW:
-            shown = _shown_section(section)
-            short_blocks = _short_unlabelled_blocks(section)
+            shown = _shown_section(section, "#d9d5ce", show_readings)
+            short_blocks = _short_unlabelled_blocks(section, shown)
             if short_blocks:
                 flush_compact()
-                rows.extend(Text(block, style="#d9d5ce") for block in short_blocks)
+                rows.extend(short_blocks)
                 continue
             if (
                 answer_layout is AnswerLayout.STACKED
                 and _is_compact_section(section, shown)
-                and _expanded_body(section)
+                and _expanded_body(section, "#d9d5ce", show_readings)
             ):
                 flush_compact()
-                rows.append(_stacked_section(section))
+                rows.append(_stacked_section(section, show_readings))
             elif _is_compact_section(section, shown):
-                compact.append(_styled_section(section, shown, "#d9d5ce"))
+                compact.append(shown)
             else:
                 flush_compact()
-                rows.append(_styled_section(section, shown, "#d9d5ce"))
+                rows.append(shown)
             continue
 
         flush_compact()
         name = section_name(section)
         if state.expanded:
-            body = _expanded_body(section)
-            rows.append(
-                _styled_section(
-                    section,
-                    f"▾ {name}\n{body}",
-                    "#c6d8d0" if state.selected else "#aaa49b",
-                )
-            )
+            style = "#c6d8d0" if state.selected else "#aaa49b"
+            row = Text(f"▾ {name}\n", style=style, overflow="fold")
+            row.append_text(_expanded_body(section, style, show_readings))
+            rows.append(row)
         else:
             marker = "›" if state.selected else "▸"
             rows.append(
@@ -333,19 +311,6 @@ def _back(
     return result
 
 
-def _with_inline_readings(result: Text) -> Text:
-    """Insert bracketed readings after their base text, preserving Rich styles."""
-    positions: set[tuple[int, str]] = set()
-    for span in result.spans:
-        meta = getattr(span.style, "meta", None)
-        reading = meta.get("repetui_furigana") if isinstance(meta, dict) else None
-        if isinstance(reading, str) and 0 <= span.start < span.end <= len(result.plain):
-            positions.add((span.end, reading))
-    for end, reading in sorted(positions, reverse=True):
-        result = result[:end] + Text(f"[{reading}]", style="#aaa49b") + result[end:]
-    return result
-
-
 def compose_review(
     presentation: CardPresentation,
     deck_name: str,
@@ -359,11 +324,11 @@ def compose_review(
     show_readings: bool = False,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
-    result = _header(presentation, deck_name, counts, width, current_queue)
+    result = _header(presentation, deck_name, counts, width, current_queue, show_readings)
     if revealed:
         result.append("\n")
-        result.append_text(_back(sections, answer_layout))
-    return _with_inline_readings(result) if show_readings else result
+        result.append_text(_back(sections, answer_layout, show_readings))
+    return result
 
 
 def compose_ratings(width: int, controls: ReviewControls | None = None) -> Text:

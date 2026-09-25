@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +173,28 @@ def test_flattens_nested_decks_with_aggregate_parent_counts() -> None:
     assert decks[1].counts.total == 12
 
 
+def test_failed_close_keeps_collection_available_for_retry() -> None:
+    service, collection = backend()
+    attempts = 0
+
+    def close() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("collection close failed")
+
+    collection.close = close
+    with pytest.raises(BackendError, match="Could not close the Anki collection"):
+        service.close()
+    assert service.is_open
+    assert service.decks()
+
+    service.close()
+    assert not service.is_open
+    service.close()
+    assert attempts == 2
+
+
 def test_review_uses_anki_rendering_and_scheduler() -> None:
     service, collection = backend()
     service.begin_review(2)
@@ -225,6 +248,31 @@ def test_sample_cards_reads_same_template_without_touching_scheduler() -> None:
     ]
     assert collection.sched.queue_calls == 0
     assert service._current is None
+
+
+def test_review_records_time_spent_on_the_card(tmp_path: Path, monkeypatch) -> None:
+    service = AnkiBackend(tmp_path / "collection.anki2")
+    service.open()
+    try:
+        import anki.cards
+
+        collection = service._require_collection()
+        note = collection.new_note(collection.models.by_name("Basic"))
+        note["Front"] = "Timing prompt"
+        note["Back"] = "Timing answer"
+        collection.add_note(note, 1)
+        service.begin_review(1)
+        now = 1000.0
+        monkeypatch.setattr(anki.cards, "time", SimpleNamespace(time=lambda: now))
+
+        card = service.next_card()
+        assert card is not None
+        now += 7.5
+        service.answer(3)
+
+        assert collection.db.scalar("select time from revlog where cid = ?", card.id) == 7500
+    finally:
+        service.close()
 
 
 def test_sample_card_read_failure_is_a_recoverable_backend_error() -> None:
