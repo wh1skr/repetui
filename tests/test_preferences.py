@@ -87,6 +87,66 @@ def test_answer_layout_defaults_stacked_and_survives_restart_per_template(
     assert "answer_layout" not in json.loads(path.read_text())["templates"]["204:0"]
 
 
+@pytest.mark.parametrize("requested", [SectionMode.SHOW, SectionMode.HIDE])
+def test_failed_section_mode_write_preserves_active_and_saved_choice(
+    tmp_path, monkeypatch, requested
+) -> None:
+    path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(path)
+    section = "back:heading:mnemonic"
+    preferences.set_mode(JAPANESE_RECOGNITION, section, SectionMode.FOLD)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_mode(JAPANESE_RECOGNITION, section, requested)
+
+    assert preferences.mode(JAPANESE_RECOGNITION, section) is SectionMode.FOLD
+    assert JsonPreferences(path).mode(JAPANESE_RECOGNITION, section) is SectionMode.FOLD
+
+
+@pytest.mark.parametrize("original", list(AnswerLayout))
+def test_failed_answer_layout_write_preserves_active_and_saved_choice(
+    tmp_path, monkeypatch, original
+) -> None:
+    path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(path)
+    preferences.set_answer_layout(JAPANESE_RECOGNITION, original)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_answer_layout(JAPANESE_RECOGNITION, original.next)
+
+    assert preferences.answer_layout(JAPANESE_RECOGNITION) is original
+    assert JsonPreferences(path).answer_layout(JAPANESE_RECOGNITION) is original
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_failed_deck_expansion_write_preserves_active_and_saved_choice(
+    tmp_path, monkeypatch, expanded
+) -> None:
+    path = tmp_path / "preferences.json"
+    preferences = JsonPreferences(path)
+    current_profile = profile(tmp_path)
+    preferences.set_deck_expanded(current_profile, 10, expanded=not expanded)
+    original = preferences.expanded_deck_ids(current_profile)
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk unavailable"):
+        preferences.set_deck_expanded(current_profile, 10, expanded=expanded)
+
+    assert preferences.expanded_deck_ids(current_profile) == original
+    assert JsonPreferences(path).expanded_deck_ids(current_profile) == original
+
+
 def test_existing_saved_stacked_answer_layout_remains_valid(tmp_path) -> None:
     path = tmp_path / "preferences.json"
     path.write_text(
@@ -366,3 +426,41 @@ def test_failed_review_control_write_preserves_active_and_saved_mapping(
 
     assert preferences.review_controls(whskr) == original
     assert JsonPreferences(path).review_controls(whskr) == original
+
+
+@pytest.mark.parametrize("choice", ["enabled", "setting"])
+def test_nested_add_on_draft_is_atomic_and_retry_preserves_other_preferences(
+    tmp_path, monkeypatch, choice,
+) -> None:
+    path = tmp_path / "preferences.json"
+    whskr = profile(tmp_path / "Anki2")
+    preferences = JsonPreferences(path)
+    preferences.set_add_on_enabled(whskr, "celebration", enabled=True)
+    preferences.set_add_on_setting(whskr, "celebration", "duration", "brief")
+    preferences.set_mode(JAPANESE_RECOGNITION, "meaning", SectionMode.FOLD)
+    saved = path.read_bytes()
+
+    def change():
+        if choice == "enabled":
+            preferences.set_add_on_enabled(whskr, "celebration", enabled=False)
+        else:
+            preferences.set_add_on_setting(whskr, "celebration", "duration", "long")
+
+    def fail_replace(_source, _destination):
+        raise OSError("disk unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", fail_replace)
+        with pytest.raises(OSError, match="disk unavailable"):
+            change()
+    assert preferences.add_on_enabled(whskr, "celebration")
+    assert preferences.add_on_settings(whskr, "celebration") == {"duration": "brief"}
+    assert path.read_bytes() == saved
+    change()
+    restarted = JsonPreferences(path)
+    for reader in (preferences, restarted):
+        assert reader.add_on_enabled(whskr, "celebration") is (choice != "enabled")
+        assert reader.add_on_settings(whskr, "celebration") == {
+            "duration": "long" if choice == "setting" else "brief"
+        }
+        assert reader.mode(JAPANESE_RECOGNITION, "meaning") is SectionMode.FOLD

@@ -19,20 +19,15 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from rich.cells import cell_len
+from rich.text import Text
+
+from .card_text import INLINE_FURIGANA, annotated, annotations, extract_readings, normalise
 
 _ANSWER_RULE = re.compile(r'<hr[^>]*\bid\s*=\s*["\']?answer["\']?[^>]*>', re.IGNORECASE)
-_SOUND = re.compile(r"\[sound:([^\]]+)\]", re.IGNORECASE)
-_AV_REFERENCE = re.compile(r"\[anki:play:[^:\]]+:(\d+)\]", re.IGNORECASE)
-_TYPE_MARKER = re.compile(r"\[\[type:[^\]]+\]\]", re.IGNORECASE)
-_SPACE = re.compile(r"[ \t]+")
 _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
 _SIMPLE_CLASS = re.compile(r"(?:[a-z][\w-]*)?\.([\w-]+)", re.IGNORECASE)
 _FURIGANA_HINT = re.compile(r"(?:\[[ぁ-んァ-ンー]{1,30}\]|（[ぁ-んァ-ンー]{1,30}）)")
-_INLINE_FURIGANA = re.compile(
-    r"(?P<base>[㐀-鿿豈-﫿々〆ヵヶ𠀀-𪛟]+)"
-    r"\[(?P<reading>[ぁ-ゖァ-ヺー・]+)\]"
-)
 _MACHINE_VALUE = re.compile(
     r"(?:https?://\S+|[0-9]{3,}|[0-9a-f]{12,}(?::[0-9]+)?)",
     re.IGNORECASE,
@@ -158,8 +153,9 @@ class CardPresentation:
 @dataclass
 class _RawSection:
     kind: str
-    label_parts: list[str]
-    body_parts: list[str]
+    start: int
+    label_end: int
+    end: int
 
 
 @dataclass
@@ -215,7 +211,6 @@ class _RenderedHTMLParser(HTMLParser):
     def __init__(self, underline_classes: frozenset[str] = frozenset()) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self.prelude: list[str] = []
         self.sections: list[_RawSection] = []
         self._active: _RawSection | None = None
         self._heading_depth = 0
@@ -244,12 +239,10 @@ class _RenderedHTMLParser(HTMLParser):
             else:
                 self.underline_ranges.append((start, self._raw_length))
         self.parts.append(text)
-        if self._heading_depth and self._active is not None:
-            self._active.label_parts.append(text)
-        elif self._active is not None:
-            self._active.body_parts.append(text)
-        else:
-            self.prelude.append(text)
+        if self._active is not None:
+            self._active.end = self._raw_length
+            if self._heading_depth:
+                self._active.label_end = self._raw_length
 
     @staticmethod
     def _classes(attributes: dict[str, str | None]) -> set[str]:
@@ -324,11 +317,15 @@ class _RenderedHTMLParser(HTMLParser):
             self._ignored_depth = 1
         elif tag in self._HEADINGS:
             self._emit("\n")
-            self._active = _RawSection("heading", [], [])
+            self._active = _RawSection(
+                "heading", self._raw_length, self._raw_length, self._raw_length
+            )
             self.sections.append(self._active)
             self._heading_depth = 1
         elif tag == "repetui-label":
-            self._active = _RawSection("label", [], [])
+            self._active = _RawSection(
+                "label", self._raw_length, self._raw_length, self._raw_length
+            )
             self.sections.append(self._active)
             self._heading_depth = 1
         elif tag == "br":
@@ -462,8 +459,8 @@ def _html_classes(html: str) -> frozenset[str]:
 @dataclass(frozen=True)
 class _RenderedDocument:
     text: str
-    structural_sections: tuple[tuple[str, str, str], ...]
-    prelude: str
+    structural_sections: tuple[tuple[str, Text, Text], ...]
+    prelude: Text
     atoms: tuple[str, ...]
     underlines: tuple[tuple[int, int], ...] = ()
     furigana: tuple[tuple[int, int, str], ...] = ()
@@ -499,89 +496,8 @@ def _underlined_classes(css: str) -> frozenset[str]:
     return frozenset(result)
 
 
-def _normalised_underlines(
-    raw: str,
-    ranges: list[tuple[int, int]],
-    text: str,
-    av: tuple[AVReference, ...],
-) -> tuple[tuple[int, int], ...]:
-    result: set[tuple[int, int]] = set()
-    for start, end in ranges:
-        fragment = _normalise(raw[start:end], av)
-        if not fragment:
-            continue
-        position = text.find(fragment)
-        if position >= 0 and text.find(fragment, position + 1) < 0:
-            result.add((position, position + len(fragment)))
-    return tuple(sorted(result))
-
-
-def _normalised_ruby(
-    raw: str,
-    ranges: list[tuple[int, int, str]],
-    text: str,
-    av: tuple[AVReference, ...],
-) -> tuple[tuple[int, int, str], ...]:
-    result: list[tuple[int, int, str]] = []
-    for start, end, reading in ranges:
-        base = _normalise(raw[start:end], av)
-        if not base:
-            continue
-        after_prefix = len(_normalise(raw[:start], av))
-        position = text.find(base, after_prefix)
-        if position >= 0:
-            result.append((position, position + len(base), reading))
-    return tuple(result)
-
-
 def _without_inline_furigana(text: str) -> str:
-    return _INLINE_FURIGANA.sub(lambda match: match.group("base"), text)
-
-
-def _deannotate_furigana(
-    text: str,
-    underlines: tuple[tuple[int, int], ...],
-    ruby: tuple[tuple[int, int, str], ...],
-) -> tuple[str, tuple[tuple[int, int], ...], tuple[tuple[int, int, str], ...]]:
-    matches = tuple(_INLINE_FURIGANA.finditer(text))
-    if not matches:
-        return text, underlines, ruby
-
-    removed = tuple((match.end("base"), match.end()) for match in matches)
-
-    def position_after_removal(position: int) -> int:
-        skipped = 0
-        for start, end in removed:
-            if position <= start:
-                break
-            if position < end:
-                return start - skipped
-            skipped += end - start
-        return position - skipped
-
-    clean = _without_inline_furigana(text)
-    adjusted_underlines = tuple(
-        (new_start, new_end)
-        for start, end in underlines
-        for new_start, new_end in (
-            (position_after_removal(start), position_after_removal(end)),
-        )
-        if new_start < new_end
-    )
-    readings = [
-        (position_after_removal(start), position_after_removal(end), reading)
-        for start, end, reading in ruby
-        if position_after_removal(start) < position_after_removal(end)
-    ]
-    readings.extend(
-        (
-            position_after_removal(match.start("base")),
-            position_after_removal(match.end("base")),
-            match.group("reading"),
-        )
-        for match in matches
-    )
-    return clean, adjusted_underlines, tuple(sorted(set(readings)))
+    return INLINE_FURIGANA.sub(lambda match: match.group("base"), text)
 
 
 def _promote_structural_labels(html: str) -> str:
@@ -601,17 +517,30 @@ def _render_document(
     parser.feed(_promote_structural_labels(html))
     parser.close()
     raw_text = "".join(parser.parts)
-    annotated_text = _normalise(raw_text, av)
-    text, underlines, furigana = _deannotate_furigana(
-        annotated_text,
-        _normalised_underlines(raw_text, parser.underline_ranges, annotated_text, av),
-        _normalised_ruby(raw_text, parser.ruby_ranges, annotated_text, av),
-    )
+    placeholders = tuple(reference.placeholder for reference in av)
+
+    def render_range(start: int, end: int) -> Text:
+        source = annotated(
+            raw_text[start:end],
+            tuple(
+                (max(left, start) - start, min(right, end) - start)
+                for left, right in parser.underline_ranges if left < end and right > start
+            ),
+            tuple(
+                (max(left, start) - start, min(right, end) - start, reading)
+                for left, right, reading in parser.ruby_ranges if left < end and right > start
+            ),
+        )
+        return extract_readings(normalise(source, placeholders))
+
+    marked = render_range(0, len(raw_text))
+    text = marked.plain
+    underlines, furigana = annotations(marked)
     sections = tuple(
         (
             section.kind,
-            _without_inline_furigana(_normalise("".join(section.label_parts), av)),
-            _without_inline_furigana(_normalise("".join(section.body_parts), av)),
+            render_range(section.start, section.label_end),
+            render_range(section.label_end, section.end),
         )
         for section in parser.sections
     )
@@ -623,7 +552,7 @@ def _render_document(
     return _RenderedDocument(
         text,
         sections,
-        _without_inline_furigana(_normalise("".join(parser.prelude), av)),
+        render_range(0, parser.sections[0].start if parser.sections else len(raw_text)),
         atoms,
         underlines,
         furigana,
@@ -631,31 +560,7 @@ def _render_document(
 
 
 def _normalise(text: str, av: tuple[AVReference, ...] = ()) -> str:
-    text = text.replace("\xa0", " ")
-    text = _SOUND.sub(lambda match: f"[audio: {_media_name(match.group(1))}]", text)
-
-    def replace_av(match: re.Match[str]) -> str:
-        index = int(match.group(1))
-        return av[index].placeholder if index < len(av) else "[audio]"
-
-    text = _AV_REFERENCE.sub(replace_av, text)
-    text = _TYPE_MARKER.sub("[type answer]", text)
-
-    lines: list[str] = []
-    in_fence = False
-    for raw_line in text.splitlines():
-        if raw_line.strip() in {"```text", "```"}:
-            line = raw_line.strip()
-            in_fence = line != "```"
-        elif in_fence:
-            line = raw_line.rstrip()
-        else:
-            line = _SPACE.sub(" ", raw_line).strip()
-        if line:
-            lines.append(line)
-        elif lines and lines[-1] != "":
-            lines.append("")
-    return "\n".join(lines).strip()
+    return normalise(annotated(text), tuple(reference.placeholder for reference in av)).plain
 
 
 def _reconcile_key(text: str) -> str:
@@ -687,30 +592,17 @@ def _unique_id(prefix: str, value: str, seen: dict[str, int]) -> str:
 def _with_document_marks(
     section: PresentationSection,
     document: _RenderedDocument,
-    offset: int | None = None,
+    offset: int,
 ) -> PresentationSection:
     if not section.text:
         return section
-    if offset is None:
-        offset = document.text.find(section.text)
-        if offset < 0 or document.text.find(section.text, offset + 1) >= 0:
-            return section
     if document.text[offset : offset + len(section.text)] != section.text:
         return section
     end = offset + len(section.text)
-    return replace(
-        section,
-        underlines=tuple(
-            (start - offset, stop - offset)
-            for start, stop in document.underlines
-            if offset <= start < stop <= end
-        ),
-        furigana=tuple(
-            (start - offset, stop - offset, reading)
-            for start, stop, reading in document.furigana
-            if offset <= start < stop <= end
-        ),
+    underlines, furigana = annotations(
+        annotated(document.text, document.underlines, document.furigana)[offset:end]
     )
+    return replace(section, underlines=underlines, furigana=furigana)
 
 
 def _structural_sections(side: str, document: _RenderedDocument) -> tuple[PresentationSection, ...]:
@@ -719,39 +611,42 @@ def _structural_sections(side: str, document: _RenderedDocument) -> tuple[Presen
     seen: dict[str, int] = {}
     result: list[PresentationSection] = []
     if document.prelude:
-        result.append(PresentationSection(f"{side}:preamble", document.prelude))
+        underlines, furigana = annotations(document.prelude)
+        result.append(PresentationSection(
+            f"{side}:preamble", document.prelude.plain,
+            underlines=underlines, furigana=furigana,
+        ))
     for kind, raw_label, body in document.structural_sections:
-        label = raw_label.removesuffix(":").strip()
+        label = raw_label.plain.removesuffix(":").strip()
         if label or body:
-            if kind == "label" or raw_label.rstrip().endswith(":"):
-                text = _normalise(f"{raw_label} {body}")
+            if kind == "label" or raw_label.plain.rstrip().endswith(":"):
+                text = normalise(Text(" ").join((raw_label, body)))
+                underlines, furigana = annotations(text)
                 result.append(
                     PresentationSection(
                         _unique_id(f"{side}:label", label, seen),
-                        text,
+                        text.plain,
                         label=label or None,
+                        underlines=underlines,
+                        furigana=furigana,
                     )
                 )
             else:
+                underlines, furigana = annotations(body)
                 result.append(
                     PresentationSection(
                         _unique_id(f"{side}:heading", label, seen),
-                        body,
+                        body.plain,
                         label=label or None,
                         label_is_content=True,
+                        underlines=underlines,
+                        furigana=furigana,
                     )
                 )
     joined = "\n\n".join(section.display_text for section in result)
     if _reconcile_key(joined) != _reconcile_key(document.text):
         return ()
-    marked: list[PresentationSection] = []
-    cursor = 0
-    for section in result:
-        offset = document.text.find(section.text, cursor)
-        marked.append(_with_document_marks(section, document, offset) if offset >= 0 else section)
-        if offset >= 0:
-            cursor = offset + len(section.text)
-    return tuple(marked)
+    return tuple(result)
 
 
 def _field_sections(
@@ -876,9 +771,12 @@ def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
         if remainder:
             if len(back.sections) == 1:
                 section = back.sections[0]
-                offset = section.text.find(remainder)
-                if offset >= 0:
+                offset = len(section.text) - len(remainder)
+                if offset >= 0 and section.text[offset:] == remainder:
                     end = offset + len(remainder)
+                    underlines, furigana = annotations(
+                        annotated(section.text, section.underlines, section.furigana)[offset:end]
+                    )
                     return CardSide(
                         (
                             replace(
@@ -886,16 +784,8 @@ def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
                                 id="back:fallback",
                                 text=remainder,
                                 label="Answer",
-                                underlines=tuple(
-                                    (start - offset, stop - offset)
-                                    for start, stop in section.underlines
-                                    if offset <= start < stop <= end
-                                ),
-                                furigana=tuple(
-                                    (start - offset, stop - offset, reading)
-                                    for start, stop, reading in section.furigana
-                                    if offset <= start < stop <= end
-                                ),
+                                underlines=underlines,
+                                furigana=furigana,
                             ),
                         )
                     )

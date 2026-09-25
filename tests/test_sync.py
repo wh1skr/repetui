@@ -135,6 +135,33 @@ def test_normal_sync_includes_media(
     assert collection.closed is True
 
 
+@pytest.mark.parametrize("media_fails", [False, True])
+def test_unchanged_collection_still_syncs_media(monkeypatch, tmp_path, media_fails):
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required", SyncStatusResponse.Required.NO_CHANGES
+    )
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+
+    def sync_media(self, auth):
+        self.media_synced = True
+        if media_fails:
+            raise ConnectionError("media connection lost")
+
+    def sync_collection(self, auth, sync_media):
+        pytest.fail("An unchanged collection needs only media sync")
+
+    monkeypatch.setattr(FakeSyncCollection, "sync_media", sync_media)
+    monkeypatch.setattr(FakeSyncCollection, "sync_collection", sync_collection)
+
+    outcome = sync_profile(profile)
+
+    collection = FakeSyncCollection.instances[-1]
+    assert collection.media_synced
+    assert collection.closed
+    assert outcome.status is (SyncStatus.OFFLINE if media_fails else SyncStatus.UP_TO_DATE)
+
+
 @pytest.mark.parametrize("required", [SyncCollectionResponse.NORMAL_SYNC, 999])
 def test_incomplete_or_unknown_sync_response_is_not_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, required: int

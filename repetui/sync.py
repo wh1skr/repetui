@@ -155,6 +155,8 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
         if status.new_endpoint:
             auth.endpoint = status.new_endpoint.rstrip("/") + "/"
         if status.required == SyncStatusResponse.Required.NO_CHANGES:
+            # Collection status does not include pending media transfers.
+            collection.sync_media(auth)
             return SyncOutcome(SyncStatus.UP_TO_DATE)
 
         result = collection.sync_collection(auth, sync_media=False)

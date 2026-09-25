@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -158,6 +160,30 @@ class JsonPreferences:
     def _profile_key(profile: ProfilePaths) -> str:
         return str(profile.collection.expanduser().resolve())
 
+    @contextmanager
+    def _edit(
+        self, *, profile: ProfilePaths | None = None,
+        identity: CardTemplateIdentity | None = None,
+    ) -> Iterator[dict[str, object]]:
+        """Publish an isolated draft only after the complete document is saved.
+
+        Nested values are detached too: setters may freely mutate their draft,
+        and validation or persistence failures leave the active document intact.
+        """
+        templates, profiles = deepcopy((self._templates, self._profiles))
+        if profile is not None:
+            draft = profiles.setdefault(self._profile_key(profile), {"name": profile.name})
+        else:
+            assert identity is not None
+            draft = templates.setdefault(self._template_key(identity), {
+                "note_type_name": identity.note_type_name,
+                "template_name": identity.template_name,
+                "sections": {},
+            })
+        yield draft
+        self._write_document(templates, profiles)
+        self._templates, self._profiles = templates, profiles
+
     def _load(
         self,
     ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
@@ -202,11 +228,8 @@ class JsonPreferences:
             expanded_ids.add(deck_id)
         else:
             expanded_ids.discard(deck_id)
-        saved_profile = self._profiles.setdefault(
-            self._profile_key(profile), {"name": profile.name}
-        )
-        saved_profile["expanded_deck_ids"] = sorted(expanded_ids)
-        self._save()
+        with self._edit(profile=profile) as saved_profile:
+            saved_profile["expanded_deck_ids"] = sorted(expanded_ids)
 
     def review_controls(self, profile: ProfilePaths) -> ReviewControls:
         saved_profile = self._profiles.get(self._profile_key(profile), {})
@@ -215,16 +238,12 @@ class JsonPreferences:
     def set_review_controls(
         self, profile: ProfilePaths, controls: ReviewControls
     ) -> None:
-        profiles = {key: dict(value) for key, value in self._profiles.items()}
-        profile_key = self._profile_key(profile)
-        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
         overrides = controls.saved_overrides()
-        if overrides:
-            saved_profile["review_controls"] = overrides
-        else:
-            saved_profile.pop("review_controls", None)
-        self._write_document(self._templates, profiles)
-        self._profiles = profiles
+        with self._edit(profile=profile) as saved_profile:
+            if overrides:
+                saved_profile["review_controls"] = overrides
+            else:
+                saved_profile.pop("review_controls", None)
 
     def action_feedback_duration(
         self, profile: ProfilePaths
@@ -243,15 +262,11 @@ class JsonPreferences:
     def set_action_feedback_duration(
         self, profile: ProfilePaths, duration: ActionFeedbackDuration
     ) -> None:
-        profiles = {key: dict(value) for key, value in self._profiles.items()}
-        profile_key = self._profile_key(profile)
-        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
-        if duration is ActionFeedbackDuration.NORMAL:
-            saved_profile.pop("action_feedback_duration", None)
-        else:
-            saved_profile["action_feedback_duration"] = duration.value
-        self._write_document(self._templates, profiles)
-        self._profiles = profiles
+        with self._edit(profile=profile) as saved_profile:
+            if duration is ActionFeedbackDuration.NORMAL:
+                saved_profile.pop("action_feedback_duration", None)
+            else:
+                saved_profile["action_feedback_duration"] = duration.value
 
     def add_on_enabled(self, profile: ProfilePaths, add_on_id: str) -> bool:
         return self._add_on_state(profile, add_on_id).get("enabled") is True
@@ -283,30 +298,22 @@ class JsonPreferences:
         add_on_id: str,
         update: Callable[[dict[str, object]], None],
     ) -> None:
-        profiles = {key: dict(value) for key, value in self._profiles.items()}
-        profile_key = self._profile_key(profile)
-        saved_profile = profiles.setdefault(profile_key, {"name": profile.name})
-        add_ons = dict(
-            saved_profile.get("add_ons", {})
-            if isinstance(saved_profile.get("add_ons"), dict)
-            else {}
-        )
-        state = dict(
-            add_ons.get(add_on_id, {})
-            if isinstance(add_ons.get(add_on_id), dict)
-            else {}
-        )
-        update(state)
-        if state:
-            add_ons[add_on_id] = state
-        else:
-            add_ons.pop(add_on_id, None)
-        if add_ons:
-            saved_profile["add_ons"] = add_ons
-        else:
-            saved_profile.pop("add_ons", None)
-        self._write_document(self._templates, profiles)
-        self._profiles = profiles
+        with self._edit(profile=profile) as saved_profile:
+            add_ons = saved_profile.get("add_ons", {})
+            if not isinstance(add_ons, dict):
+                add_ons = {}
+            state = add_ons.get(add_on_id, {})
+            if not isinstance(state, dict):
+                state = {}
+            update(state)
+            if state:
+                add_ons[add_on_id] = state
+            else:
+                add_ons.pop(add_on_id, None)
+            if add_ons:
+                saved_profile["add_ons"] = add_ons
+            else:
+                saved_profile.pop("add_ons", None)
 
     def add_on_settings(
         self, profile: ProfilePaths, add_on_id: str
@@ -355,24 +362,15 @@ class JsonPreferences:
         section_id: str,
         mode: SectionMode,
     ) -> None:
-        key = self._template_key(identity)
-        template = self._templates.setdefault(
-            key,
-            {
-                "note_type_name": identity.note_type_name,
-                "template_name": identity.template_name,
-                "sections": {},
-            },
-        )
-        sections = template.setdefault("sections", {})
-        if not isinstance(sections, dict):
-            sections = {}
+        with self._edit(identity=identity) as template:
+            sections = template.get("sections", {})
+            if not isinstance(sections, dict):
+                sections = {}
             template["sections"] = sections
-        if mode is SectionMode.SHOW:
-            sections.pop(section_id, None)
-        else:
-            sections[section_id] = mode.value
-        self._save()
+            if mode is SectionMode.SHOW:
+                sections.pop(section_id, None)
+            else:
+                sections[section_id] = mode.value
 
     def answer_layout(self, identity: CardTemplateIdentity) -> AnswerLayout:
         template = self._templates.get(self._template_key(identity), {})
@@ -388,20 +386,11 @@ class JsonPreferences:
         identity: CardTemplateIdentity,
         layout: AnswerLayout,
     ) -> None:
-        key = self._template_key(identity)
-        template = self._templates.setdefault(
-            key,
-            {
-                "note_type_name": identity.note_type_name,
-                "template_name": identity.template_name,
-                "sections": {},
-            },
-        )
-        if layout is AnswerLayout.STACKED:
-            template.pop("answer_layout", None)
-        else:
-            template["answer_layout"] = layout.value
-        self._save()
+        with self._edit(identity=identity) as template:
+            if layout is AnswerLayout.STACKED:
+                template.pop("answer_layout", None)
+            else:
+                template["answer_layout"] = layout.value
 
     def field_profile(
         self, identity: CardTemplateIdentity
@@ -442,27 +431,13 @@ class JsonPreferences:
             or len(selected) != len(set(selected))
         ):
             raise ValueError("A field profile requires unique prompt and answer fields.")
-        templates = {key: dict(value) for key, value in self._templates.items()}
-        key = self._template_key(identity)
-        template = templates.setdefault(
-            key,
-            {
-                "note_type_name": identity.note_type_name,
-                "template_name": identity.template_name,
-                "sections": {},
-            },
-        )
-        template["field_profile"] = {
-            "prompt_fields": list(profile.prompt_fields),
-            "answer_fields": list(profile.answer_fields),
-        }
-        if profile.ignored_fields:
-            template["field_profile"]["ignored_fields"] = list(profile.ignored_fields)
-        self._write_document(templates, self._profiles)
-        self._templates = templates
-
-    def _save(self) -> None:
-        self._write_document(self._templates, self._profiles)
+        with self._edit(identity=identity) as template:
+            template["field_profile"] = {
+                "prompt_fields": list(profile.prompt_fields),
+                "answer_fields": list(profile.answer_fields),
+            }
+            if profile.ignored_fields:
+                template["field_profile"]["ignored_fields"] = list(profile.ignored_fields)
 
     def _write_document(
         self,

@@ -1,4 +1,5 @@
 import pytest
+from rich.console import Console
 
 from repetui.backend import DueCounts, ReviewQueue
 from repetui.controls import ReviewAction, ReviewControls
@@ -125,6 +126,52 @@ def test_flow_can_show_furigana_inline_without_leaking_hidden_answer() -> None:
         for span in answer.spans
         if "underline" in str(span.style)
     } == {"気"}
+
+
+@pytest.mark.parametrize("separator", ["<br>", "</p><p>"])
+def test_front_readings_survive_multiline_compaction(separator) -> None:
+    presentation = present_card(RawCardContent(
+        CardTemplateIdentity(1, "Basic", 0, "Card"),
+        f"<p><u>道[みち]</u>{separator}気[き]</p>", "answer",
+    ))
+    result = compose_review(
+        presentation, "Japanese", DueCounts(0, 0, 1), 40,
+        revealed=False, show_readings=True,
+    )
+    assert "道[みち]" in result.plain
+    assert "気[き]" in result.plain
+    assert "道" in {
+        result.plain[span.start:span.end] for span in result.spans
+        if "underline" in str(span.style)
+    }
+
+
+def test_short_answer_blocks_keep_readings_and_underlines() -> None:
+    presentation = present_card(RawCardContent(
+        CardTemplateIdentity(1, "Basic", 0, "Card"), "Q",
+        "<hr id=answer><p><u>道[みち]</u></p><p>気[き]</p>",
+    ))
+    result = compose_review(
+        presentation, "Japanese", DueCounts(0, 0, 1), 40, revealed=True,
+        sections=tuple(SectionState(s, SectionMode.SHOW) for s in presentation.back.sections),
+        show_readings=True,
+    )
+    assert "道[みち]\n気[き]" in result.plain
+    assert "道" in {
+        result.plain[span.start:span.end] for span in result.spans
+        if "underline" in str(span.style)
+    }
+
+
+def test_readings_are_measured_before_placing_due_counts() -> None:
+    presentation = present_card(RawCardContent(
+        CardTemplateIdentity(1, "Basic", 0, "Card"), "道[みち]へ。", "answer",
+    ))
+    result = compose_review(
+        presentation, "Japanese", DueCounts(0, 0, 1), 40,
+        revealed=False, show_readings=True,
+    )
+    assert "0/0/1" in result.wrap(Console(width=40), 40)[0].plain
 
 
 def test_real_kanji_card_becomes_compact_flow_without_control_noise() -> None:

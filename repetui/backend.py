@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -117,11 +116,14 @@ class AnkiBackend:
             raise BackendError(f"Could not open the Anki collection: {message}") from exc
 
     def close(self) -> None:
-        collection, self._collection = self._collection, None
-        self._current = None
+        collection = self._collection
         if collection is not None:
-            with contextlib.suppress(Exception):
+            try:
                 collection.close()
+            except Exception as exc:
+                raise BackendError(f"Could not close the Anki collection: {exc}") from exc
+        self._collection = None
+        self._current = None
 
     def _require_collection(self) -> Any:
         if self._collection is None:
@@ -180,10 +182,12 @@ class AnkiBackend:
         queued_card = queued.cards[0]
         card = collection.get_card(queued_card.card.id)
         raw_content = self._raw_content_for_card(card)
+        presentation = present_card(raw_content)
+        card.start_timer()
         self._current = (card, queued_card.states)
         return ReviewCard(
             id=card.id,
-            presentation=present_card(raw_content),
+            presentation=presentation,
             queue=_ANKI_REVIEW_QUEUES.get(int(queued_card.queue)),
             raw_content=raw_content,
         )
@@ -263,7 +267,6 @@ class AnkiBackend:
             3: CardAnswer.Rating.GOOD,
             4: CardAnswer.Rating.EASY,
         }
-        card.start_timer()
         answer = collection.sched.build_answer(
             card=card,
             states=states,
