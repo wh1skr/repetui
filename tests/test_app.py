@@ -7,6 +7,7 @@ import pytest
 from textual.widgets import Input, ListItem, Static
 
 import repetui.app as app_module
+from repetui import __version__
 from repetui.addons import (
     AddOnDefinition,
     AddOnEvent,
@@ -1239,7 +1240,7 @@ async def test_decks_are_compact_unboxed_and_keep_identity_plus_counts_at_40x6(
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, DeckScreen)
-        assert str(screen.query_one("#deck-header").render()) == "decks · repetui 0.1.6"
+        assert str(screen.query_one("#deck-header").render()) == f"decks · repetui {__version__}"
         assert screen.query_one("#deck-header").region.y == 0
         assert len(screen.query("#logo")) == 0
         assert len(screen.query(".quiet-footer")) == 0
