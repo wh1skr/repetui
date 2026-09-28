@@ -150,6 +150,7 @@ class JsonPreferences:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_preferences_path()
+        self.load_warning: str | None = None
         self._templates, self._profiles = self._load()
 
     @staticmethod
@@ -170,6 +171,8 @@ class JsonPreferences:
         Nested values are detached too: setters may freely mutate their draft,
         and validation or persistence failures leave the active document intact.
         """
+        if self.load_warning is not None:
+            raise OSError("Preferences are read-only because the saved file could not be loaded.")
         templates, profiles = deepcopy((self._templates, self._profiles))
         if profile is not None:
             draft = profiles.setdefault(self._profile_key(profile), {"name": profile.name})
@@ -188,21 +191,33 @@ class JsonPreferences:
         self,
     ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
         try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            saved = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}, {}
+        except OSError:
+            self.load_warning = "Preferences could not be read; the file is preserved."
+            return {}, {}
+        try:
+            document = json.loads(saved)
+        except json.JSONDecodeError:
+            self.load_warning = "Preferences contain invalid JSON; the file is preserved."
             return {}, {}
         if not isinstance(document, dict) or document.get("version") != self.VERSION:
+            self.load_warning = "Preferences use an unsupported format; the file is preserved."
             return {}, {}
         templates = document.get("templates")
         profiles = document.get("profiles")
+        if not isinstance(templates, dict) or not isinstance(profiles, dict):
+            self.load_warning = "Preferences are incomplete; the file is preserved."
+            return {}, {}
         loaded_templates = {
             str(key): value
-            for key, value in (templates.items() if isinstance(templates, dict) else ())
+            for key, value in templates.items()
             if isinstance(value, dict)
         }
         loaded_profiles = {
             str(key): value
-            for key, value in (profiles.items() if isinstance(profiles, dict) else ())
+            for key, value in profiles.items()
             if isinstance(value, dict)
         }
         return loaded_templates, loaded_profiles
