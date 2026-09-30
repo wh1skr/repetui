@@ -215,6 +215,34 @@ class ErrorScreen(Screen[None]):
         )
 
 
+class RefreshRecoveryScreen(ErrorScreen):
+    """Keep an unrefreshable post-sync view blocked until it can be rebuilt."""
+
+    BINDINGS = [Binding("r", "retry", show=False)]
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Could not refresh the current view after sync.\n"
+            "The collection is open; press r to retry."
+        )
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("repetui · refresh paused", id="error-header"),
+            VerticalScroll(Static(Text(self.message)), id="error-scroll"),
+            Static("r retry · q quit", classes="surface-footer"),
+            id="error-layout",
+        )
+
+    def action_retry(self) -> None:
+        try:
+            cast("RepetuiApp", self.app).refresh_open_screens()
+        except Exception:
+            self.notify("Could not refresh yet. Try again or quit.", severity="warning")
+            return
+        self.app.pop_screen()
+
+
 class InstanceCloseRequested(Message):
     """A verified peer requested an ordinary app exit."""
 
@@ -1627,6 +1655,7 @@ class ReviewScreen(Screen[None]):
         self._rendered_card_width = 0
         self._rating_feedback: int | None = None
         self._rating_feedback_timer: Timer | None = None
+        self._refresh_failed = False
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -1659,6 +1688,7 @@ class ReviewScreen(Screen[None]):
         return False
 
     def load_next(self) -> None:
+        self._refresh_failed = False
         self.card = self.repetui.backend.next_card()
         if self.card is not None and self.card.raw_content is not None:
             profile = self.repetui.preferences.field_profile(self.card.identity)
@@ -1735,7 +1765,7 @@ class ReviewScreen(Screen[None]):
         return tuple(states)
 
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
-        if self.repetui.syncing:
+        if self.repetui.syncing or self._refresh_failed:
             return
         counts = self.repetui.backend.counts()
         self._displayed_counts = counts
@@ -1769,6 +1799,14 @@ class ReviewScreen(Screen[None]):
         if reset_scroll:
             self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
 
+    def _refresh_or_recover(self, *, reset_scroll: bool = True) -> None:
+        if self.app.screen is not self:
+            return
+        try:
+            self._refresh_view(reset_scroll=reset_scroll)
+        except Exception:
+            self._show_refresh_failure(clear_card=True)
+
     def _refresh_action_row(self, actions: Static) -> None:
         if self.card is not None and self.revealed:
             actions.update(
@@ -1794,7 +1832,7 @@ class ReviewScreen(Screen[None]):
         self._rating_feedback = None
         self._rating_feedback_timer = None
         if self.is_mounted:
-            self._refresh_view(reset_scroll=False)
+            self._refresh_or_recover(reset_scroll=False)
 
     def renderable_width_changed(self, actual_width: int) -> None:
         """Recompose after Textual adds or removes the scrollbar gutter."""
@@ -1804,11 +1842,11 @@ class ReviewScreen(Screen[None]):
             and actual_width > 0
             and actual_width != self._rendered_card_width
         ):
-            self._refresh_view(reset_scroll=False)
+            self._refresh_or_recover(reset_scroll=False)
 
     def on_resize(self) -> None:
         if self.is_mounted:
-            self._refresh_view(reset_scroll=False)
+            self._refresh_or_recover(reset_scroll=False)
 
     def backend_refreshed(self) -> None:
         deck = next(
@@ -1827,28 +1865,39 @@ class ReviewScreen(Screen[None]):
         """Apply saved choices after the settings screen returns."""
         self.expanded_sections.clear()
         self.selected_folded = 0
-        self._refresh_view(reset_scroll=False)
+        self._refresh_or_recover(reset_scroll=False)
 
     def action_back(self) -> None:
         if not self._busy():
             self.app.pop_screen()
 
     def action_primary(self) -> None:
-        if self.revealed:
+        if self._refresh_failed:
+            self._retry_refresh()
+        elif self.revealed:
             self._rate(3)
         else:
             self.action_reveal()
 
+    def _retry_refresh(self) -> None:
+        if self._busy():
+            return
+        try:
+            self.repetui.backend.begin_review(self.deck.id)
+            self.load_next()
+        except Exception:
+            self._show_refresh_failure(clear_card=True)
+
     def action_reveal(self) -> None:
         if not self._busy() and self.card is not None and not self.revealed:
             self.revealed = True
-            self._refresh_view()
+            self._refresh_or_recover()
 
     def action_readings(self) -> None:
         if self._busy() or self.card is None:
             return
         self.show_readings = not self.show_readings
-        self._refresh_view(reset_scroll=False)
+        self._refresh_or_recover(reset_scroll=False)
 
     def action_toggle_fold(self) -> None:
         if not self.revealed:
@@ -1862,31 +1911,36 @@ class ReviewScreen(Screen[None]):
             self.expanded_sections.remove(section.id)
         else:
             self.expanded_sections.add(section.id)
-        self._refresh_view(reset_scroll=False)
+        self._refresh_or_recover(reset_scroll=False)
 
     def _rate(self, rating: int) -> None:
         if self._busy() or self.card is None or not self.revealed:
             return
         try:
             self.repetui.backend.answer(rating)
-            self._set_rating_feedback(rating)
-            self.load_next()
-            self.repetui.dispatch_add_on_event(
-                AddOnEvent(
-                    AddOnEventType.RATING_ACCEPTED,
-                    deck_name=self.deck.name,
-                    rating=rating,
-                )
-            )
-            if self.card is None:
-                self.repetui.dispatch_add_on_event(
-                    AddOnEvent(
-                        AddOnEventType.REVIEW_COMPLETED,
-                        deck_name=self.deck.name,
-                    )
-                )
         except Exception as exc:
             self.notify(str(exc), severity="error")
+            return
+        self._set_rating_feedback(rating)
+        self.repetui.dispatch_add_on_event(
+            AddOnEvent(
+                AddOnEventType.RATING_ACCEPTED,
+                deck_name=self.deck.name,
+                rating=rating,
+            )
+        )
+        try:
+            self.load_next()
+        except Exception:
+            self._show_refresh_failure(clear_card=True, committed_action="Rating")
+            return
+        if self.card is None:
+            self.repetui.dispatch_add_on_event(
+                AddOnEvent(
+                    AddOnEventType.REVIEW_COMPLETED,
+                    deck_name=self.deck.name,
+                )
+            )
 
     def action_again(self) -> None:
         self._rate(1)
@@ -1935,8 +1989,15 @@ class ReviewScreen(Screen[None]):
             return
         self._show_operation_status("[ok] undone", success=True)
 
-    def _show_refresh_failure(self, *, clear_card: bool) -> None:
+    def _show_refresh_failure(
+        self, *, clear_card: bool, committed_action: str | None = None
+    ) -> None:
         if clear_card:
+            if self._rating_feedback_timer is not None:
+                self._rating_feedback_timer.stop()
+                self._rating_feedback_timer = None
+            self._rating_feedback = None
+            self._refresh_failed = True
             with contextlib.suppress(Exception):
                 self.repetui.backend.begin_review(self.deck.id)
             self.card = None
@@ -1945,10 +2006,17 @@ class ReviewScreen(Screen[None]):
             self.selected_folded = 0
             content = Text("review · ", style="#dc6b72")
             content.append(self.deck.leaf_name, style="bold #eee9e0")
-            content.append("\nCould not refresh cards.", style="#aaa49b")
+            if committed_action is not None:
+                content.append(f"\n{committed_action} saved.", style="#aaa49b")
+            content.append("\nCould not refresh cards. Enter: retry.", style="#aaa49b")
             self.query_one("#card", Static).update(content)
             self.query_one("#review-actions", Static).display = False
-        self._show_operation_status("[err] refresh failed", success=False)
+        message = (
+            f"[err] {committed_action.lower()} saved; refresh failed"
+            if committed_action is not None
+            else "[err] refresh failed"
+        )
+        self._show_operation_status(message, success=False)
 
     def _advance_after_operation(
         self,
@@ -2010,14 +2078,14 @@ class ReviewScreen(Screen[None]):
         folded = self._folded_sections()
         if self.revealed and folded:
             self.selected_folded = (self.selected_folded + 1) % len(folded)
-            self._refresh_view(reset_scroll=False)
+            self._refresh_or_recover(reset_scroll=False)
         self.query_one(VerticalScroll).scroll_down(animate=False)
 
     def action_scroll_up(self) -> None:
         folded = self._folded_sections()
         if self.revealed and folded:
             self.selected_folded = (self.selected_folded - 1) % len(folded)
-            self._refresh_view(reset_scroll=False)
+            self._refresh_or_recover(reset_scroll=False)
         self.query_one(VerticalScroll).scroll_up(animate=False)
 
     def action_scroll_top(self) -> None:
@@ -2743,6 +2811,12 @@ class RepetuiApp(App[None]):
             self.switch_screen(DeckScreen())
         else:
             self.push_screen(DeckScreen())
+        if isinstance(self.preferences, JsonPreferences) and self.preferences.load_warning:
+            self.notify(
+                "Preferences are read-only; the original file was preserved.",
+                severity="warning",
+                timeout=10,
+            )
 
     def on_instance_close_requested(self, message: InstanceCloseRequested) -> None:
         if not self.syncing:
@@ -2815,11 +2889,18 @@ class RepetuiApp(App[None]):
     def _sync_popup_closed(self, fatal: bool | None) -> None:
         fatal_error = self._sync_fatal_error
         self.lifecycle.finish_sync()
-        if self.backend.is_open:
-            for screen in self.screen_stack:
-                if hasattr(screen, "backend_refreshed"):
-                    cast(Refreshable, screen).backend_refreshed()
         self._sync_popup = None
         self._sync_fatal_error = None
+        if self.backend.is_open:
+            try:
+                self.refresh_open_screens()
+            except Exception:
+                self.push_screen(RefreshRecoveryScreen())
+                return
         if fatal and fatal_error is not None:
             self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))
+
+    def refresh_open_screens(self) -> None:
+        for screen in tuple(self.screen_stack):
+            if hasattr(screen, "backend_refreshed"):
+                cast(Refreshable, screen).backend_refreshed()
