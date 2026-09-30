@@ -294,6 +294,58 @@ def test_media_only_and_unknown_html_have_complete_deterministic_fallbacks() -> 
     assert unknown.back.sections[0].label == "Answer"
 
 
+def test_image_occurrences_keep_source_order_when_answer_repeats_question() -> None:
+    front = 'Prompt <img src="one%20pic.png" alt="first"> then <img src="two.png">'
+    back = front + '<div>Answer <img src="answer.png"> after</div>'
+    card = present_card(raw(front, back))
+
+    front_section = card.front.sections[0]
+    back_section = card.back.sections[0]
+    assert [image.source for image in front_section.images] == ["one%20pic.png", "two.png"]
+    assert [image.source for image in back_section.images] == ["answer.png"]
+    assert [front_section.text[image.start:image.end] for image in front_section.images] == [
+        "[image: first]", "[image: two.png]"
+    ]
+    assert back_section.text[back_section.images[0].start:back_section.images[0].end] == (
+        "[image: answer.png]"
+    )
+
+
+def test_image_occurrences_follow_saved_field_profile_and_skip_hidden_html() -> None:
+    card = present_card(
+        RawCardContent(
+            IDENTITY,
+            '<div hidden><img src="secret.png"></div><img src="front.png">',
+            '<hr id=answer><img src="back.png">',
+            (
+                SourceField("Question", '<img src="front.png">'),
+                SourceField("Answer", '<img src="back.png">'),
+            ),
+        ),
+        TemplateFieldProfile(("Question",), ("Answer",)),
+    )
+
+    assert [image.source for section in card.front.sections for image in section.images] == [
+        "front.png"
+    ]
+    assert [image.source for section in card.back.sections for image in section.images] == [
+        "back.png"
+    ]
+
+
+def test_latex_image_keeps_text_fallback_without_picture_reference() -> None:
+    card = present_card(raw('<img class="latex" src="formula.png">', "answer"))
+    assert card.front.text == "[math: formula.png]"
+    assert card.front.sections[0].images == ()
+
+
+def test_heading_picture_falls_back_without_losing_its_source() -> None:
+    card = present_card(raw("question", '<h2><img src="heading.png"></h2>answer'))
+    assert [image.source for section in card.back.sections for image in section.images] == [
+        "heading.png"
+    ]
+
+
 def test_hidden_content_stays_hidden_and_empty_back_does_not_repeat_front() -> None:
     card = present_card(
         raw(

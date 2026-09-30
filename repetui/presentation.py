@@ -19,6 +19,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from rich.cells import cell_len
+from rich.style import Style
 from rich.text import Text
 
 from .card_text import INLINE_FURIGANA, annotated, annotations, extract_readings, normalise
@@ -107,6 +108,15 @@ class RawCardContent:
 
 
 @dataclass(frozen=True)
+class ImageSpan:
+    """One image occurrence in a section's normalized text."""
+
+    start: int
+    end: int
+    source: str
+
+
+@dataclass(frozen=True)
 class PresentationSection:
     """One ordered section whose content came from the rendered card side."""
 
@@ -117,6 +127,7 @@ class PresentationSection:
     label_is_content: bool = False
     underlines: tuple[tuple[int, int], ...] = ()
     furigana: tuple[tuple[int, int, str], ...] = ()
+    images: tuple[ImageSpan, ...] = ()
 
     @property
     def display_text(self) -> str:
@@ -228,6 +239,7 @@ class _RenderedHTMLParser(HTMLParser):
         self.underline_ranges: list[tuple[int, int]] = []
         self._ruby_stack: list[_RubyCapture] = []
         self.ruby_ranges: list[tuple[int, int, str]] = []
+        self.image_ranges: list[ImageSpan] = []
 
     def _emit(self, text: str) -> None:
         start = self._raw_length
@@ -357,7 +369,12 @@ class _RenderedHTMLParser(HTMLParser):
             if not label:
                 label = _media_name(attributes.get("src") or "")
             kind = "math" if "latex" in classes else "image"
+            start = self._raw_length
             self._emit(f"[{kind}: {label.strip()}]" if label else f"[{kind}]")
+            if kind == "image":
+                self.image_ranges.append(
+                    ImageSpan(start, self._raw_length, attributes.get("src") or "")
+                )
         elif tag in {"audio", "video"}:
             self._media_tag = tag
             label = attributes.get("title") or _media_name(attributes.get("src") or "")
@@ -464,6 +481,7 @@ class _RenderedDocument:
     atoms: tuple[str, ...]
     underlines: tuple[tuple[int, int], ...] = ()
     furigana: tuple[tuple[int, int, str], ...] = ()
+    images: tuple[ImageSpan, ...] = ()
 
 
 def _declares_underline(declarations: str) -> bool | None:
@@ -531,11 +549,19 @@ def _render_document(
                 for left, right, reading in parser.ruby_ranges if left < end and right > start
             ),
         )
+        for image in parser.image_ranges:
+            if image.start >= start and image.end <= end:
+                source.stylize(
+                    Style(meta={"repetui_image": image.source}),
+                    image.start - start,
+                    image.end - start,
+                )
         return extract_readings(normalise(source, placeholders))
 
     marked = render_range(0, len(raw_text))
     text = marked.plain
     underlines, furigana = annotations(marked)
+    images = _image_spans(marked)
     sections = tuple(
         (
             section.kind,
@@ -556,6 +582,7 @@ def _render_document(
         atoms,
         underlines,
         furigana,
+        images,
     )
 
 
@@ -579,8 +606,35 @@ def _label_key(value: str) -> str:
 
 
 def _media_name(source: str) -> str:
-    path = urlsplit(source.replace("\\", "/")).path
+    try:
+        path = urlsplit(source.replace("\\", "/")).path
+    except ValueError:
+        return ""
     return os.path.basename(path)
+
+
+def _image_spans(text: Text) -> tuple[ImageSpan, ...]:
+    images: list[ImageSpan] = []
+    for span in text.spans:
+        style = Style.parse(span.style) if isinstance(span.style, str) else span.style
+        source = style.meta.get("repetui_image")
+        if isinstance(source, str) and span.start < span.end:
+            images.append(ImageSpan(span.start, span.end, source))
+    return tuple(images)
+
+
+def _marked_text(
+    text: str,
+    underlines: tuple[tuple[int, int], ...],
+    furigana: tuple[tuple[int, int, str], ...],
+    images: tuple[ImageSpan, ...],
+) -> Text:
+    result = annotated(text, underlines, furigana)
+    for image in images:
+        result.stylize(
+            Style(meta={"repetui_image": image.source}), image.start, image.end
+        )
+    return result
 
 
 def _unique_id(prefix: str, value: str, seen: dict[str, int]) -> str:
@@ -599,10 +653,13 @@ def _with_document_marks(
     if document.text[offset : offset + len(section.text)] != section.text:
         return section
     end = offset + len(section.text)
-    underlines, furigana = annotations(
-        annotated(document.text, document.underlines, document.furigana)[offset:end]
+    marked = _marked_text(
+        document.text, document.underlines, document.furigana, document.images
+    )[offset:end]
+    underlines, furigana = annotations(marked)
+    return replace(
+        section, underlines=underlines, furigana=furigana, images=_image_spans(marked)
     )
-    return replace(section, underlines=underlines, furigana=furigana)
 
 
 def _structural_sections(side: str, document: _RenderedDocument) -> tuple[PresentationSection, ...]:
@@ -615,8 +672,12 @@ def _structural_sections(side: str, document: _RenderedDocument) -> tuple[Presen
         result.append(PresentationSection(
             f"{side}:preamble", document.prelude.plain,
             underlines=underlines, furigana=furigana,
+            images=_image_spans(document.prelude),
         ))
     for kind, raw_label, body in document.structural_sections:
+        if kind == "heading" and _image_spans(raw_label):
+            # A heading image cannot live in a section's plain-text label.
+            return ()
         label = raw_label.plain.removesuffix(":").strip()
         if label or body:
             if kind == "label" or raw_label.plain.rstrip().endswith(":"):
@@ -629,6 +690,7 @@ def _structural_sections(side: str, document: _RenderedDocument) -> tuple[Presen
                         label=label or None,
                         underlines=underlines,
                         furigana=furigana,
+                        images=_image_spans(text),
                     )
                 )
             else:
@@ -641,6 +703,7 @@ def _structural_sections(side: str, document: _RenderedDocument) -> tuple[Presen
                         label_is_content=True,
                         underlines=underlines,
                         furigana=furigana,
+                        images=_image_spans(body),
                     )
                 )
     joined = "\n\n".join(section.display_text for section in result)
@@ -745,6 +808,7 @@ def _present_side(
                 label,
                 underlines=document.underlines,
                 furigana=document.furigana,
+                images=document.images,
             ),
         )
     )
@@ -755,6 +819,19 @@ def _strip_answer_html(back_html: str) -> tuple[str, bool]:
     if match:
         return back_html[match.end() :], True
     return back_html, False
+
+
+def _marked_side_text(side: CardSide) -> Text:
+    parts: list[Text] = []
+    for section in side.sections:
+        body = _marked_text(
+            section.text, section.underlines, section.furigana, section.images
+        )
+        if section.label_is_content and section.label:
+            prefix = section.label + ("\n" if section.text else "")
+            body = Text(prefix) + body
+        parts.append(body)
+    return Text("\n\n").join(parts)
 
 
 def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
@@ -769,27 +846,14 @@ def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
     ):
         remainder = back_text[len(front_text) :].lstrip("\n ─")
         if remainder:
-            if len(back.sections) == 1:
-                section = back.sections[0]
-                offset = len(section.text) - len(remainder)
-                if offset >= 0 and section.text[offset:] == remainder:
-                    end = offset + len(remainder)
-                    underlines, furigana = annotations(
-                        annotated(section.text, section.underlines, section.furigana)[offset:end]
-                    )
-                    return CardSide(
-                        (
-                            replace(
-                                section,
-                                id="back:fallback",
-                                text=remainder,
-                                label="Answer",
-                                underlines=underlines,
-                                furigana=furigana,
-                            ),
-                        )
-                    )
-            return CardSide((PresentationSection("back:fallback", remainder, "Answer"),))
+            offset = len(back_text) - len(remainder)
+            marked = _marked_side_text(back)[offset:]
+            underlines, furigana = annotations(marked)
+            return CardSide((PresentationSection(
+                "back:fallback", remainder, "Answer",
+                underlines=underlines, furigana=furigana,
+                images=_image_spans(marked),
+            ),))
     return back
 
 
@@ -1101,6 +1165,7 @@ def _field_side(
                 source_label=name,
                 underlines=rendered.underlines,
                 furigana=rendered.furigana,
+                images=rendered.images,
             )
         )
     if sections:

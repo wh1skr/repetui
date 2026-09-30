@@ -4,6 +4,8 @@ from pathlib import Path
 from threading import Event
 
 import pytest
+from PIL import Image, ImageDraw
+from textual.containers import ScrollableContainer, VerticalScroll
 from textual.widgets import Input, ListItem, Static
 
 import repetui.app as app_module
@@ -24,6 +26,7 @@ from repetui.app import (
     DeckScreen,
     ErrorScreen,
     FlagSelectionPill,
+    ImageDetailScreen,
     OperationStatusPill,
     RepetuiApp,
     ReviewScreen,
@@ -38,6 +41,7 @@ from repetui.backend import BackendError, CollectionInUseError, Deck, DueCounts,
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
+from repetui.native_images import NativeImageOverlay
 from repetui.preferences import (
     ActionFeedbackDuration,
     AnswerLayout,
@@ -45,6 +49,7 @@ from repetui.preferences import (
     SectionMode,
 )
 from repetui.presentation import (
+    AVReference,
     CardTemplateIdentity,
     RawCardContent,
     SourceField,
@@ -108,6 +113,9 @@ class FakeBackend:
             presentation = present_card(content)
             return ReviewCard(42, presentation, raw_content=content)
         return None
+
+    def media_path(self, filename: str) -> Path:
+        return Path("/tmp/collection.media") / filename
 
     def sample_cards(
         self,
@@ -272,6 +280,326 @@ async def test_review_uses_the_saved_field_profile_for_a_dynamic_template(tmp_pa
 
         assert "actual answer" in rendered_text(review)
         assert "template controls" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+async def test_inline_picture_keeps_prompt_and_rating_visible_at_40x6(tmp_path) -> None:
+    image = Image.new("RGB", (32, 24), "white")
+    ImageDraw.Draw(image).rectangle((4, 3, 27, 20), fill="red")
+    image.save(tmp_path / "front.png")
+    image.save(tmp_path / "back.png")
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        'Question <img src="front.png"> after image',
+        '<hr id=answer>Answer <img src="back.png">',
+    )
+    app, backend = make_app(tmp_path, content)
+    backend.media_path = lambda name: tmp_path / name
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        await pilot.pause()
+        front = rendered_text(review)
+        assert front.count("Question") == 1
+        assert front.count("after image") == 1
+        assert "[image: front.png]" in front
+        assert "[image: back.png]" not in front
+        assert "[picture unavailable]" not in front
+        assert "[image:" not in rendered_card_row(review, 0)
+        assert review.query_one("#card-scroll", VerticalScroll).region.height >= 3
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "[image: back.png]" in rendered_text(review)
+        assert review.revealed
+        assert review.query_one("#review-actions", Static).display
+
+
+@pytest.mark.asyncio
+async def test_image_only_card_with_multiple_pictures_scrolls_at_40x6(tmp_path) -> None:
+    image = Image.new("RGB", (24, 24), "#266d9d")
+    for name in ("one.png", "two.png", "three.png"):
+        image.save(tmp_path / name)
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        '<img src="one.png"><img src="two.png"><img src="three.png">',
+        '<hr id=answer>Done',
+    )
+    app, backend = make_app(tmp_path, content)
+    backend.media_path = lambda name: tmp_path / name
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        await pilot.pause()
+        card = rendered_text(review)
+        assert card.index("[image: one.png]") < card.index("[image: two.png]")
+        assert card.index("[image: two.png]") < card.index("[image: three.png]")
+        assert "[picture unavailable]" not in card
+        assert "[image:" not in rendered_card_row(review, 0)
+        scroller = review.query_one("#card-scroll", VerticalScroll)
+        await pilot.press("G")
+        await pilot.pause()
+        assert scroller.scroll_y > 0
+
+
+@pytest.mark.asyncio
+async def test_image_detail_selects_visible_pictures_pans_and_returns_at_40x6(
+    tmp_path, monkeypatch
+) -> None:
+    sound_plays = []
+
+    class FakeAudioPlayer:
+        def __init__(self, report_error) -> None:
+            self.report_error = report_error
+
+        def play(self, paths) -> None:
+            sound_plays.append(tuple(paths))
+
+        def stop(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(app_module, "CardAudioPlayer", FakeAudioPlayer)
+    image = Image.new("RGB", (640, 480), "#c3dae5")
+    drawing = ImageDraw.Draw(image)
+    for x in range(0, 640, 32):
+        drawing.line((x, 0, x, 479), fill="#b73524", width=5)
+    for y in range(0, 480, 32):
+        drawing.line((0, y, 639, y), fill="#2a694b", width=5)
+    for name in ("front-one.png", "front-two.png", "answer.png"):
+        image.save(tmp_path / name)
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        '<img src="front-one.png"><img src="front-two.png">',
+        '<hr id=answer><h2>Answer picture</h2><img src="answer.png">',
+        front_av=(AVReference("audio", "front.wav"),),
+    )
+    presentation = present_card(content)
+    answer_section = next(
+        section for section in presentation.back.sections if section.images
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    preferences.set_mode(content.identity, answer_section.id, SectionMode.FOLD)
+    app, backend = make_app(tmp_path, content, preferences)
+    backend.media_path = lambda name: tmp_path / name
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        card = review.card
+        assert card is not None
+        assert len(sound_plays) == 1
+
+        await pilot.press("v")
+        viewer = app.screen
+        assert isinstance(viewer, ImageDetailScreen)
+        assert viewer.sources == ("front-one.png", "front-two.png")
+        scroller = viewer.query_one("#image-detail-scroll", ScrollableContainer)
+        picture = viewer.query_one("#image-detail-picture", Static)
+        assert scroller.region.height >= 4
+        assert len(str(picture.render()).splitlines()) > 3
+        await pilot.press("right", "down")
+        assert scroller.scroll_x > 0 and scroller.scroll_y > 0
+        await pilot.press("tab")
+        assert viewer.index == 1
+        await pilot.press("shift+tab")
+        assert viewer.index == 0
+        await pilot.resize_terminal(55, 10)
+        assert isinstance(app.screen, ImageDetailScreen)
+        assert viewer.index == 0
+        await pilot.press("space", "3", "escape")
+        assert app.screen is review
+        assert review.card is card and review.revealed is False
+        assert backend.rating is None and len(sound_plays) == 1
+
+        await pilot.press("enter", "v")
+        sound_plays_after_reveal = len(sound_plays)
+        viewer = app.screen
+        assert isinstance(viewer, ImageDetailScreen)
+        assert viewer.sources == ("front-one.png", "front-two.png")
+        await pilot.press("escape", "space", "v")
+        viewer = app.screen
+        assert isinstance(viewer, ImageDetailScreen)
+        assert viewer.sources == ("front-one.png", "front-two.png", "answer.png")
+        await pilot.press("tab", "tab")
+        assert viewer.index == 2
+        assert "3/3" in str(viewer.query_one("#image-detail-header", Static).render())
+        await pilot.press("escape")
+        assert app.screen is review and review.revealed is True
+        assert review.card is card and backend.rating is None
+        assert len(sound_plays) == sound_plays_after_reveal
+        await pilot.press("3")
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+async def test_native_preview_and_detail_clear_on_review_transitions_at_40x6(tmp_path) -> None:
+    Image.new("RGB", (32, 24), "#b73524").save(tmp_path / "front.png")
+    Image.new("RGB", (32, 24), "#2a694b").save(tmp_path / "back.png")
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        '<img src="front.png">',
+        '<hr id=answer><img src="back.png">',
+    )
+    app, backend = make_app(tmp_path, content)
+    backend.media_path = lambda name: tmp_path / name
+    emitted: list[str] = []
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        review._native = NativeImageOverlay(emitted.append, enabled=True)
+        review._native_invalidated()
+        await pilot.pause()
+        assert any("a=p,i=" in part for part in emitted)
+
+        emitted.clear()
+        await pilot.press("enter")  # Reveal replaces the preview placements.
+        await pilot.pause()
+        assert any("a=d,d=I,i=" in part for part in emitted)
+        assert any("a=p,i=" in part for part in emitted)
+
+        emitted.clear()
+        await pilot.press("v")
+        viewer = app.screen
+        assert isinstance(viewer, ImageDetailScreen)
+        assert any("a=d,d=I,i=" in part for part in emitted)
+        viewer._native = NativeImageOverlay(emitted.append, enabled=True)
+        viewer._native_invalidated()
+        await pilot.pause()
+        assert any("a=p,i=" in part for part in emitted)
+
+        emitted.clear()
+        await pilot.press("down", "right")
+        await pilot.pause()
+        assert any("a=d,d=I,i=" in part for part in emitted)
+        assert any("a=p,i=" in part for part in emitted)
+
+        emitted.clear()
+        await pilot.resize_terminal(55, 10)
+        await pilot.pause()
+        assert any("a=d,d=I,i=" in part for part in emitted)
+        assert any("a=p,i=" in part for part in emitted)
+
+        emitted.clear()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert any("a=d,d=I,i=" in part for part in emitted)
+        assert app.screen is review
+        await pilot.press("3")
+        await pilot.pause()
+        assert backend.rating == 3
+        assert review._native_pictures == ()
+
+
+@pytest.mark.asyncio
+async def test_view_picture_key_without_visible_image_keeps_review_state(tmp_path) -> None:
+    app, backend = make_app(tmp_path)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "v")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is not None and review.revealed is False
+        assert backend.rating is None
+
+
+@pytest.mark.asyncio
+async def test_recorded_audio_follows_visible_side_and_replay_at_40x6(
+    tmp_path, monkeypatch
+) -> None:
+    events: list[tuple[str, tuple[str, ...]]] = []
+
+    class FakeAudioPlayer:
+        def __init__(self, report_error) -> None:
+            self.report_error = report_error
+
+        def play(self, paths) -> None:
+            events.append(("play", tuple(path.name for path in paths)))
+
+        def stop(self) -> None:
+            events.append(("stop", ()))
+
+        async def close(self) -> None:
+            self.stop()
+
+    class AudioBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.card_ids = [42, 43]
+
+        def next_card(self) -> ReviewCard | None:
+            if not self.card_ids:
+                return None
+            card_id = self.card_ids[0]
+            content = RawCardContent(
+                CardTemplateIdentity(1, "Basic", 0, "Card 1"),
+                f"question {card_id}",
+                f"answer {card_id}",
+                front_av=(AVReference("audio", f"front-{card_id}.mp3"),),
+                back_av=(
+                    AVReference("audio", f"back-{card_id}-1.mp3"),
+                    AVReference("audio", "bad%2Fclip.mp3"),
+                    AVReference("text to speech", "ja_JP"),
+                    AVReference("audio", f"back-{card_id}-2.mp3"),
+                ),
+            )
+            return ReviewCard(card_id, present_card(content), raw_content=content)
+
+        def answer(self, rating: int) -> None:
+            self.rating = rating
+            self.card_ids.pop(0)
+
+        def media_path(self, filename: str) -> Path:
+            if filename == "bad%2Fclip.mp3":
+                raise ValueError("unsafe media name")
+            return super().media_path(filename)
+
+    monkeypatch.setattr(app_module, "CardAudioPlayer", FakeAudioPlayer)
+    backend = AudioBackend()
+    profile = ProfilePaths(tmp_path, "test", tmp_path / "collection.anki2")
+    app = RepetuiApp(backend, profile, JsonPreferences(tmp_path / "preferences.json"))
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert ("play", ("front-42.mp3",)) in events
+        assert not any("back-42" in str(event) for event in events)
+
+        before_redraw = list(events)
+        review.on_resize()
+        review.renderable_width_changed(39)
+        assert events == before_redraw
+
+        await pilot.press("p")
+        assert review.card is not None and review.card.id == 42
+        assert review.revealed is False
+        assert events[-1] == ("play", ("front-42.mp3",))
+
+        await pilot.press("enter")
+        assert review.revealed is True
+        assert events[-1] == ("play", ("back-42-1.mp3", "back-42-2.mp3"))
+        await pilot.press("p")
+        assert review.revealed is True
+        assert events[-1] == ("play", ("back-42-1.mp3", "back-42-2.mp3"))
+
+        await pilot.press("3")
+        assert backend.rating == 3
+        assert review.card is not None and review.card.id == 43
+        assert review.revealed is False
+        assert events[-2:] == [("stop", ()), ("play", ("front-43.mp3",))]
+
+        await pilot.press("escape")
+        assert events[-1] == ("stop", ())
 
 
 @pytest.mark.asyncio
@@ -2331,7 +2659,7 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
         assert controls.display is True
         assert controls.region == (0, 2, 40, 3)
         rows = list(controls.children)
-        assert len(rows) == 12
+        assert len(rows) == 14
         rendered_rows = [
             (
                 str(row.query_one(".control-label").render()),
@@ -2350,6 +2678,8 @@ async def test_controls_tab_lists_every_review_action_and_binding_at_40x6(tmp_pa
             ("Suspend", "x"),
             ("Flag", "f"),
             ("Readings", "r"),
+            ("Replay audio", "p"),
+            ("View picture", "v"),
             ("Sync", "s"),
             ("Action feedback duration", "Normal"),
         ]
@@ -2712,7 +3042,7 @@ async def test_failed_control_write_preserves_the_active_mapping(
             raise OSError("disk unavailable")
 
         monkeypatch.setattr(Path, "replace", fail_replace)
-        await pilot.press("v")
+        await pilot.press("m")
 
         assert str(settings.query_one("#settings-footer").render()) == (
             "[err] controls not saved"

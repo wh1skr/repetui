@@ -7,6 +7,7 @@ import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from threading import Thread
 from typing import Protocol, cast
 
@@ -15,7 +16,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
@@ -33,6 +34,7 @@ from .addons import (
     SettingDefinition,
     bundled_add_ons,
 )
+from .audio import CardAudioPlayer
 from .backend import AnkiBackend, BackendError, CollectionInUseError, Deck, ReviewCard
 from .completion import completion_duration_seconds, compose_completion_frame
 from .config import ProfilePaths
@@ -50,7 +52,14 @@ from .flow import (
     compose_review,
     section_name,
 )
+from .images import (
+    ImagePreviewError,
+    expand_image_previews,
+    render_image_detail,
+    resolve_local_image,
+)
 from .lifecycle import CollectionLifecycle, SyncRunResult
+from .native_images import NativeImageOverlay, NativePicture, mark_native_picture, overlay_for_app
 from .preferences import (
     ActionFeedbackDuration,
     AnswerLayout,
@@ -1586,6 +1595,174 @@ class ReviewContent(Static):
             screen.renderable_width_changed(self.size.width)
 
 
+class NativeScrollMixin:
+    """Invalidate native pixels before a scroll moves their character anchors."""
+
+    def _native_scrolled(self) -> None:
+        if self.is_mounted:
+            screen = self.screen
+            if isinstance(screen, (ReviewScreen, ImageDetailScreen)):
+                screen._native_invalidated()
+
+    def watch_scroll_x(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_x(old_value, new_value)
+        if old_value != new_value:
+            self._native_scrolled()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if old_value != new_value:
+            self._native_scrolled()
+
+
+class NativeCardScroll(NativeScrollMixin, VerticalScroll):
+    pass
+
+
+class NativeDetailScroll(NativeScrollMixin, ScrollableContainer):
+    pass
+
+
+class ImageDetailScreen(Screen[None]):
+    """Full-pane character image that can pan and switch visible card pictures."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Review", show=False),
+        Binding("q", "back", "Review", show=False, priority=True),
+        Binding("up", "pan_up", "Pan up", show=False),
+        Binding("down", "pan_down", "Pan down", show=False),
+        Binding("left", "pan_left", "Pan left", show=False),
+        Binding("right", "pan_right", "Pan right", show=False),
+        Binding("tab", "next_image", "Next picture", show=False),
+        Binding("shift+tab", "previous_image", "Previous picture", show=False),
+    ]
+
+    def __init__(self, sources: tuple[str, ...], resolve: Callable[[str], Path]) -> None:
+        super().__init__()
+        self.sources = sources
+        self.resolve = resolve
+        self.index = 0
+        self._rendered: tuple[int, int, int] | None = None
+        self._native: NativeImageOverlay | None = None
+        self._native_pictures: tuple[NativePicture, ...] = ()
+        self._native_paint_pending = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="image-detail-header")
+        with NativeDetailScroll(id="image-detail-scroll"):
+            yield Static(id="image-detail-picture")
+
+    def on_mount(self) -> None:
+        self._native = overlay_for_app(self.app)
+        self.call_after_refresh(self._render_picture)
+
+    def on_unmount(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+
+    def on_screen_suspend(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+
+    def on_screen_resume(self) -> None:
+        self._native_invalidated()
+
+    def _native_invalidated(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            self._schedule_native_paint()
+
+    def _schedule_native_paint(self) -> None:
+        if self._native is None or not self._native.enabled:
+            return
+        if not self._native_paint_pending:
+            self._native_paint_pending = True
+            self.call_after_refresh(self._paint_native)
+
+    def _paint_native(self) -> None:
+        self._native_paint_pending = False
+        if self.app.screen is self and self._native is not None:
+            self._native.paint(
+                self.query_one("#image-detail-picture", Static),
+                self.query_one("#image-detail-scroll", ScrollableContainer),
+                self._native_pictures,
+            )
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            if self._native is not None:
+                self._native.clear()
+            self.call_after_refresh(self._render_picture)
+
+    def _render_picture(self) -> None:
+        if not self.is_mounted:
+            return
+        width = max(80, min(160, self.size.width * 2))
+        rows = max(24, min(72, (self.size.height - 1) * 4))
+        state = (self.index, width, rows)
+        if state == self._rendered:
+            self._schedule_native_paint()
+            return
+        scroller = self.query_one("#image-detail-scroll", ScrollableContainer)
+        previous_x = scroller.scroll_x if self._rendered and self._rendered[0] == self.index else 0
+        previous_y = scroller.scroll_y if self._rendered and self._rendered[0] == self.index else 0
+        self._rendered = state
+        if self._native is not None:
+            self._native.clear()
+        self._native_pictures = ()
+        source = self.sources[self.index]
+        header = f"{self.index + 1}/{len(self.sources)} · arrows pan · tab next · esc"
+        self.query_one("#image-detail-header", Static).update(Text(header, no_wrap=True))
+        try:
+            path = resolve_local_image(source, self.resolve)
+            picture = render_image_detail(path, width, rows)
+            lines = picture.plain.splitlines()
+            self._native_pictures = (
+                NativePicture(path, max(map(cell_len, lines), default=1), len(lines)),
+            )
+            picture = mark_native_picture(picture, 0)
+        except (ImagePreviewError, OSError, ValueError, RuntimeError):
+            picture = Text("[picture unavailable]", style="#dc6b72")
+        widget = self.query_one("#image-detail-picture", Static)
+        widget.styles.width = max(
+            (cell_len(line) for line in picture.plain.splitlines()), default=1
+        )
+        widget.update(picture)
+        scroller.scroll_to(x=previous_x, y=previous_y, animate=False)
+        self._schedule_native_paint()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_pan_up(self) -> None:
+        self.query_one("#image-detail-scroll", ScrollableContainer).scroll_relative(
+            y=-2, animate=False
+        )
+
+    def action_pan_down(self) -> None:
+        self.query_one("#image-detail-scroll", ScrollableContainer).scroll_relative(
+            y=2, animate=False
+        )
+
+    def action_pan_left(self) -> None:
+        self.query_one("#image-detail-scroll", ScrollableContainer).scroll_relative(
+            x=-4, animate=False
+        )
+
+    def action_pan_right(self) -> None:
+        self.query_one("#image-detail-scroll", ScrollableContainer).scroll_relative(
+            x=4, animate=False
+        )
+
+    def action_next_image(self) -> None:
+        self.index = (self.index + 1) % len(self.sources)
+        self._render_picture()
+
+    def action_previous_image(self) -> None:
+        self.index = (self.index - 1) % len(self.sources)
+        self._render_picture()
+
+
 class ReviewScreen(Screen[None]):
     RATING_FEEDBACK_DURATION = 1.0
 
@@ -1608,6 +1785,8 @@ class ReviewScreen(Screen[None]):
         Binding("x", "suspend", "Suspend", show=False, id="review.suspend"),
         Binding("f", "flag", "Flag", show=False, id="review.flag"),
         Binding("r", "readings", "Readings", show=False, id="review.readings"),
+        Binding("p", "replay_audio", "Replay audio", show=False, id="review.replay_audio"),
+        Binding("v", "view_image", "View picture", show=False, id="review.view_image"),
         Binding("j", "scroll_down", "Scroll down", show=False),
         Binding("k", "scroll_up", "Scroll up", show=False),
         Binding("g", "scroll_top", "Top", show=False),
@@ -1627,6 +1806,11 @@ class ReviewScreen(Screen[None]):
         self._rendered_card_width = 0
         self._rating_feedback: int | None = None
         self._rating_feedback_timer: Timer | None = None
+        self._audio = CardAudioPlayer(self._audio_error)
+        self._visible_images: tuple[str, ...] = ()
+        self._native: NativeImageOverlay | None = None
+        self._native_pictures: tuple[NativePicture, ...] = ()
+        self._native_paint_pending = False
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -1634,12 +1818,13 @@ class ReviewScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            VerticalScroll(ReviewContent(id="card"), id="card-scroll"),
+            NativeCardScroll(ReviewContent(id="card"), id="card-scroll"),
             Static(id="review-actions"),
             id="review-layout",
         )
 
     def on_mount(self) -> None:
+        self._native = overlay_for_app(self.app)
         self.repetui.backend.begin_review(self.deck.id)
         self.load_next()
         if self.card is not None:
@@ -1647,10 +1832,41 @@ class ReviewScreen(Screen[None]):
                 AddOnEvent(AddOnEventType.REVIEW_STARTED, deck_name=self.deck.name)
             )
 
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+        await self._audio.close()
         if self._rating_feedback_timer is not None:
             self._rating_feedback_timer.stop()
             self._rating_feedback_timer = None
+
+    def on_screen_suspend(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+
+    def on_screen_resume(self) -> None:
+        self._native_invalidated()
+
+    def _native_invalidated(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            self._schedule_native_paint()
+
+    def _schedule_native_paint(self) -> None:
+        if self._native is None or not self._native.enabled:
+            return
+        if not self._native_paint_pending:
+            self._native_paint_pending = True
+            self.call_after_refresh(self._paint_native)
+
+    def _paint_native(self) -> None:
+        self._native_paint_pending = False
+        if self.app.screen is self and self._native is not None:
+            self._native.paint(
+                self.query_one("#card", Static),
+                self.query_one("#card-scroll", VerticalScroll),
+                self._native_pictures,
+            )
 
     def _busy(self) -> bool:
         if self.repetui.syncing:
@@ -1659,6 +1875,7 @@ class ReviewScreen(Screen[None]):
         return False
 
     def load_next(self) -> None:
+        self._audio.stop()
         self.card = self.repetui.backend.next_card()
         if self.card is not None and self.card.raw_content is not None:
             profile = self.repetui.preferences.field_profile(self.card.identity)
@@ -1671,8 +1888,32 @@ class ReviewScreen(Screen[None]):
         self.expanded_sections.clear()
         self.selected_folded = 0
         self._refresh_view()
+        self._play_side()
         if self.card is not None and self.card.presentation.suggested_profile is not None:
             self.call_after_refresh(self._offer_field_setup)
+
+    def _audio_error(self, message: str) -> None:
+        if self.is_mounted:
+            self.notify(message, severity="warning")
+
+    def _play_side(self, *, replay: bool = False) -> None:
+        if self.card is None or self.card.raw_content is None:
+            self._audio.stop()
+            return
+        references = (
+            self.card.raw_content.back_av if self.revealed else self.card.raw_content.front_av
+        )
+        paths = []
+        for reference in references:
+            if reference.kind != "audio" or not reference.label:
+                continue
+            try:
+                paths.append(self.repetui.backend.media_path(reference.label))
+            except (ValueError, BackendError):
+                self._audio_error(f"Could not locate card audio: {reference.label}")
+        if replay and not paths:
+            self.notify("No recorded sound on this side.")
+        self._audio.play(paths)
 
     def _offer_field_setup(self) -> None:
         if self.card is None or self.app.screen is not self:
@@ -1735,6 +1976,9 @@ class ReviewScreen(Screen[None]):
         return tuple(states)
 
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
+        if self._native is not None:
+            self._native.clear()
+        self._native_pictures = ()
         if self.repetui.syncing:
             return
         counts = self.repetui.backend.counts()
@@ -1742,6 +1986,7 @@ class ReviewScreen(Screen[None]):
         content = self.query_one("#card", Static)
         actions = self.query_one("#review-actions", Static)
         if self.card is None:
+            self._visible_images = ()
             complete = Text("done · ", style="#79c98b")
             complete.append(self.deck.leaf_name, style="bold #eee9e0")
             complete.append("\nNothing due. You showed up.", style="#aaa49b")
@@ -1764,10 +2009,25 @@ class ReviewScreen(Screen[None]):
             ),
             show_readings=self.show_readings,
         )
+        self._visible_images = tuple(
+            source
+            for span in sorted(flow.spans, key=lambda marked: marked.start)
+            if isinstance((source := getattr(span.style, "meta", {}).get("repetui_image")), str)
+        )
+        native_marks: list[tuple[Path, int, int]] = []
+        flow = expand_image_previews(
+            flow,
+            self.repetui.backend.media_path,
+            self._rendered_card_width,
+            max(1, min(3, self.size.height - 3)),
+            native_marks,
+        )
+        self._native_pictures = tuple(NativePicture(*mark) for mark in native_marks)
         self._refresh_action_row(actions)
         content.update(flow)
         if reset_scroll:
             self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
+        self._schedule_native_paint()
 
     def _refresh_action_row(self, actions: Static) -> None:
         if self.card is not None and self.revealed:
@@ -1843,6 +2103,21 @@ class ReviewScreen(Screen[None]):
         if not self._busy() and self.card is not None and not self.revealed:
             self.revealed = True
             self._refresh_view()
+            self._play_side()
+
+    def action_replay_audio(self) -> None:
+        if not self._busy() and self.card is not None:
+            self._play_side(replay=True)
+
+    def action_view_image(self) -> None:
+        if self._busy() or self.card is None:
+            return
+        if not self._visible_images:
+            self.notify("No visible pictures on this card.")
+            return
+        self.app.push_screen(
+            ImageDetailScreen(self._visible_images, self.repetui.backend.media_path)
+        )
 
     def action_readings(self) -> None:
         if self._busy() or self.card is None:
@@ -1937,9 +2212,13 @@ class ReviewScreen(Screen[None]):
 
     def _show_refresh_failure(self, *, clear_card: bool) -> None:
         if clear_card:
+            if self._native is not None:
+                self._native.clear()
+            self._native_pictures = ()
             with contextlib.suppress(Exception):
                 self.repetui.backend.begin_review(self.deck.id)
             self.card = None
+            self._visible_images = ()
             self.revealed = False
             self.expanded_sections.clear()
             self.selected_folded = 0
@@ -2401,6 +2680,33 @@ class RepetuiApp(App[None]):
     #card {
         height: auto;
         min-height: 1;
+    }
+
+    ImageDetailScreen {
+        layout: vertical;
+        background: #111416;
+    }
+
+    #image-detail-header {
+        width: 100%;
+        height: 1;
+        overflow: hidden;
+        text-wrap: nowrap;
+        color: #aaa49b;
+    }
+
+    #image-detail-scroll {
+        width: 100%;
+        height: 1fr;
+        overflow: auto;
+        scrollbar-size: 1 1;
+        background: #111416;
+    }
+
+    #image-detail-picture {
+        height: auto;
+        min-height: 1;
+        text-wrap: nowrap;
     }
 
     #review-actions {

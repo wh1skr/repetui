@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "anki==25.9.2",
+    "pillow>=11,<13",
     "textual>=7.3,<8",
 ]
 

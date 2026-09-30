@@ -17,6 +17,8 @@ class ReviewAction(str, Enum):
     SUSPEND = "suspend"
     FLAG = "flag"
     READINGS = "readings"
+    REPLAY_AUDIO = "replay_audio"
+    VIEW_IMAGE = "view_image"
     SYNC = "sync"
 
     @property
@@ -32,6 +34,8 @@ class ReviewAction(str, Enum):
             ReviewAction.SUSPEND: "Suspend",
             ReviewAction.FLAG: "Flag",
             ReviewAction.READINGS: "Readings",
+            ReviewAction.REPLAY_AUDIO: "Replay audio",
+            ReviewAction.VIEW_IMAGE: "View picture",
             ReviewAction.SYNC: "Sync",
         }[self]
 
@@ -47,6 +51,8 @@ DEFAULT_REVIEW_BINDINGS: dict[ReviewAction, str] = {
     ReviewAction.SUSPEND: "x",
     ReviewAction.FLAG: "f",
     ReviewAction.READINGS: "r",
+    ReviewAction.REPLAY_AUDIO: "p",
+    ReviewAction.VIEW_IMAGE: "v",
     ReviewAction.SYNC: "s",
 }
 
@@ -105,6 +111,18 @@ class ReviewControls:
             if action_name != "readings"
         ):
             bindings[ReviewAction.READINGS] = None
+        if "replay_audio" not in saved and any(
+            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.REPLAY_AUDIO]
+            for action_name, key in saved.items()
+            if action_name != "replay_audio"
+        ):
+            bindings[ReviewAction.REPLAY_AUDIO] = None
+        if "view_image" not in saved and any(
+            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.VIEW_IMAGE]
+            for action_name, key in saved.items()
+            if action_name != "view_image"
+        ):
+            bindings[ReviewAction.VIEW_IMAGE] = None
         assigned = [key for key in bindings.values() if key is not None]
         if len(assigned) != len(set(assigned)):
             return cls.defaults()

@@ -128,6 +128,32 @@ def test_flow_can_show_furigana_inline_without_leaking_hidden_answer() -> None:
     } == {"気"}
 
 
+def test_image_marks_follow_reveal_and_fold_visibility_in_review_flow() -> None:
+    presentation = present_card(RawCardContent(
+        CardTemplateIdentity(73, "Pictures", 0, "Card"),
+        'Which one? <img src="front.png">',
+        '<hr id=answer><h2>Picture</h2><img src="back.png">',
+    ))
+
+    def sources(revealed: bool, mode: SectionMode, expanded: bool = False) -> list[str]:
+        flow = compose_review(
+            presentation, "Pictures", DueCounts(1, 0, 0), 40,
+            revealed=revealed,
+            sections=tuple(SectionState(section, mode, expanded=expanded)
+                           for section in presentation.back.sections),
+        )
+        return [
+            span.style.meta["repetui_image"] for span in flow.spans
+            if "repetui_image" in getattr(span.style, "meta", {})
+        ]
+
+    assert sources(False, SectionMode.SHOW) == ["front.png"]
+    assert sources(True, SectionMode.FOLD) == ["front.png"]
+    assert sources(True, SectionMode.FOLD, expanded=True) == ["front.png", "back.png"]
+    assert sources(True, SectionMode.SHOW) == ["front.png", "back.png"]
+    assert sources(True, SectionMode.HIDE) == ["front.png"]
+
+
 @pytest.mark.parametrize("separator", ["<br>", "</p><p>"])
 def test_front_readings_survive_multiline_compaction(separator) -> None:
     presentation = present_card(RawCardContent(

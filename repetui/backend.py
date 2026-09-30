@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .presentation import (
     AVReference,
@@ -129,6 +130,17 @@ class AnkiBackend:
         if self._collection is None:
             raise BackendError("The Anki collection is not open.")
         return self._collection
+
+    def media_path(self, filename: str) -> Path:
+        """Resolve a rendered media name inside this collection's media folder."""
+        name = unquote(filename)
+        if not name or name in {".", ".."} or Path(name).name != name or "\\" in name:
+            raise ValueError("Media filename must be a single file name.")
+        media_dir = Path(self._require_collection().media.dir()).resolve()
+        path = (media_dir / name).resolve()
+        if not path.is_relative_to(media_dir):
+            raise ValueError("Media file is outside the collection's media folder.")
+        return path
 
     def decks(self) -> list[Deck]:
         collection = self._require_collection()
