@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from wave import open as open_wave
 
 import pytest
 
@@ -62,6 +63,59 @@ def test_raw_card_keeps_note_type_css_for_terminal_emphasis() -> None:
     raw = AnkiBackend._raw_content_for_card(StyledCard())
 
     assert raw.card_css == ".target { text-decoration: underline; }"
+
+
+def test_media_path_decodes_once_and_stays_inside_collection_media(tmp_path) -> None:
+    service, collection = backend()
+    media_dir = tmp_path / "collection.media"
+    media_dir.mkdir()
+    collection.media = SimpleNamespace(dir=lambda: str(media_dir))
+    clip = media_dir / "声.mp3"
+    clip.touch()
+
+    assert service.media_path("%E5%A3%B0.mp3") == clip
+    with pytest.raises(ValueError):
+        service.media_path("%2E%2E%2Fprivate.mp3")
+    with pytest.raises(ValueError):
+        service.media_path("..\\private.mp3")
+
+    (media_dir / "link.mp3").symlink_to(tmp_path / "private.mp3")
+    with pytest.raises(ValueError):
+        service.media_path("link.mp3")
+
+
+def test_disposable_anki_card_keeps_question_and_answer_sound_separate(tmp_path) -> None:
+    from anki.collection import Collection
+
+    collection_path = tmp_path / "collection.anki2"
+    collection = Collection(str(collection_path))
+    note = collection.new_note(collection.models.current())
+    note["Front"] = "Question [sound:front.wav]"
+    note["Back"] = "Answer [sound:back-1.wav] [sound:back-2.wav]"
+    deck_id = collection.decks.current()["id"]
+    collection.add_note(note, deck_id)
+    media_dir = Path(collection.media.dir())
+    for name in ("front.wav", "back-1.wav", "back-2.wav"):
+        with open_wave(str(media_dir / name), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(8000)
+            output.writeframes(b"\0\0" * 80)
+    collection.close()
+
+    service = AnkiBackend(collection_path)
+    service.open()
+    try:
+        service.begin_review(deck_id)
+        card = service.next_card()
+        assert card is not None and card.raw_content is not None
+        assert [ref.label for ref in card.raw_content.front_av] == ["front.wav"]
+        assert [ref.label for ref in card.raw_content.back_av] == [
+            "back-1.wav", "back-2.wav"
+        ]
+        assert service.media_path("front.wav").is_file()
+    finally:
+        service.close()
 
 
 class FakeScheduler:

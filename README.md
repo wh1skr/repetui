@@ -64,6 +64,8 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Review | `j` / `k`, `g` / `G` | Scroll; jump to top or bottom |
 | Review | `Space` | Open or close the selected folded section |
 | Review | `r` | Toggle bracketed readings directly on the card |
+| Review | `p` | Replay recorded sound on the visible card side |
+| Review | `v` | View visible pictures larger; Tab switches pictures, arrows pan, Escape returns |
 | Review | `u`, `b`, `x`, `f` | Undo, bury, suspend, flag |
 | Card-field setup | `Space`, `J` / `K`, `a`, `p`, `v`, `Enter` | Change role, reorder, suggest a layout, preview, flip question/answer, save |
 | Decks / review | `s` | Sync with AnkiWeb |
@@ -109,6 +111,31 @@ them inline as `漢字[かんじ]`; press `r` again to hide them. Only visible c
 content is annotated—unrevealed or hidden answers stay hidden. Unknown markup
 falls back to its visible text rather than being silently discarded.
 
+Recorded sound plays when its question or answer side appears. Clips on a side
+play in order; `p` replays that side, and moving to another card stops playback.
+Playback uses `mpv`, `ffplay`, or `paplay` if available. `mpv` or `ffplay` is
+recommended for broad audio format support; `paplay` supports formats available
+through the system's libsndfile. Missing media or unavailable playback shows a
+warning and leaves review usable.
+
+Local raster pictures appear as colored-character previews within the card.
+On a direct Kitty terminal, or a supported direct WezTerm version, Repetui also
+paints native pixels over those previews and the enlarged view using Kitty
+graphics placements. The characters remain visible if the terminal does not
+show graphics or writing them fails. Native output is off by default inside
+terminal multiplexers, including Herdr, because graphics forwarding varies;
+set `REPETUI_NATIVE_IMAGES=kitty` to opt in when forwarding is configured, or
+`REPETUI_NATIVE_IMAGES=off` to keep only the portable characters. This setting
+does not query the terminal or consume a review key.
+
+Question pictures appear immediately; answer pictures appear after Reveal. The card remains
+scrollable in a narrow pane. Missing, damaged, or unsupported pictures show a
+placeholder and leave review usable.
+Press `v` to inspect a visible picture in a larger in-terminal view. Use the
+arrow keys to pan, `Tab` and `Shift+Tab` to select another visible picture,
+and `Escape` to return to the same card. Folded answer pictures become available
+after their section is expanded.
+
 If a script-heavy template cannot be separated safely, `repetui` derives a
 field-based terminal layout and opens a one-time setup. Assign fields to Prompt,
 Answer, Auto, or Ignore with `Space`, reorder them with `J` / `K`, and save with
@@ -148,7 +175,7 @@ card template.
 Choices are remembered per note type and card template, so long explanations
 and mnemonics can stay one keypress away without taking over every card.
 
-Template JavaScript, typed-answer grading, CSS layout, and media playback are
+Template JavaScript, typed-answer grading, CSS layout, and video playback are
 not executed. Card creation, editing, and statistics are also outside the
 current scope.
 

@@ -16,6 +16,8 @@ def test_review_controls_start_with_terminal_defaults() -> None:
     assert controls.binding(ReviewAction.SUSPEND) == "x"
     assert controls.binding(ReviewAction.FLAG) == "f"
     assert controls.binding(ReviewAction.READINGS) == "r"
+    assert controls.binding(ReviewAction.REPLAY_AUDIO) == "p"
+    assert controls.binding(ReviewAction.VIEW_IMAGE) == "v"
     assert controls.binding(ReviewAction.SYNC) == "s"
 
 
@@ -24,6 +26,20 @@ def test_existing_r_binding_is_preserved_when_readings_action_is_added() -> None
 
     assert controls.binding(ReviewAction.AGAIN) == "r"
     assert controls.binding(ReviewAction.READINGS) is None
+
+
+def test_existing_p_binding_is_preserved_when_replay_action_is_added() -> None:
+    controls = ReviewControls.from_saved({"again": "p"})
+
+    assert controls.binding(ReviewAction.AGAIN) == "p"
+    assert controls.binding(ReviewAction.REPLAY_AUDIO) is None
+
+
+def test_existing_v_binding_is_preserved_when_view_action_is_added() -> None:
+    controls = ReviewControls.from_saved({"again": "v"})
+
+    assert controls.binding(ReviewAction.AGAIN) == "v"
+    assert controls.binding(ReviewAction.VIEW_IMAGE) is None
 
 
 def test_binding_conflict_requires_confirmation_and_unbinds_displaced_action() -> None:

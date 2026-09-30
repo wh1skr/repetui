@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from rich.cells import cell_len
+from rich.style import Style
 from rich.text import Text
 
 from .backend import DueCounts, ReviewQueue
@@ -41,7 +42,27 @@ def section_name(section: PresentationSection) -> str:
 def _section_text(section: PresentationSection, style: str, show_readings: bool) -> Text:
     """Attach annotations before layout transforms the section text."""
     result = annotated(section.text, section.underlines, section.furigana, style=style)
-    return inline_readings(result) if show_readings else result
+    for image in section.images:
+        result.stylize(
+            Style(meta={"repetui_image": image.source}), image.start, image.end
+        )
+    result = inline_readings(result) if show_readings else result
+    image_spans = sorted(
+        (
+            span for span in result.spans
+            if "repetui_image" in getattr(span.style, "meta", {})
+        ),
+        key=lambda span: span.start,
+        reverse=True,
+    )
+    for span in image_spans:
+        before = "\n" if span.start and result.plain[span.start - 1] != "\n" else ""
+        after = "\n" if span.end < len(result) and result.plain[span.end] != "\n" else ""
+        result = (
+            result[:span.start] + Text(before) + result[span.start:span.end]
+            + Text(after) + result[span.end:]
+        )
+    return result
 
 
 def _blocks(text: Text) -> list[Text]:
@@ -108,6 +129,9 @@ def _header(
     first_break = front.plain.find("\n")
     first_front = front if first_break < 0 else front[:first_break]
     remaining_front = Text() if first_break < 0 else front[first_break + 1:]
+    if any("repetui_image" in getattr(span.style, "meta", {}) for span in first_front.spans):
+        first_front = Text()
+        remaining_front = front
     split = f"{counts.new}/{counts.learning}/{counts.review}"
     optional = {
         "deck": deck_name,
@@ -200,6 +224,8 @@ def _shown_section(
 
 
 def _is_compact_section(section: PresentationSection, text: Text) -> bool:
+    if section.images:
+        return False
     if "\n" in text.plain or text.cell_len > _SHORT_BLOCK_WIDTH:
         return False
     return not (
