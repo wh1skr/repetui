@@ -1938,6 +1938,86 @@ async def test_newest_rating_feedback_survives_rapid_review_and_then_clears(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["counts", "next_card"])
+async def test_committed_rating_refresh_failure_blocks_repeat_and_can_retry(
+    tmp_path, monkeypatch, failed_read
+) -> None:
+    app, backend = make_app(tmp_path)
+    original_counts = backend.counts
+    original_next_card = backend.next_card
+    original_answer = backend.answer
+    answers: list[int] = []
+
+    def answer(rating: int) -> None:
+        answers.append(rating)
+        original_answer(rating)
+
+    def counts() -> DueCounts:
+        if backend.rating is not None:
+            raise BackendError("private count read failure")
+        return original_counts()
+
+    def next_card() -> ReviewCard | None:
+        if backend.rating is not None:
+            raise BackendError("private next-card read failure")
+        return original_next_card()
+
+    monkeypatch.setattr(backend, "answer", answer)
+    monkeypatch.setattr(backend, failed_read, counts if failed_read == "counts" else next_card)
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "enter", "3")
+        await pilot.pause(1.05)
+
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+        assert review.card is None
+        assert "Rating saved" in rendered_text(review)
+        assert "Could not refresh cards" in rendered_text(review)
+        assert "question" not in rendered_text(review)
+        assert answers == [3]
+
+        await pilot.press("3")
+        assert answers == [3]
+
+        restored_read = original_counts if failed_read == "counts" else original_next_card
+        monkeypatch.setattr(backend, failed_read, restored_read)
+        await pilot.press("enter")
+        assert "Nothing due" in rendered_text(review)
+        assert answers == [3]
+
+
+@pytest.mark.asyncio
+async def test_review_resize_count_failure_enters_recovery_instead_of_crashing(
+    tmp_path, monkeypatch
+) -> None:
+    app, backend = make_app(tmp_path)
+    original_counts = backend.counts
+
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        assert isinstance(review, ReviewScreen)
+
+        def failed_counts() -> DueCounts:
+            raise BackendError("private resize count failure")
+
+        monkeypatch.setattr(backend, "counts", failed_counts)
+        await pilot.resize_terminal(41, 6)
+        await pilot.pause()
+
+        assert app.screen_stack[-2] is review
+        assert review.card is None
+        assert "Could not refresh cards" in rendered_text(review)
+
+        monkeypatch.setattr(backend, "counts", original_counts)
+        await pilot.pause(1.05)
+        await pilot.press("enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert review.card is not None
+
+
+@pytest.mark.asyncio
 async def test_undo_restores_the_final_rated_card_and_refreshes_counts(tmp_path) -> None:
     app, backend = make_app(tmp_path)
 
@@ -3374,6 +3454,41 @@ async def test_review_refreshes_once_after_held_sync_popup_closes(tmp_path) -> N
         assert app.screen is review
         assert backend.is_open is True
         assert backend.begun_deck_ids == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_failed_deck_read_after_sync_reopen_is_retryable_without_crashing(tmp_path) -> None:
+    def sync(_profile: ProfilePaths) -> SyncOutcome:
+        backend.fail_deck_reads = True
+        return SyncOutcome(SyncStatus.SYNCED)
+
+    app, backend = make_app(tmp_path, syncer=sync)
+    backend.fail_deck_reads = False
+    original_decks = backend.decks
+
+    def decks() -> list[Deck]:
+        if backend.fail_deck_reads:
+            raise BackendError("private post-sync deck read failure")
+        return original_decks()
+
+    backend.decks = decks
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("s")
+        await pilot.pause(1.2)
+
+        assert type(app.screen).__name__ == "RefreshRecoveryScreen"
+        assert backend.is_open is True
+        assert app.syncing is False
+        assert "could not refresh" in app.screen.message.lower()
+        assert "private" not in app.screen.message
+
+        await pilot.press("r")
+        assert type(app.screen).__name__ == "RefreshRecoveryScreen"
+
+        backend.fail_deck_reads = False
+        await pilot.press("r")
+        assert isinstance(app.screen, DeckScreen)
+        assert [item.deck.id for item in app.screen.query(DeckItem)] == [1]
 
 
 @pytest.mark.asyncio

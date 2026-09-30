@@ -31,6 +31,21 @@ def test_unknown_sections_default_to_show_without_writing_a_file(tmp_path) -> No
     assert not path.exists()
 
 
+@pytest.mark.parametrize(
+    "saved",
+    ["{damaged", json.dumps({"version": 999, "profiles": {"old": {}}, "templates": {}})],
+)
+def test_unreadable_preferences_remain_untouched_and_read_only(tmp_path, saved) -> None:
+    path = tmp_path / "preferences.json"
+    path.write_text(saved)
+    preferences = JsonPreferences(path)
+
+    assert preferences.mode(JAPANESE_RECOGNITION, "back:heading:mnemonic") is SectionMode.SHOW
+    with pytest.raises(OSError, match="read-only"):
+        preferences.set_mode(JAPANESE_RECOGNITION, "back:heading:mnemonic", SectionMode.FOLD)
+    assert path.read_text() == saved
+
+
 def test_section_modes_survive_restart_and_are_scoped_to_template(tmp_path) -> None:
     path = tmp_path / "preferences.json"
     preferences = JsonPreferences(path)
