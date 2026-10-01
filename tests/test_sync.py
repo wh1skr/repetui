@@ -114,6 +114,9 @@ class FakeSyncCollection:
     def sync_media(self, auth) -> None:
         self.media_synced = True
 
+    def media_sync_status(self):
+        return SimpleNamespace(active=False)
+
     def close(self) -> None:
         self.closed = True
 
@@ -396,3 +399,43 @@ def test_media_failure_after_collection_sync_does_not_report_success(
     monkeypatch.setattr(FakeSyncCollection, "sync_media", fail_media)
     assert sync_profile(profile).status is SyncStatus.OFFLINE
     assert FakeSyncCollection.instances[-1].closed
+
+
+@pytest.mark.parametrize("mode", ["normal", "unchanged", "full"])
+@pytest.mark.parametrize("media_fails", [False, True])
+def test_sync_waits_for_background_media_and_reports_delayed_failure(
+    monkeypatch, tmp_path, mode, media_fails
+):
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required",
+        SyncStatusResponse.Required.NO_CHANGES if mode == "unchanged"
+        else SyncStatusResponse.Required.NORMAL_SYNC,
+    )
+    monkeypatch.setattr(
+        FakeSyncCollection, "collection_required", SyncCollectionResponse.NO_CHANGES
+    )
+    collection_type = RecoveryCollection if mode == "full" else FakeSyncCollection
+    monkeypatch.setattr(anki.collection, "Collection", collection_type)
+    polls = []
+
+    def media_status(self):
+        assert self.media_synced
+        assert not self.closed, "Collection closed before media finished"
+        polls.append(True)
+        if len(polls) == 1:
+            return SimpleNamespace(active=True)
+        if media_fails:
+            raise ConnectionError("background media connection lost")
+        return SimpleNamespace(active=False)
+
+    monkeypatch.setattr(FakeSyncCollection, "media_sync_status", media_status)
+    outcome = (
+        full_sync_profile(profile, FullSyncDirection.DOWNLOAD)
+        if mode == "full" else sync_profile(profile)
+    )
+    assert len(polls) == 2, "Sync must wait for background transfers before reporting success"
+    assert outcome.ok is (not media_fails)
+    if media_fails:
+        assert outcome.status is SyncStatus.OFFLINE
+    assert collection_type.instances[-1].closed

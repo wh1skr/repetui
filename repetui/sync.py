@@ -7,6 +7,7 @@ import io
 import pickle
 import sqlite3
 import tempfile
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -142,6 +143,13 @@ def _auth(profile: ProfilePaths):
     return auth
 
 
+def _sync_media_to_completion(collection, auth) -> None:
+    """Wait for Anki's background transfer and surface its delayed errors."""
+    collection.sync_media(auth)
+    while collection.media_sync_status().active:
+        time.sleep(0.25)
+
+
 def sync_profile(profile: ProfilePaths) -> SyncOutcome:
     """Sync collection and media, stopping when full sync needs a user's choice."""
     from anki.collection import Collection
@@ -156,7 +164,7 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
             auth.endpoint = status.new_endpoint.rstrip("/") + "/"
         if status.required == SyncStatusResponse.Required.NO_CHANGES:
             # Collection status does not include pending media transfers.
-            collection.sync_media(auth)
+            _sync_media_to_completion(collection, auth)
             return SyncOutcome(SyncStatus.UP_TO_DATE)
 
         result = collection.sync_collection(auth, sync_media=False)
@@ -187,7 +195,7 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
                 SyncStatus.FAILED,
                 "Collection sync did not complete. Try syncing again.",
             )
-        collection.sync_media(auth)
+        _sync_media_to_completion(collection, auth)
         return SyncOutcome(SyncStatus.SYNCED)
     except Exception as exc:
         return failed_sync_outcome(exc)
@@ -253,7 +261,7 @@ def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> Sy
                 )
         elif result.required != SyncCollectionResponse.NO_CHANGES:
             return SyncOutcome(SyncStatus.FAILED, "Sync state changed; retry and choose again.")
-        collection.sync_media(auth)
+        _sync_media_to_completion(collection, auth)
         return SyncOutcome(SyncStatus.SYNCED, f"Local collection backup: {backup}")
     except Exception as exc:
         if backing_up:
