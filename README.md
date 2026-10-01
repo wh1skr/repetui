@@ -80,6 +80,19 @@ Suspend, and Flag confirmations; errors remain readable. While a successful
 confirmation is visible, `Enter` dismisses it and immediately continues with
 the current card's primary action, while `Escape` only dismisses it.
 
+### Media sync
+
+`s` synchronizes cards first, then downloads images and audio in the background.
+The media window shows Anki's added, checked, and removed file counts. Press
+`Enter` or `Escape` to dismiss it and keep studying; `s` reopens progress without
+starting another transfer. A `↓` in review and “media ↓” on the deck screen
+indicate downloads are still running.
+
+Missing pictures show `[picture downloading]` while media sync is active and
+refresh when files arrive. Missing audio can be replayed once it is ready. You
+can continue reviewing after a download error; `s` retries media sync. Quitting
+Repetui stops downloads; the next sync resumes the remaining work.
+
 ### Full-sync conflicts
 
 If sync reports **full sync required**, your cards have not been synchronized.

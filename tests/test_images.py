@@ -131,6 +131,22 @@ def test_missing_or_corrupt_image_has_a_readable_placeholder(tmp_path: Path) -> 
         render_image(tmp_path / "broken.png", 40, 3)
 
 
+def test_pending_media_only_marks_missing_local_files_as_downloading(tmp_path):
+    (tmp_path / "broken.png").write_bytes(b"not an image")
+    backend = media_backend(tmp_path)
+    document = review(
+        '<img src="missing.png"><img src="broken.png">'
+        '<img src="https://example.com/remote.png"><img src="../outside.png">'
+    )
+    pending = expand_image_previews(document, backend.media_path, 40, 3, media_pending=True)
+    assert pending.plain.count("[picture downloading]") == 1
+    assert pending.plain.count("[picture unavailable]") == 3
+    picture(tmp_path / "missing.png")
+    arrived = expand_image_previews(document, backend.media_path, 40, 3, media_pending=True)
+    assert "[picture downloading]" not in arrived.plain
+    assert arrived.plain.count("[picture unavailable]") == 3
+
+
 def test_image_without_source_or_with_malformed_url_is_nonfatal(tmp_path: Path) -> None:
     backend = media_backend(tmp_path)
     document = review('<img alt="first"><img src="http://[broken" alt="second">')

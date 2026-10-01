@@ -19,8 +19,8 @@ from .sync import (
     SyncOutcome,
     SyncStatus,
     failed_sync_outcome,
-    full_sync_profile,
-    sync_profile,
+    full_sync_collection_profile,
+    sync_collection_profile,
 )
 
 
@@ -46,8 +46,10 @@ class CollectionLifecycle:
         self,
         backend: CollectionBackend,
         profile: ProfilePaths,
-        syncer: Callable[[ProfilePaths], SyncOutcome] = sync_profile,
-        full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] = full_sync_profile,
+        syncer: Callable[[ProfilePaths], SyncOutcome] = sync_collection_profile,
+        full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] = (
+            full_sync_collection_profile
+        ),
     ) -> None:
         self._backend = backend
         self._profile = profile

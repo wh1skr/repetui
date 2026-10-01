@@ -15,7 +15,9 @@ from repetui.sync import (
     _auth,
     _profile_data,
     failed_sync_outcome,
+    full_sync_collection_profile,
     full_sync_profile,
+    sync_collection_profile,
     sync_profile,
 )
 
@@ -439,3 +441,56 @@ def test_sync_waits_for_background_media_and_reports_delayed_failure(
     if media_fails:
         assert outcome.status is SyncStatus.OFFLINE
     assert collection_type.instances[-1].closed
+
+
+@pytest.mark.parametrize("mode", ["unchanged", "normal", "auto-full", "confirmed-full"])
+def test_collection_only_sync_never_starts_media_on_the_connection_it_closes(
+    monkeypatch, tmp_path, mode,
+):
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(
+        FakeSyncCollection, "status_required",
+        SyncStatusResponse.Required.NO_CHANGES if mode == "unchanged"
+        else SyncStatusResponse.Required.NORMAL_SYNC,
+    )
+    monkeypatch.setattr(
+        FakeSyncCollection, "collection_required",
+        SyncCollectionResponse.FULL_DOWNLOAD if mode == "auto-full"
+        else SyncCollectionResponse.NO_CHANGES,
+    )
+    collection_type = RecoveryCollection if mode == "confirmed-full" else FakeSyncCollection
+    monkeypatch.setattr(anki.collection, "Collection", collection_type)
+
+    def forbidden(*_):
+        pytest.fail("Media started on the short-lived collection-sync connection")
+
+    monkeypatch.setattr(FakeSyncCollection, "sync_media", forbidden)
+    monkeypatch.setattr(FakeSyncCollection, "media_sync_status", forbidden)
+    outcome = (
+        full_sync_collection_profile(profile, FullSyncDirection.DOWNLOAD)
+        if mode == "confirmed-full" else sync_collection_profile(profile)
+    )
+    collection = collection_type.instances[-1]
+    assert outcome.ok
+    assert collection.closed
+    if mode in {"auto-full", "confirmed-full"}:
+        assert collection.full_sync == (None, False), "Native full sync must skip automatic media"
+
+
+@pytest.mark.parametrize("redirect_in_status", [True, False])
+def test_collection_sync_passes_redirected_endpoint_to_background_media(
+    tmp_path, monkeypatch, redirect_in_status,
+):
+    profile = profile_with_prefs(tmp_path, {"syncKey": "secret"})
+    monkeypatch.setattr(anki.collection, "Collection", FakeSyncCollection)
+    monkeypatch.setattr(FakeSyncCollection, "sync_status", lambda *_: SimpleNamespace(
+        required=SyncStatusResponse.Required.NO_CHANGES if redirect_in_status
+        else SyncStatusResponse.Required.NORMAL_SYNC,
+        new_endpoint="http://redirected.invalid" if redirect_in_status else "",
+    ))
+    monkeypatch.setattr(FakeSyncCollection, "sync_collection", lambda *_args, **_kwargs:
+        SimpleNamespace(required=SyncCollectionResponse.NO_CHANGES,
+                        new_endpoint="http://redirected.invalid", server_media_usn=12))
+    outcome = sync_collection_profile(profile)
+    assert outcome.ok
+    assert outcome.media_endpoint == "http://redirected.invalid/"

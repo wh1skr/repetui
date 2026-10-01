@@ -59,6 +59,7 @@ from .images import (
     resolve_local_image,
 )
 from .lifecycle import CollectionLifecycle, SyncRunResult
+from .media_sync import MediaSyncSnapshot, MediaSyncStatus, MediaSyncTask
 from .native_images import NativeImageOverlay, NativePicture, mark_native_picture, overlay_for_app
 from .preferences import (
     ActionFeedbackDuration,
@@ -82,8 +83,8 @@ from .sync import (
     FullSyncDirection,
     SyncOutcome,
     SyncStatus,
-    full_sync_profile,
-    sync_profile,
+    full_sync_collection_profile,
+    sync_collection_profile,
 )
 
 
@@ -178,6 +179,13 @@ class SyncFinished(Message):
         self.result = result
 
 
+class MediaUpdated(Message):
+    def __init__(self, task: MediaSyncTask, snapshot: MediaSyncSnapshot) -> None:
+        super().__init__()
+        self.task = task
+        self.snapshot = snapshot
+
+
 _HELP_TEXT = (
     "everywhere\n"
     "  ?        settings\n"
@@ -187,6 +195,8 @@ _HELP_TEXT = (
     "  tab      expand / collapse\n"
     "  enter    review\n"
     "  s        sync\n"
+    "           during media downloads: reopen progress\n"
+    "           enter/esc dismisses progress; studying continues\n"
     "  counts   total  new/learning/review\n\n"
     "review\n"
     "  enter    reveal / Good\n"
@@ -528,7 +538,12 @@ class DeckScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self.reload()
+        self.refresh_media_status()
         self.query_one(ListView).focus()
+
+    def refresh_media_status(self) -> None:
+        status = " · media ↓" if self.repetui.media_downloading else ""
+        self.query_one("#deck-header", Static).update(f"decks · repetui {__version__}{status}")
 
     def reload(self, selected_deck_id: int | None = None) -> None:
         view = self.query_one("#decks", ListView)
@@ -1674,6 +1689,8 @@ class ImageDetailScreen(Screen[None]):
         self._native: NativeImageOverlay | None = None
         self._native_pictures: tuple[NativePicture, ...] = ()
         self._native_paint_pending = False
+        self._pending_picture: Path | None = None
+        self._media_active_rendered = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="image-detail-header")
@@ -1722,25 +1739,28 @@ class ImageDetailScreen(Screen[None]):
                 self._native.clear()
             self.call_after_refresh(self._render_picture)
 
-    def _render_picture(self) -> None:
+    def _render_picture(self, *, force: bool = False) -> None:
         if not self.is_mounted:
             return
         width = max(80, min(160, self.size.width * 2))
         rows = max(24, min(72, (self.size.height - 1) * 4))
         state = (self.index, width, rows)
-        if state == self._rendered:
+        if state == self._rendered and not force:
             self._schedule_native_paint()
             return
         scroller = self.query_one("#image-detail-scroll", ScrollableContainer)
         previous_x = scroller.scroll_x if self._rendered and self._rendered[0] == self.index else 0
         previous_y = scroller.scroll_y if self._rendered and self._rendered[0] == self.index else 0
         self._rendered = state
+        self._media_active_rendered = cast("RepetuiApp", self.app).media_downloading
+        self._pending_picture = None
         if self._native is not None:
             self._native.clear()
         self._native_pictures = ()
         source = self.sources[self.index]
         header = f"{self.index + 1}/{len(self.sources)} · arrows pan · tab next · esc"
         self.query_one("#image-detail-header", Static).update(Text(header, no_wrap=True))
+        path = None
         try:
             path = resolve_local_image(source, self.resolve)
             picture = render_image_detail(path, width, rows)
@@ -1750,7 +1770,16 @@ class ImageDetailScreen(Screen[None]):
             )
             picture = mark_native_picture(picture, 0)
         except (ImagePreviewError, OSError, ValueError, RuntimeError):
-            picture = Text("[picture unavailable]", style="#dc6b72")
+            pending = False
+            if cast("RepetuiApp", self.app).media_downloading and path is not None:
+                with contextlib.suppress(OSError):
+                    pending = not path.is_file()
+            if pending:
+                self._pending_picture = path
+            picture = Text(
+                "[picture downloading]" if pending else "[picture unavailable]",
+                style="#d7b85a" if pending else "#dc6b72",
+            )
         widget = self.query_one("#image-detail-picture", Static)
         widget.styles.width = max(
             (cell_len(line) for line in picture.plain.splitlines()), default=1
@@ -1758,6 +1787,14 @@ class ImageDetailScreen(Screen[None]):
         widget.update(picture)
         scroller.scroll_to(x=previous_x, y=previous_y, animate=False)
         self._schedule_native_paint()
+
+    def refresh_media(self) -> None:
+        changed = self._media_active_rendered != cast("RepetuiApp", self.app).media_downloading
+        if self._pending_picture is not None:
+            with contextlib.suppress(OSError):
+                changed = changed or self._pending_picture.is_file()
+        if changed:
+            self._render_picture(force=True)
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -1840,6 +1877,8 @@ class ReviewScreen(Screen[None]):
         self._native_pictures: tuple[NativePicture, ...] = ()
         self._native_paint_pending = False
         self._refresh_failed = False
+        self._media_active_rendered = False
+        self._pending_pictures: tuple[Path, ...] = ()
 
     @property
     def repetui(self) -> RepetuiApp:
@@ -1875,6 +1914,7 @@ class ReviewScreen(Screen[None]):
 
     def on_screen_resume(self) -> None:
         self._native_invalidated()
+        self.call_after_refresh(self.refresh_media)
 
     def _native_invalidated(self) -> None:
         if self._native is not None:
@@ -1924,6 +1964,10 @@ class ReviewScreen(Screen[None]):
 
     def _audio_error(self, message: str) -> None:
         if self.is_mounted:
+            if self.repetui.media_downloading and message.startswith("Audio file missing:"):
+                key = self.repetui.review_controls.binding(ReviewAction.REPLAY_AUDIO)
+                hint = f"{key} replays when ready." if key else "Replay when ready."
+                message = f"Audio still downloading; {hint}"
             self.notify(message, severity="warning")
 
     def _play_side(self, *, replay: bool = False) -> None:
@@ -2011,6 +2055,8 @@ class ReviewScreen(Screen[None]):
         self._native_pictures = ()
         if self.repetui.syncing or self._refresh_failed:
             return
+        self._media_active_rendered = self.repetui.media_downloading
+        self._pending_pictures = ()
         counts = self.repetui.backend.counts()
         self._displayed_counts = counts
         content = self.query_one("#card", Static)
@@ -2038,12 +2084,20 @@ class ReviewScreen(Screen[None]):
                 self.card.presentation.identity
             ),
             show_readings=self.show_readings,
+            media_active=self.repetui.media_downloading,
         )
         self._visible_images = tuple(
             source
             for span in sorted(flow.spans, key=lambda marked: marked.start)
             if isinstance((source := getattr(span.style, "meta", {}).get("repetui_image")), str)
         )
+        pending_pictures = []
+        for source in self._visible_images:
+            with contextlib.suppress(ImagePreviewError, OSError, ValueError, RuntimeError):
+                path = resolve_local_image(source, self.repetui.backend.media_path)
+                if not path.is_file():
+                    pending_pictures.append(path)
+        self._pending_pictures = tuple(pending_pictures)
         native_marks: list[tuple[Path, int, int]] = []
         flow = expand_image_previews(
             flow,
@@ -2051,6 +2105,7 @@ class ReviewScreen(Screen[None]):
             self._rendered_card_width,
             max(1, min(3, self.size.height - 3)),
             native_marks,
+            media_pending=self.repetui.media_downloading,
         )
         self._native_pictures = tuple(NativePicture(*mark) for mark in native_marks)
         self._refresh_action_row(actions)
@@ -2058,6 +2113,14 @@ class ReviewScreen(Screen[None]):
         if reset_scroll:
             self.query_one("#card-scroll", VerticalScroll).scroll_home(animate=False)
         self._schedule_native_paint()
+
+    def refresh_media(self) -> None:
+        """Repaint only a changed indicator or an arriving visible picture."""
+        changed = self._media_active_rendered != self.repetui.media_downloading
+        with contextlib.suppress(OSError):
+            changed = changed or any(path.is_file() for path in self._pending_pictures)
+        if changed:
+            self._refresh_or_recover(reset_scroll=False)
 
     def _refresh_or_recover(self, *, reset_scroll: bool = True) -> None:
         if self.app.screen is not self:
@@ -2512,6 +2575,80 @@ class FlagSelectionPill(StatusPill):
 
     def action_block(self) -> None:
         """Keep global shortcuts inside the flag-selection state."""
+
+
+class MediaProgressScreen(ModalScreen[None]):
+    """Dismissible progress; media ownership stays with the open collection."""
+
+    DEFAULT_CSS = """
+    MediaProgressScreen { align: center middle; background: $background 60%; }
+    #media-layout { width: 40; max-width: 100%; height: 6; max-height: 100%;
+        background: #293034; }
+    #media-header, #media-footer { height: 1; color: #d7b85a; }
+    #media-body { height: 1fr; max-height: 4; scrollbar-size-vertical: 1; }
+    #media-progress { height: auto; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", show=False),
+        Binding("enter", "back", show=False),
+        Binding("s", "sync", show=False),
+    ]
+
+    def __init__(self, snapshot: MediaSyncSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("", id="media-header"),
+            VerticalScroll(Static("", id="media-progress"), id="media-body"),
+            Static("enter/esc: study · s: progress/retry", id="media-footer"),
+            id="media-layout",
+        )
+
+    def on_mount(self) -> None:
+        self.update_progress(self.snapshot)
+        self.query_one("#media-body", VerticalScroll).focus()
+
+    def on_screen_resume(self) -> None:
+        snapshot = cast("RepetuiApp", self.app)._media_snapshot
+        if snapshot is not None:
+            self.update_progress(snapshot)
+
+    def update_progress(self, snapshot: MediaSyncSnapshot) -> None:
+        self.snapshot = snapshot
+        if not self.query("#media-progress"):
+            return
+        title = {
+            MediaSyncStatus.STARTING: "Media sync starting…",
+            MediaSyncStatus.ACTIVE: "Media downloading…",
+            MediaSyncStatus.COMPLETE: "[ok] media synced",
+            MediaSyncStatus.FAILED: "Media sync failed · s: retry",
+            MediaSyncStatus.CANCELLED: "Media sync stopped",
+        }[snapshot.status]
+        self.query_one("#media-header", Static).update(title)
+        detail = "Some images/audio may not be ready."
+        if snapshot.status is MediaSyncStatus.COMPLETE:
+            detail = "Media sync finished."
+        elif snapshot.status is MediaSyncStatus.FAILED:
+            detail = {
+                SyncStatus.OFFLINE: "Offline; study now or retry with s.",
+                SyncStatus.AUTH_REQUIRED: "Sign in to Anki, then retry with s.",
+            }.get(snapshot.failure, "Downloads interrupted; retry with s.")
+        self.query_one("#media-progress", Static).update(
+            Text(
+                f"{snapshot.added or 'Added: 0'}\n"
+                f"{snapshot.checked or 'Checked: 0'}\n"
+                f"{snapshot.removed or 'Removed: 0'}\n{detail}"
+            )
+        )
+
+    def action_back(self) -> None:
+        self.dismiss(None)
+
+    def action_sync(self) -> None:
+        cast("RepetuiApp", self.app).action_sync()
 
 
 class SyncPopup(StatusPill):
@@ -3019,10 +3156,12 @@ class RepetuiApp(App[None]):
         backend: AnkiBackend,
         profile: ProfilePaths,
         preferences: Preferences | None = None,
-        syncer: Callable[[ProfilePaths], SyncOutcome] = sync_profile,
+        syncer: Callable[[ProfilePaths], SyncOutcome] = sync_collection_profile,
         *,
         add_ons: Sequence[AddOnDefinition] | None = None,
-        full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] = full_sync_profile,
+        full_syncer: Callable[[ProfilePaths, FullSyncDirection], SyncOutcome] = (
+            full_sync_collection_profile
+        ),
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -3039,6 +3178,9 @@ class RepetuiApp(App[None]):
         self._sync_popup: SyncPopup | None = None
         self._sync_thread: Thread | None = None
         self._sync_fatal_error: str | None = None
+        self._media_task: MediaSyncTask | None = None
+        self._media_snapshot: MediaSyncSnapshot | None = None
+        self._media_endpoint: str | None = None
         self._completion_celebration: CompletionCelebrationScreen | None = None
         self.offered_field_setups: set[tuple[int, int]] = set()
         self._instance_control = InstanceControl(
@@ -3129,6 +3271,8 @@ class RepetuiApp(App[None]):
             self.exit()
 
     def on_unmount(self) -> None:
+        if self._media_task is not None:
+            self._media_task.cancel()
         self.lifecycle.shutdown()
         self._instance_control.close()
         if self._completion_celebration is not None:
@@ -3155,6 +3299,17 @@ class RepetuiApp(App[None]):
             self.exit()
 
     def action_sync(self) -> None:
+        if self.syncing or self.lifecycle.stopped:
+            return
+        if self.media_downloading:
+            self._show_media_progress()
+            return
+        if self._media_snapshot is not None and self._media_snapshot.status in {
+            MediaSyncStatus.FAILED, MediaSyncStatus.CANCELLED,
+        }:
+            self._start_media_downloads()
+            self._show_media_progress()
+            return
         if not self.lifecycle.begin_sync():
             return
         self._sync_popup = SyncPopup()
@@ -3187,8 +3342,60 @@ class RepetuiApp(App[None]):
     def syncing(self) -> bool:
         return self.lifecycle.busy
 
+    @property
+    def media_downloading(self) -> bool:
+        return self._media_snapshot is not None and self._media_snapshot.active
+
+    def _start_media_downloads(self) -> None:
+        if not self.backend.is_open or self.lifecycle.stopped:
+            return
+        task = self.backend.media_sync_task(
+            self.profile, lambda task, snapshot: self.post_message(MediaUpdated(task, snapshot)),
+            endpoint=self._media_endpoint,
+        )
+        self._media_task = task
+        self._media_snapshot = task.snapshot if task is not None else None
+        if task is not None:
+            task.start()
+
+    def _show_media_progress(self) -> None:
+        if self._media_snapshot is None:
+            return
+        if isinstance(self.screen, MediaProgressScreen):
+            self.screen.update_progress(self._media_snapshot)
+        else:
+            self.push_screen(MediaProgressScreen(self._media_snapshot), self._media_progress_closed)
+
+    def _media_progress_closed(self, _: None) -> None:
+        self._refresh_media_content()
+
+    def _refresh_media_content(self) -> None:
+        if self.syncing or self.lifecycle.stopped:
+            return
+        for screen in self.screen_stack:
+            if isinstance(screen, DeckScreen):
+                screen.refresh_media_status()
+        if isinstance(self.screen, (ReviewScreen, ImageDetailScreen)):
+            self.screen.refresh_media()
+
+    def on_media_updated(self, message: MediaUpdated) -> None:
+        if self.lifecycle.stopped or message.task is not self._media_task:
+            return
+        self._media_snapshot = message.snapshot
+        if isinstance(self.screen, MediaProgressScreen):
+            self.screen.update_progress(message.snapshot)
+        self._refresh_media_content()
+        if message.snapshot.status is MediaSyncStatus.COMPLETE:
+            self.notify("Media synced.")
+        elif message.snapshot.status is MediaSyncStatus.FAILED:
+            self.notify("Media downloads interrupted; s retries. You can keep studying.",
+                        severity="warning")
+
     def _finish_sync(self, result: SyncRunResult) -> None:
         self._sync_fatal_error = result.reopen_error
+        if result.outcome.ok and result.reopen_error is None:
+            self._media_endpoint = result.outcome.media_endpoint
+            self._start_media_downloads()
         if self._sync_popup is not None:
             self._sync_popup.finish(result)
 
@@ -3205,6 +3412,11 @@ class RepetuiApp(App[None]):
                 return
         if fatal and fatal_error is not None:
             self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))
+        elif self.media_downloading or (
+            self._media_snapshot is not None
+            and self._media_snapshot.status is MediaSyncStatus.FAILED
+        ):
+            self._show_media_progress()
 
     def refresh_open_screens(self) -> None:
         for screen in tuple(self.screen_stack):

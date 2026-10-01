@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -127,6 +128,8 @@ def expand_image_previews(
     width: int,
     rows: int,
     native_marks: list[tuple[Path, int, int]] | None = None,
+    *,
+    media_pending: bool = False,
 ) -> Text:
     """Insert previews after visible, marked image labels in their card order."""
     marked = []
@@ -144,6 +147,7 @@ def expand_image_previews(
         if start < cursor:
             continue
         result.append_text(document[cursor:end])
+        path = None
         try:
             path = resolve_local_image(source, resolve)
             preview = render_image(path, width, rows)
@@ -155,7 +159,14 @@ def expand_image_previews(
                 )
                 native_marks.append((path, max(map(len, lines), default=1), len(lines)))
         except (ImagePreviewError, OSError, ValueError, RuntimeError):
-            preview = Text("[picture unavailable]", style="#dc6b72")
+            pending = False
+            if media_pending and path is not None:
+                with suppress(OSError):
+                    pending = not path.is_file()
+            preview = Text(
+                "[picture downloading]" if pending else "[picture unavailable]",
+                style="#d7b85a" if pending else "#dc6b72",
+            )
         result.append("\n")
         result.append_text(preview)
         result.append("\n")
