@@ -209,7 +209,38 @@ def backend() -> tuple[AnkiBackend, FakeCollection]:
     service._collection = collection
     service._deck_id = None
     service._current = None
+    service._media_task = None
     return service, collection
+
+
+def test_close_cancels_captured_media_before_releasing_collection(tmp_path, monkeypatch):
+    from repetui.config import ProfilePaths
+
+    service = AnkiBackend(tmp_path / "collection.anki2")
+    events = []
+    original = SimpleNamespace(close=lambda: events.append("close"))
+    service._collection = original
+    captured = []
+
+    class CapturedTask:
+        def __init__(self, collection, profile, report, *, endpoint=None):
+            captured.append(collection)
+
+        def cancel(self):
+            events.append("cancel")
+
+    monkeypatch.setattr("repetui.backend.MediaSyncTask", CapturedTask)
+    profile = ProfilePaths(tmp_path, "fixture", service.collection_path)
+    service.media_sync_task(profile, lambda *_: None)
+    assert captured == [original]
+    service.close()
+    assert events == ["cancel", "close"]
+    assert not service.is_open
+    replacement = SimpleNamespace(close=lambda: events.append("close new"))
+    service._collection = replacement
+    service.media_sync_task(profile, lambda *_: None)
+    assert captured == [original, replacement]
+    service.close()
 
 
 def test_flattens_nested_decks_with_aggregate_parent_counts() -> None:

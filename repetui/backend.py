@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from .config import ProfilePaths
+from .media_sync import MediaSyncSnapshot, MediaSyncTask
 from .presentation import (
     AVReference,
     CardPresentation,
@@ -96,6 +99,7 @@ class AnkiBackend:
         self._collection: Any | None = None
         self._deck_id: int | None = None
         self._current: tuple[Any, Any] | None = None
+        self._media_task: MediaSyncTask | None = None
 
     @property
     def is_open(self) -> bool:
@@ -117,6 +121,9 @@ class AnkiBackend:
             raise BackendError(f"Could not open the Anki collection: {message}") from exc
 
     def close(self) -> None:
+        if self._media_task is not None:
+            self._media_task.cancel()
+            self._media_task = None
         collection = self._collection
         if collection is not None:
             try:
@@ -125,6 +132,18 @@ class AnkiBackend:
                 raise BackendError(f"Could not close the Anki collection: {exc}") from exc
         self._collection = None
         self._current = None
+
+    def media_sync_task(
+        self, profile: ProfilePaths, report: Callable[[MediaSyncTask, MediaSyncSnapshot], None],
+        *, endpoint: str | None = None,
+    ) -> MediaSyncTask:
+        """Capture this review collection so progress never follows a reopened one."""
+        if self._media_task is not None:
+            self._media_task.cancel()
+        self._media_task = MediaSyncTask(
+            self._require_collection(), profile, report, endpoint=endpoint
+        )
+        return self._media_task
 
     def _require_collection(self) -> Any:
         if self._collection is None:

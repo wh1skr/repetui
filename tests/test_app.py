@@ -27,6 +27,8 @@ from repetui.app import (
     ErrorScreen,
     FlagSelectionPill,
     ImageDetailScreen,
+    MediaProgressScreen,
+    MediaUpdated,
     OperationStatusPill,
     RepetuiApp,
     ReviewScreen,
@@ -41,6 +43,7 @@ from repetui.backend import BackendError, CollectionInUseError, Deck, DueCounts,
 from repetui.config import ProfilePaths
 from repetui.controls import ReviewAction, ReviewControls
 from repetui.deck_tree import VisibleDeckRow
+from repetui.media_sync import MediaSyncSnapshot, MediaSyncStatus
 from repetui.native_images import NativeImageOverlay
 from repetui.preferences import (
     ActionFeedbackDuration,
@@ -88,6 +91,9 @@ class FakeBackend:
 
     def close(self) -> None:
         self.is_open = False
+
+    def media_sync_task(self, profile, report, *, endpoint=None):
+        return None
 
     def decks(self) -> list[Deck]:
         return self._decks
@@ -4269,3 +4275,248 @@ async def test_startup_close_timeout_is_recoverable_and_cancel_does_not_force(
         await pilot.pause(0.3)
         assert isinstance(app.screen, StartupRecoveryScreen)
         assert not calls
+
+
+@pytest.mark.asyncio
+async def test_media_progress_can_be_dismissed_for_review_and_reopened_at_40x6(
+    tmp_path, monkeypatch
+):
+    app, backend = make_app(tmp_path, syncer=lambda _: SyncOutcome(
+        SyncStatus.SYNCED, media_endpoint="http://fixture.invalid/"
+    ))
+    created = []
+
+    class HeldMediaTask:
+        snapshot = MediaSyncSnapshot(MediaSyncStatus.STARTING)
+        cancelled = False
+
+        def __init__(self, report):
+            self.report = report
+
+        @property
+        def active(self):
+            return self.snapshot.active
+
+        def start(self):
+            self.snapshot = MediaSyncSnapshot(
+                MediaSyncStatus.ACTIVE, added="Added: 12", checked="Checked: 50"
+            )
+            self.report(self, self.snapshot)
+
+        def cancel(self):
+            self.cancelled = True
+
+    def create(profile, report, *, endpoint=None):
+        assert backend.is_open
+        assert endpoint == "http://fixture.invalid/"
+        worker = HeldMediaTask(report)
+        created.append(worker)
+        return worker
+
+    monkeypatch.setattr(backend, "media_sync_task", create)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "s")
+        await pilot.pause(1.2)
+        assert type(app.screen).__name__ == "MediaProgressScreen"
+        assert len(created) == 1
+        assert app.syncing is False
+        assert "Added: 12" in str(app.screen.query_one("#media-progress", Static).render())
+        assert "Added: Added:" not in str(app.screen.query_one("#media-progress", Static).render())
+        assert app.screen.query_one("#media-footer").region.bottom <= 6
+        await pilot.resize_terminal(20, 4)
+        assert app.screen.query_one("#media-footer").region.bottom <= 4
+        await pilot.resize_terminal(40, 6)
+        await pilot.press("escape")
+        assert isinstance(app.screen, ReviewScreen)
+        assert "question" in rendered_text(app.screen)
+        assert not app.screen.revealed
+        assert created[0].active
+        await pilot.press("enter")
+        assert app.screen.revealed
+        await pilot.press("s")
+        assert type(app.screen).__name__ == "MediaProgressScreen"
+        assert len(created) == 1
+        await pilot.press("enter")
+        assert isinstance(app.screen, ReviewScreen)
+        assert app.screen.revealed
+        await pilot.press("3")
+        assert backend.rating == 3
+    assert created[0].cancelled
+
+
+class ControlledMediaTask:
+    def __init__(self, report):
+        self.report = report
+        self.snapshot = MediaSyncSnapshot(MediaSyncStatus.STARTING)
+        self.cancelled = False
+
+    def emit(self, status, **values):
+        self.snapshot = MediaSyncSnapshot(status, **values)
+        self.report(self, self.snapshot)
+
+    def start(self):
+        self.emit(MediaSyncStatus.ACTIVE)
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def controlled_media(backend, monkeypatch):
+    created = []
+
+    def create(profile, report, *, endpoint=None):
+        worker = ControlledMediaTask(report)
+        created.append(worker)
+        return worker
+
+    monkeypatch.setattr(backend, "media_sync_task", create)
+    return created
+
+
+@pytest.mark.asyncio
+async def test_arriving_media_preserves_card_answer_folds_scroll_and_audio(tmp_path, monkeypatch):
+    plays = []
+
+    class AudioSpy:
+        def __init__(self, report_error):
+            pass
+
+        def play(self, paths):
+            plays.append(tuple(paths))
+
+        def stop(self):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "CardAudioPlayer", AudioSpy)
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        '<img src="arriving.png"> question',
+        '<hr id=answer><h2>Meaning</h2>answer'
+        '<h2>Extra</h2>' + '<p>extra detail</p>' * 20 + '<img src="secret.png">',
+        front_av=(AVReference("audio", "front.wav"),),
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    extra = present_card(content).back.sections[-1]
+    preferences.set_mode(content.identity, extra.id, SectionMode.FOLD)
+    app, backend = make_app(tmp_path, content, preferences)
+    backend.media_path = lambda name: tmp_path / name
+    created = controlled_media(backend, monkeypatch)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        card = review.card
+        app._start_media_downloads()
+        await pilot.pause()
+        assert "[picture downloading]" in rendered_text(review)
+        assert "secret.png" not in rendered_text(review)
+        assert "↓" in rendered_text(review).splitlines()[0]
+        assert len(plays) == 1
+        refreshes = []
+        original_refresh = review._refresh_view
+
+        def refresh(**kwargs):
+            refreshes.append(True)
+            original_refresh(**kwargs)
+
+        monkeypatch.setattr(review, "_refresh_view", refresh)
+        Image.new("RGB", (32, 24), "red").save(tmp_path / "arriving.png")
+        created[0].emit(MediaSyncStatus.ACTIVE, added="1", checked="2")
+        await pilot.pause()
+        assert "[picture downloading]" not in rendered_text(review)
+        assert not review.revealed and review.card is card
+        assert len(plays) == 1
+        assert len(refreshes) == 1
+        created[0].emit(MediaSyncStatus.ACTIVE, added="2", checked="3")
+        await pilot.pause()
+        assert len(refreshes) == 1  # progress alone must not repaint native pictures
+        await pilot.press("enter", "space", "G")
+        await pilot.pause()
+        scroll = review.query_one("#card-scroll", VerticalScroll)
+        assert scroll.scroll_y > 0
+        previous_y = scroll.scroll_y
+        folded = set(review.expanded_sections)
+        assert folded
+        play_count = len(plays)
+        created[0].emit(MediaSyncStatus.COMPLETE, added="1", checked="2")
+        await pilot.pause()
+        assert review.card is card and review.revealed
+        assert review.expanded_sections == folded
+        assert scroll.scroll_y == previous_y
+        assert len(plays) == play_count
+        assert not app.media_downloading
+        assert "[picture unavailable]" in rendered_text(review)  # missing on server
+
+
+@pytest.mark.asyncio
+async def test_background_media_failure_retries_only_media_and_ignores_old_reports(
+    tmp_path, monkeypatch,
+):
+    collection_syncs = []
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: collection_syncs.append(True) or SyncOutcome(SyncStatus.SYNCED)
+    )
+    created = controlled_media(backend, monkeypatch)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        app._start_media_downloads()
+        await pilot.pause()
+        created[0].emit(MediaSyncStatus.FAILED, added="7", failure=SyncStatus.OFFLINE)
+        await pilot.pause()
+        assert app.screen is review and not app.syncing
+        await pilot.press("s")
+        assert isinstance(app.screen, MediaProgressScreen)
+        assert len(created) == 2 and not collection_syncs
+        app.post_message(MediaUpdated(created[0], MediaSyncSnapshot(MediaSyncStatus.COMPLETE)))
+        await pilot.pause()
+        assert app.media_downloading
+        assert app.screen.snapshot.status is MediaSyncStatus.ACTIVE
+        created[1].emit(MediaSyncStatus.FAILED, failure=SyncStatus.AUTH_REQUIRED)
+        await pilot.pause()
+        assert "Sign in to Anki" in str(app.screen.query_one("#media-progress", Static).render())
+        await pilot.press("escape", "enter", "3")
+        assert backend.rating == 3
+    assert created[1].cancelled
+
+
+@pytest.mark.asyncio
+async def test_download_arrives_in_image_viewer_and_refreshes_review_on_return(
+    tmp_path, monkeypatch,
+):
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Pictures", 0, "Card"),
+        '<img src="large.png"> question', '<hr id=answer>answer <img src="secret.png">',
+    )
+    app, backend = make_app(tmp_path, content)
+    backend.media_path = lambda name: tmp_path / name
+    created = controlled_media(backend, monkeypatch)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        app._start_media_downloads()
+        await pilot.pause()
+        await pilot.press("v")
+        viewer = app.screen
+        assert isinstance(viewer, ImageDetailScreen)
+        assert "[picture downloading]" in str(viewer.query_one("#image-detail-picture").render())
+        Image.new("RGB", (640, 480), "red").save(tmp_path / "large.png")
+        created[0].emit(MediaSyncStatus.ACTIVE, added="Added: 1")
+        await pilot.pause()
+        assert "[picture downloading]" not in str(
+            viewer.query_one("#image-detail-picture").render()
+        )
+        await pilot.press("right", "down")
+        scroll = viewer.query_one("#image-detail-scroll", ScrollableContainer)
+        pan = scroll.scroll_x, scroll.scroll_y
+        assert pan[0] > 0 and pan[1] > 0
+        created[0].emit(MediaSyncStatus.COMPLETE, added="Added: 1")
+        await pilot.pause()
+        assert (scroll.scroll_x, scroll.scroll_y) == pan
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is review and not review.revealed
+        assert "[picture downloading]" not in rendered_text(review)
+        assert "secret.png" not in rendered_text(review)

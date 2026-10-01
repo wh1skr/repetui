@@ -36,6 +36,7 @@ class FullSyncDirection(str, Enum):
 class SyncOutcome:
     status: SyncStatus
     detail: str = ""
+    media_endpoint: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -150,7 +151,7 @@ def _sync_media_to_completion(collection, auth) -> None:
         time.sleep(0.25)
 
 
-def sync_profile(profile: ProfilePaths) -> SyncOutcome:
+def sync_profile(profile: ProfilePaths, *, include_media: bool = True) -> SyncOutcome:
     """Sync collection and media, stopping when full sync needs a user's choice."""
     from anki.collection import Collection
     from anki.sync_pb2 import SyncCollectionResponse, SyncStatusResponse
@@ -164,8 +165,11 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
             auth.endpoint = status.new_endpoint.rstrip("/") + "/"
         if status.required == SyncStatusResponse.Required.NO_CHANGES:
             # Collection status does not include pending media transfers.
-            _sync_media_to_completion(collection, auth)
-            return SyncOutcome(SyncStatus.UP_TO_DATE)
+            if include_media:
+                _sync_media_to_completion(collection, auth)
+            return SyncOutcome(
+                SyncStatus.UP_TO_DATE, media_endpoint=None if include_media else auth.endpoint
+            )
 
         result = collection.sync_collection(auth, sync_media=False)
         if result.new_endpoint:
@@ -186,7 +190,7 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
             collection.close_for_full_sync()
             collection.full_upload_or_download(
                 auth=auth,
-                server_usn=result.server_media_usn,
+                server_usn=result.server_media_usn if include_media else None,
                 upload=upload,
             )
             collection.reopen(after_full_sync=True)
@@ -195,8 +199,11 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
                 SyncStatus.FAILED,
                 "Collection sync did not complete. Try syncing again.",
             )
-        _sync_media_to_completion(collection, auth)
-        return SyncOutcome(SyncStatus.SYNCED)
+        if include_media:
+            _sync_media_to_completion(collection, auth)
+        return SyncOutcome(
+            SyncStatus.SYNCED, media_endpoint=None if include_media else auth.endpoint
+        )
     except Exception as exc:
         return failed_sync_outcome(exc)
     finally:
@@ -205,7 +212,9 @@ def sync_profile(profile: ProfilePaths) -> SyncOutcome:
                 collection.close()
 
 
-def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> SyncOutcome:
+def full_sync_profile(
+    profile: ProfilePaths, direction: FullSyncDirection, *, include_media: bool = True
+) -> SyncOutcome:
     """Resolve a user-confirmed replacement, preserving local data first.
 
     Call only after explicit direction-specific confirmation. A local backup
@@ -249,7 +258,9 @@ def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> Sy
         if result.required in allowed:
             collection.close_for_full_sync()
             collection.full_upload_or_download(
-                auth=auth, server_usn=result.server_media_usn, upload=upload
+                auth=auth,
+                server_usn=result.server_media_usn if include_media else None,
+                upload=upload,
             )
             collection.reopen(after_full_sync=True)
             status = collection.sync_status(auth)
@@ -261,8 +272,12 @@ def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> Sy
                 )
         elif result.required != SyncCollectionResponse.NO_CHANGES:
             return SyncOutcome(SyncStatus.FAILED, "Sync state changed; retry and choose again.")
-        _sync_media_to_completion(collection, auth)
-        return SyncOutcome(SyncStatus.SYNCED, f"Local collection backup: {backup}")
+        if include_media:
+            _sync_media_to_completion(collection, auth)
+        return SyncOutcome(
+            SyncStatus.SYNCED, f"Local collection backup: {backup}",
+            media_endpoint=None if include_media else auth.endpoint,
+        )
     except Exception as exc:
         if backing_up:
             return SyncOutcome(SyncStatus.BACKUP_FAILED, "Backup failed; no sync data transferred.")
@@ -271,3 +286,14 @@ def full_sync_profile(profile: ProfilePaths, direction: FullSyncDirection) -> Sy
         if collection is not None:
             with contextlib.suppress(Exception):
                 collection.close()
+
+
+def sync_collection_profile(profile: ProfilePaths) -> SyncOutcome:
+    """Sync cards first; the UI starts media on its reopened review collection."""
+    return sync_profile(profile, include_media=False)
+
+
+def full_sync_collection_profile(
+    profile: ProfilePaths, direction: FullSyncDirection
+) -> SyncOutcome:
+    return full_sync_profile(profile, direction, include_media=False)

@@ -123,6 +123,7 @@ def _header(
     width: int,
     current_queue: ReviewQueue | None,
     show_readings: bool,
+    media_active: bool = False,
 ) -> Text:
     """Build the first Flow line, shedding metadata before card content."""
     front, multiple_front_blocks = _front_content(presentation, show_readings)
@@ -174,6 +175,8 @@ def _header(
                 else "#79c98b"
             ),
         )
+        if media_active and width >= cell_len(split) + 2:
+            result.append(" ↓", style="#d7b85a")
         return result
 
     def first_row_width() -> int:
@@ -348,9 +351,12 @@ def compose_review(
     current_queue: ReviewQueue | None = None,
     answer_layout: AnswerLayout = AnswerLayout.COMPACT,
     show_readings: bool = False,
+    media_active: bool = False,
 ) -> Text:
     """Compose the complete visible review document without mutating state."""
-    result = _header(presentation, deck_name, counts, width, current_queue, show_readings)
+    result = _header(
+        presentation, deck_name, counts, width, current_queue, show_readings, media_active
+    )
     if revealed:
         result.append("\n")
         result.append_text(_back(sections, answer_layout, show_readings))
