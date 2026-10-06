@@ -4299,7 +4299,7 @@ async def test_media_progress_can_be_dismissed_for_review_and_reopened_at_40x6(
 
         def start(self):
             self.snapshot = MediaSyncSnapshot(
-                MediaSyncStatus.ACTIVE, added="Added: 12", checked="Checked: 50"
+                MediaSyncStatus.ACTIVE, added="Added: 0↑ 12↓", checked="Checked: 50"
             )
             self.report(self, self.snapshot)
 
@@ -4320,7 +4320,7 @@ async def test_media_progress_can_be_dismissed_for_review_and_reopened_at_40x6(
         assert type(app.screen).__name__ == "MediaProgressScreen"
         assert len(created) == 1
         assert app.syncing is False
-        assert "Added: 12" in str(app.screen.query_one("#media-progress", Static).render())
+        assert "Added: 0↑ 12↓" in str(app.screen.query_one("#media-progress", Static).render())
         assert "Added: Added:" not in str(app.screen.query_one("#media-progress", Static).render())
         assert app.screen.query_one("#media-footer").region.bottom <= 6
         await pilot.resize_terminal(20, 4)
@@ -4371,6 +4371,94 @@ def controlled_media(backend, monkeypatch):
 
     monkeypatch.setattr(backend, "media_sync_task", create)
     return created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "added", "show_panel"), [
+    (MediaSyncStatus.STARTING, "", False),
+    (MediaSyncStatus.ACTIVE, "Added: 0↑ 0↓", False),
+    (MediaSyncStatus.ACTIVE, "Added: 12↑ 0↓", False),
+    (MediaSyncStatus.COMPLETE, "Added: 0↑ 0↓", False),
+    (MediaSyncStatus.COMPLETE, "Added: 12↑ 0↓", False),
+    (MediaSyncStatus.ACTIVE, "Added: 0↑ 1↓", True),
+    (MediaSyncStatus.COMPLETE, "Added: 0↑ 1↓", True),
+    (MediaSyncStatus.FAILED, "Added: 0↑ 0↓", True),
+])
+async def test_sync_only_opens_media_panel_for_downloads_or_failure_at_40x6(
+    tmp_path, monkeypatch, status, added, show_panel,
+):
+    syncs = []
+    app, backend = make_app(
+        tmp_path, syncer=lambda _: syncs.append(True) or SyncOutcome(SyncStatus.SYNCED)
+    )
+    created = controlled_media(backend, monkeypatch)
+    monkeypatch.setattr(ControlledMediaTask, "start", lambda worker: worker.emit(
+        status, added=added, checked="Checked: 50", removed="Removed: 12↑ 0↓"
+    ))
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        opened = []
+        original_show = app._show_media_progress
+
+        def show():
+            opened.append(True)
+            original_show()
+
+        monkeypatch.setattr(app, "_show_media_progress", show)
+        await pilot.press("s")
+        await pilot.pause(1.2)
+        assert syncs == [True] and len(created) == 1
+        assert not app.syncing
+        assert bool(opened) is show_panel
+        if show_panel:
+            assert isinstance(app.screen, MediaProgressScreen)
+            assert app.screen.snapshot.status is status
+            assert app.screen.query_one("#media-footer").region.bottom <= 6
+            await pilot.press("escape")
+        assert app.screen is review and not review.revealed
+        await pilot.press("enter", "3")
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manual_first", [False, True])
+@pytest.mark.parametrize("terminal", [MediaSyncStatus.COMPLETE, MediaSyncStatus.FAILED])
+async def test_late_downloads_open_once_and_manual_progress_stays_available(
+    tmp_path, monkeypatch, manual_first, terminal,
+):
+    app, backend = make_app(tmp_path, syncer=lambda _: SyncOutcome(SyncStatus.SYNCED))
+    created = controlled_media(backend, monkeypatch)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        await pilot.press("s")
+        await pilot.pause(1.2)
+        assert app.screen is review
+        if manual_first:
+            await pilot.press("s")
+            assert isinstance(app.screen, MediaProgressScreen)
+            await pilot.press("escape")
+        created[0].emit(MediaSyncStatus.ACTIVE, added="Added: 0↑ 1↓")
+        await pilot.pause()
+        if not manual_first:
+            assert isinstance(app.screen, MediaProgressScreen)
+            await pilot.press("escape")
+        assert app.screen is review
+        created[0].emit(MediaSyncStatus.ACTIVE, added="Added: 0↑ 2↓")
+        await pilot.pause()
+        assert app.screen is review
+        await pilot.press("s")
+        assert isinstance(app.screen, MediaProgressScreen)
+        assert len(created) == 1
+        await pilot.press("escape")
+        created[0].emit(terminal, added="Added: 0↑ 2↓", failure=SyncStatus.OFFLINE)
+        await pilot.pause()
+        if terminal is MediaSyncStatus.FAILED:
+            assert isinstance(app.screen, MediaProgressScreen)
+            assert "Offline" in str(app.screen.query_one("#media-progress", Static).render())
+            await pilot.press("escape")
+        assert app.screen is review
 
 
 @pytest.mark.asyncio
@@ -4466,7 +4554,10 @@ async def test_background_media_failure_retries_only_media_and_ignores_old_repor
         await pilot.pause()
         created[0].emit(MediaSyncStatus.FAILED, added="7", failure=SyncStatus.OFFLINE)
         await pilot.pause()
-        assert app.screen is review and not app.syncing
+        assert isinstance(app.screen, MediaProgressScreen) and not app.syncing
+        assert "Offline" in str(app.screen.query_one("#media-progress", Static).render())
+        await pilot.press("escape")
+        assert app.screen is review
         await pilot.press("s")
         assert isinstance(app.screen, MediaProgressScreen)
         assert len(created) == 2 and not collection_syncs
