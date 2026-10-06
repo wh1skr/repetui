@@ -3180,6 +3180,7 @@ class RepetuiApp(App[None]):
         self._sync_fatal_error: str | None = None
         self._media_task: MediaSyncTask | None = None
         self._media_snapshot: MediaSyncSnapshot | None = None
+        self._media_progress_shown = False
         self._media_endpoint: str | None = None
         self._completion_celebration: CompletionCelebrationScreen | None = None
         self.offered_field_setups: set[tuple[int, int]] = set()
@@ -3355,12 +3356,21 @@ class RepetuiApp(App[None]):
         )
         self._media_task = task
         self._media_snapshot = task.snapshot if task is not None else None
+        self._media_progress_shown = False
         if task is not None:
             task.start()
+
+    def _maybe_show_media_progress(self) -> None:
+        snapshot = self._media_snapshot
+        if self.syncing or self.lifecycle.stopped or self._media_progress_shown or snapshot is None:
+            return
+        if snapshot.has_downloads or snapshot.status is MediaSyncStatus.FAILED:
+            self._show_media_progress()
 
     def _show_media_progress(self) -> None:
         if self._media_snapshot is None:
             return
+        self._media_progress_shown = True
         if isinstance(self.screen, MediaProgressScreen):
             self.screen.update_progress(self._media_snapshot)
         else:
@@ -3381,10 +3391,16 @@ class RepetuiApp(App[None]):
     def on_media_updated(self, message: MediaUpdated) -> None:
         if self.lifecycle.stopped or message.task is not self._media_task:
             return
+        if message.snapshot.status is MediaSyncStatus.FAILED and (
+            self._media_snapshot is None
+            or self._media_snapshot.status is not MediaSyncStatus.FAILED
+        ):
+            self._media_progress_shown = False
         self._media_snapshot = message.snapshot
         if isinstance(self.screen, MediaProgressScreen):
             self.screen.update_progress(message.snapshot)
         self._refresh_media_content()
+        self._maybe_show_media_progress()
         if message.snapshot.status is MediaSyncStatus.COMPLETE:
             self.notify("Media synced.")
         elif message.snapshot.status is MediaSyncStatus.FAILED:
@@ -3412,11 +3428,8 @@ class RepetuiApp(App[None]):
                 return
         if fatal and fatal_error is not None:
             self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))
-        elif self.media_downloading or (
-            self._media_snapshot is not None
-            and self._media_snapshot.status is MediaSyncStatus.FAILED
-        ):
-            self._show_media_progress()
+        else:
+            self._maybe_show_media_progress()
 
     def refresh_open_screens(self) -> None:
         for screen in tuple(self.screen_stack):

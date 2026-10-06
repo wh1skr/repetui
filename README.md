@@ -83,6 +83,8 @@ the current card's primary action, while `Escape` only dismisses it.
 ### Media sync
 
 `s` synchronizes cards first, then downloads images and audio in the background.
+The media window opens automatically for incoming files or a media error;
+checks and uploads keep you on your study screen.
 The media window shows Anki's added, checked, and removed file counts. Press
 `Enter` or `Escape` to dismiss it and keep studying; `s` reopens progress without
 starting another transfer. A `↓` in review and “media ↓” on the deck screen
