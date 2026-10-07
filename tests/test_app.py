@@ -7,6 +7,7 @@ import pytest
 from PIL import Image, ImageDraw
 from textual.containers import ScrollableContainer, VerticalScroll
 from textual.widgets import Input, ListItem, Static
+from textual.widgets._toast import Toast
 
 import repetui.app as app_module
 from repetui import __version__
@@ -29,6 +30,7 @@ from repetui.app import (
     ImageDetailScreen,
     MediaProgressScreen,
     MediaUpdated,
+    NotificationDetailScreen,
     OperationStatusPill,
     RepetuiApp,
     ReviewScreen,
@@ -4459,6 +4461,175 @@ async def test_late_downloads_open_once_and_manual_progress_stays_available(
             assert "Offline" in str(app.screen.query_one("#media-progress", Static).render())
             await pilot.press("escape")
         assert app.screen is review
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("severity", "colour"), [
+    ("information", "#e7e1d8"), ("warning", "#e8b856"), ("error", "#dc6b72"),
+])
+async def test_notification_preview_is_compact_centred_and_keeps_native_timeouts(
+    tmp_path, severity, colour,
+):
+    app, _ = make_app(tmp_path)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        decks = app.screen.query_one("#decks")
+        region = decks.region
+        app.screen.notify("First notice", severity=severity)
+        await pilot.pause()
+        first = list(app._notifications)[-1]
+        assert first.timeout == 5 and first.message == "First notice"
+        app.notify("Read the complete message", title="Notice", severity=severity, timeout=10)
+        await pilot.pause()
+        assert list(app._notifications)[-1].timeout == 10
+        toasts = list(app.screen.query(Toast))
+        assert len(toasts) == 1
+        toast = toasts[0]
+        assert "n: Read the complete message" in toast.render().plain
+        assert toast.styles.color.hex.lower() == colour
+        assert toast.styles.background.hex == "#293034"
+        assert all(edge[0] == "" for edge in toast.styles.border)
+        assert toast.region.height <= 2 and toast.region.bottom == 6
+        assert abs(toast.region.x - (40 - toast.region.width) / 2) <= 1
+        assert decks.region == region
+        await pilot.resize_terminal(20, 4)
+        assert toast.region.right <= 20 and toast.region.bottom <= 4
+        await pilot.press("n")
+        assert isinstance(app.screen, NotificationDetailScreen)
+        assert app.screen.notification.message == "Read the complete message"
+        assert app.screen.notification.title == "Notice"
+        await pilot.press("escape")
+        assert isinstance(app.screen, DeckScreen)
+
+
+@pytest.mark.asyncio
+async def test_missing_sound_preview_allows_reveal_and_rating(tmp_path):
+    app, backend = make_app(tmp_path)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        await pilot.press("enter")
+        review = app.screen
+        region = review.query_one("#card-scroll").region
+        await pilot.press("p")
+        toast = review.query_one(Toast)
+        assert toast.render().plain == "n: No recorded sound on this side."
+        assert toast.region.height == 1
+        assert review.query_one("#card-scroll").region == region
+        await pilot.press("enter")
+        assert review.revealed and app.screen is review
+        await pilot.press("3")
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+async def test_notification_reader_scrolls_without_expiring_or_changing_review_state(tmp_path):
+    content = RawCardContent(
+        CardTemplateIdentity(1, "Basic", 0, "Card"), "question",
+        '<hr id=answer><h2>Meaning</h2>' + '<p>answer details</p>' * 20
+        + '<h2>Extra</h2><p>folded details</p>',
+    )
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    extra = present_card(content).back.sections[-1]
+    preferences.set_mode(content.identity, extra.id, SectionMode.FOLD)
+    app, backend = make_app(tmp_path, content, preferences)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        await pilot.press("enter", "enter", "space", "G")
+        review = app.screen
+        card = review.card
+        folds = set(review.expanded_sections)
+        scroll = review.query_one("#card-scroll", VerticalScroll)
+        position = scroll.scroll_y
+        assert folds and position > 0
+        message = "Audio file missing: [long-file-name].mp3\n" + "Retry instructions.\n" * 20
+        app.notify(message, title="Sound unavailable", severity="warning", timeout=1, markup=False)
+        await pilot.pause()
+        await pilot.press("n")
+        reader = app.screen
+        assert isinstance(reader, NotificationDetailScreen)
+        assert reader.notification.message == message
+        text = str(reader.query_one("#notification-text", Static).render())
+        assert "Sound unavailable" in text and "[long-file-name].mp3" in text
+        await pilot.pause(1.1)
+        assert app.screen is reader
+        body = reader.query_one("#notification-body", VerticalScroll)
+        await pilot.press("j")
+        assert body.scroll_y > 0
+        await pilot.press("k")
+        assert body.scroll_y == 0
+        await pilot.press("enter", "1", "p", "s", "n", "question_mark")
+        assert app.screen is reader and backend.rating is None
+        assert review.card is card and review.revealed
+        await pilot.resize_terminal(20, 4)
+        assert reader.query_one("#notification-footer").region.bottom <= 4
+        assert body.region.height > 0
+        await pilot.resize_terminal(40, 6)
+        app.notify("A newer notice", timeout=5)
+        await pilot.pause()
+        assert reader.notification.message == message
+        assert not reader.query(Toast)
+        await pilot.press("escape")
+        assert app.screen is review and review.card is card and review.revealed
+        assert review.expanded_sections == folds and scroll.scroll_y == position
+        await pilot.press("n")
+        assert app.screen.notification.message == "A newer notice"
+        await pilot.press("q")
+        assert app.screen is review
+        await pilot.press("3")
+        assert backend.rating == 3
+
+
+@pytest.mark.asyncio
+async def test_expired_notification_cannot_be_opened(tmp_path):
+    app, _ = make_app(tmp_path)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        screen = app.screen
+        app.notify("Short-lived notice", timeout=0.1)
+        await pilot.pause(0.3)
+        assert not screen.query(Toast)
+        await pilot.press("n")
+        assert app.screen is screen and not list(app._notifications)
+
+
+@pytest.mark.asyncio
+async def test_notification_shortcut_yields_to_text_entry_and_existing_review_binding(tmp_path):
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    app, backend = make_app(tmp_path, preferences=preferences)
+    controls = ReviewControls.defaults().with_binding(ReviewAction.AGAIN, "n")
+    app.save_review_controls(controls)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        await pilot.press("enter", "enter")
+        review = app.screen
+        field = Input(id="notification-input")
+        await review.mount(field)
+        field.focus()
+        app.notify("A notice is visible")
+        await pilot.pause()
+        assert review.query_one(Toast).render().plain == "A notice is visible"
+        await pilot.press("n")
+        assert field.value == "n" and app.screen is review
+        await field.remove()
+        review.set_focus(None)
+        await pilot.press("n")
+        assert backend.rating == 1
+        assert app.review_controls == controls
+
+
+@pytest.mark.asyncio
+async def test_media_failure_waits_for_notification_reader_to_close(tmp_path, monkeypatch):
+    app, backend = make_app(tmp_path)
+    created = controlled_media(backend, monkeypatch)
+    async with app.run_test(size=(40, 6), notifications=True) as pilot:
+        await pilot.press("enter")
+        app._start_media_downloads()
+        app.notify("Read this notice")
+        await pilot.pause()
+        await pilot.press("n")
+        reader = app.screen
+        created[0].emit(MediaSyncStatus.FAILED, failure=SyncStatus.OFFLINE)
+        await pilot.pause()
+        assert app.screen is reader
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, MediaProgressScreen)
+        assert "Offline" in str(app.screen.query_one("#media-progress", Static).render())
 
 
 @pytest.mark.asyncio

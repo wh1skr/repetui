@@ -17,10 +17,13 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
+from textual.notifications import Notification, Notifications
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import Input, ListItem, ListView, Static
+from textual.widgets._toast import ToastRack
 
 from . import __version__
 from .addons import (
@@ -189,6 +192,7 @@ class MediaUpdated(Message):
 _HELP_TEXT = (
     "everywhere\n"
     "  ?        settings\n"
+    "  n        read current notification\n"
     "  q        quit\n\n"
     "decks\n"
     "  j / k    move\n"
@@ -2440,6 +2444,53 @@ class ReviewScreen(Screen[None]):
         self.repetui.action_sync()
 
 
+class NotificationDetailScreen(ModalScreen[None]):
+    """Keep one complete notice readable until the user returns to study."""
+
+    BINDINGS = [
+        Binding("escape", "back", show=False),
+        Binding("q", "back", show=False, priority=True),
+        Binding("question_mark", "block", show=False, priority=True),
+        Binding("j", "scroll_down", show=False),
+        Binding("k", "scroll_up", show=False),
+    ]
+
+    def __init__(self, notification: Notification) -> None:
+        super().__init__()
+        self.notification = notification
+        self.add_class(f"-{notification.severity}")
+
+    def compose(self) -> ComposeResult:
+        notification = self.notification
+        text = (
+            Content.from_markup(notification.message)
+            if notification.markup else Content(notification.message)
+        )
+        if notification.title:
+            text = Content.assemble(notification.title, "\n", text)
+        yield Vertical(
+            Static(f"notification · {notification.severity}", id="notification-header"),
+            VerticalScroll(Static(text, id="notification-text"), id="notification-body"),
+            Static("j/k scroll · esc back", id="notification-footer"),
+            id="notification-layout",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).focus()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).scroll_up(animate=False)
+
+    def action_block(self) -> None:
+        pass
+
+    def action_back(self) -> None:
+        self.dismiss()
+
+
 class StatusPill(ModalScreen[None]):
     """Reusable centered one-line terminal status surface."""
 
@@ -3126,6 +3177,69 @@ class RepetuiApp(App[None]):
         color: #dc6b72;
     }
 
+    ToastRack {
+        overlay: screen;
+        align: center bottom;
+        max-height: 50%;
+        margin-bottom: 0;
+        overflow: hidden;
+    }
+
+    ToastHolder {
+        align-horizontal: center;
+    }
+
+    Toast {
+        width: auto;
+        max-width: 100%;
+        max-height: 2;
+        margin: 0;
+        padding: 0 1;
+        border: none;
+        background: #293034;
+        color: #e7e1d8;
+    }
+
+    Toast.-information {
+        border: none;
+    }
+
+    Toast.-warning, Toast.-warning .toast--title,
+    NotificationDetailScreen.-warning #notification-header {
+        border: none;
+        color: #e8b856;
+    }
+
+    Toast.-error, Toast.-error .toast--title,
+    NotificationDetailScreen.-error #notification-header {
+        border: none;
+        color: #dc6b72;
+    }
+
+    Toast.-information .toast--title {
+        color: #e7e1d8;
+    }
+
+    #notification-layout {
+        height: 1fr;
+        background: #293034;
+    }
+
+    #notification-header, #notification-footer {
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
+    #notification-footer {
+        color: #aaa49b;
+    }
+
+    #notification-body {
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+
     #sync-recovery {
         display: none;
         width: 40;
@@ -3149,6 +3263,8 @@ class RepetuiApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=False, priority=True),
         Binding("question_mark", "help", "Help", show=False, priority=True),
+        # ponytail: n yields to custom review keys; make it configurable if needed.
+        Binding("n", "open_notification", "Read notification", show=False),
     ]
 
     def __init__(
@@ -3280,8 +3396,49 @@ class RepetuiApp(App[None]):
             self._completion_celebration.stop_animation()
             self._completion_celebration = None
 
+    def _refresh_notifications(self) -> None:
+        if not self.screen_stack:
+            return
+        racks = self.screen.query(ToastRack)
+        if not racks:
+            return
+        notifications = list(self._notifications)
+        preview = Notifications()
+        if notifications and not isinstance(self.screen, NotificationDetailScreen):
+            notification = notifications[-1]
+            shortcut_available = not isinstance(self.screen, ReviewScreen) or not any(
+                self.review_controls.binding(action) == "n" for action in ReviewAction
+            )
+            message = f"n: {notification.message}" if shortcut_available else notification.message
+            preview.add(replace(notification, message=message))
+        rack = racks.first()
+
+        async def show_preview() -> None:
+            if rack.is_mounted:
+                # Remove native holders as well, so replaced notices leave no empty rows.
+                await rack.remove_children()
+                rack.show(preview)
+
+        self.call_later(show_preview)
+
+    def action_open_notification(self) -> None:
+        if self.syncing or isinstance(self.screen, (
+            NotificationDetailScreen, OperationStatusPill, CompletionCelebrationScreen,
+        )):
+            return
+        notifications = list(self._notifications)
+        if notifications:
+            notification = notifications[-1]
+            self._unnotify(notification)
+            self.push_screen(
+                NotificationDetailScreen(notification),
+                lambda _: self._maybe_show_media_progress(),
+            )
+
     def action_help(self) -> None:
-        if self.syncing or isinstance(self.screen, StartupRecoveryScreen):
+        if self.syncing or isinstance(self.screen, (
+            StartupRecoveryScreen, NotificationDetailScreen,
+        )):
             return
         screen = self.screen
         if isinstance(screen, CompletionCelebrationScreen):
@@ -3294,7 +3451,9 @@ class RepetuiApp(App[None]):
             self.push_screen(SettingsScreen(initial_tab="help"))
 
     def action_quit(self) -> None:
-        if isinstance(self.screen, CompletionCelebrationScreen):
+        if isinstance(self.screen, NotificationDetailScreen):
+            self.screen.action_back()
+        elif isinstance(self.screen, CompletionCelebrationScreen):
             self.screen.action_skip()
         elif not self.syncing:
             self.exit()
@@ -3362,7 +3521,10 @@ class RepetuiApp(App[None]):
 
     def _maybe_show_media_progress(self) -> None:
         snapshot = self._media_snapshot
-        if self.syncing or self.lifecycle.stopped or self._media_progress_shown or snapshot is None:
+        if (
+            self.syncing or self.lifecycle.stopped or self._media_progress_shown or snapshot is None
+            or isinstance(self.screen, NotificationDetailScreen)
+        ):
             return
         if snapshot.has_downloads or snapshot.status is MediaSyncStatus.FAILED:
             self._show_media_progress()
