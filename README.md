@@ -70,6 +70,7 @@ Retry. Recovery never deletes collection, lock, WAL, or journal files.
 | Card-field setup | `Space`, `J` / `K`, `a`, `p`, `v`, `Enter` | Change role, reorder, suggest a layout, preview, flip question/answer, save |
 | Decks / review | `s` | Sync with AnkiWeb |
 | Anywhere | `?` | Help, controls, and section settings |
+| Anywhere | `n` | Read the current notification; `j` / `k` scroll, Escape returns |
 | Anywhere | `q` | Quit |
 
 Navigation remains fixed so it is always recoverable. Review actions can be
@@ -79,6 +80,18 @@ Instant, Brief, Normal, or Relaxed. This controls successful Undo, Bury,
 Suspend, and Flag confirmations; errors remain readable. While a successful
 confirmation is visible, `Enter` dismisses it and immediately continues with
 the current card's primary action, while `Escape` only dismisses it.
+
+### Notifications
+
+Notices appear as a compact, bottom-centred charcoal strip: warm text for
+information, amber for warnings, and soft red for errors. The current preview
+wraps to at most two lines and leaves study controls active. Unopened notices
+keep their normal timeout (5 seconds, or longer for important messages).
+
+Press `n` to read the full title and message without a timeout. Use `j` / `k`
+to scroll and `Escape` to return to the same card and review state. Opening a
+notice dismisses its preview. Existing custom review bindings and text entry
+take precedence over `n`.
 
 ### Media sync
 
