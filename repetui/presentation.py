@@ -150,7 +150,7 @@ class CardSide:
 
     @property
     def display_width(self) -> int:
-        return max((_terminal_width(line) for line in self.text.splitlines()), default=0)
+        return max((cell_len(line) for line in self.text.splitlines()), default=0)
 
 
 @dataclass(frozen=True)
@@ -855,10 +855,6 @@ def _strip_plain_front(back: CardSide, front: CardSide) -> CardSide:
                 images=_image_spans(marked),
             ),))
     return back
-
-
-def _terminal_width(text: str) -> int:
-    return cell_len(text)
 
 
 def _field_is_present(field: _RenderedDocument, side: _RenderedDocument) -> bool:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -32,6 +33,12 @@ class MediaSyncSnapshot:
     @property
     def active(self) -> bool:
         return self.status in {MediaSyncStatus.STARTING, MediaSyncStatus.ACTIVE}
+
+    @property
+    def has_downloads(self) -> bool:
+        # Native counts have localized labels and optional Fluent bidi isolation.
+        downloaded = re.search(r"([0-9]+)\u2069?↓", self.added)
+        return downloaded is not None and int(downloaded[1]) > 0
 
 
 class MediaSyncTask:

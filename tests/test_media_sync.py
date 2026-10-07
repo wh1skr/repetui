@@ -1,12 +1,28 @@
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from weakref import ref
 
+import pytest
+from anki._backend import RustBackend, Translations
 from anki.sync_pb2 import MediaSyncProgress, MediaSyncStatusResponse
 
 from repetui.config import ProfilePaths
-from repetui.media_sync import MediaSyncStatus, MediaSyncTask
+from repetui.media_sync import MediaSyncSnapshot, MediaSyncStatus, MediaSyncTask
 from repetui.sync import SyncStatus
+
+
+@pytest.mark.parametrize("language", ["en", "ja", "de", "ar"])
+def test_download_detection_uses_native_localized_direction_counts(language):
+    backend = RustBackend(langs=[language])
+    translations = Translations(ref(backend))
+    for uploaded, downloaded in ((0, 0), (12, 0), (0, 1), (12, 1234)):
+        added = translations.sync_media_added_count(up=str(uploaded), down=str(downloaded))
+        snapshot = MediaSyncSnapshot(MediaSyncStatus.ACTIVE, added=added)
+        assert snapshot.has_downloads is (downloaded > 0)
+    assert not MediaSyncSnapshot(MediaSyncStatus.STARTING).has_downloads
+    assert not MediaSyncSnapshot(MediaSyncStatus.ACTIVE, added="Added: 12").has_downloads
+    assert MediaSyncSnapshot(MediaSyncStatus.COMPLETE, added="Added: 0↑ 1↓").has_downloads
 
 
 class BackgroundCollection:

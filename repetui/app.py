@@ -17,10 +17,13 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
+from textual.notifications import Notification, Notifications
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import Input, ListItem, ListView, Static
+from textual.widgets._toast import ToastRack
 
 from . import __version__
 from .addons import (
@@ -51,6 +54,7 @@ from .flow import (
     compose_ratings,
     compose_review,
     section_name,
+    section_states,
 )
 from .images import (
     ImagePreviewError,
@@ -189,6 +193,7 @@ class MediaUpdated(Message):
 _HELP_TEXT = (
     "everywhere\n"
     "  ?        settings\n"
+    "  n        read current notification\n"
     "  q        quit\n\n"
     "decks\n"
     "  j / k    move\n"
@@ -857,28 +862,8 @@ class TemplateFieldSetupScreen(Screen[None]):
     def _preview_states(
         self, presentation: CardPresentation
     ) -> tuple[SectionState, ...]:
-        identity = presentation.identity
-        modes = tuple(
-            self.review.repetui.preferences.mode(identity, section.id)
-            for section in presentation.back.sections
-        )
-        folded_ids = tuple(
-            section.id
-            for section, mode in zip(presentation.back.sections, modes, strict=True)
-            if mode is SectionMode.FOLD
-        )
-        selected_fold = (
-            folded_ids[self.review.selected_folded % len(folded_ids)]
-            if folded_ids
-            else None
-        )
-        return tuple(
-            SectionState(
-                section=section,
-                mode=mode,
-                selected=section.id == selected_fold,
-            )
-            for section, mode in zip(presentation.back.sections, modes, strict=True)
+        return section_states(
+            presentation, self.review.repetui.preferences, self.review.selected_folded
         )
 
     def _refresh_preview(self) -> None:
@@ -1314,51 +1299,25 @@ class SettingsScreen(Screen[None]):
     def action_down(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_down(animate=False)
-        elif self.tab == "sections" and self.card is not None:
-            self.query_one("#settings-sections", ListView).action_cursor_down()
-        elif self.tab == "controls":
-            self.query_one("#settings-controls", ListView).action_cursor_down()
-        elif self.tab == "add-ons":
-            self._active_add_on_view().action_cursor_down()
+        elif (view := self._active_list()) is not None:
+            view.action_cursor_down()
 
     def action_up(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_up(animate=False)
-        elif self.tab == "sections" and self.card is not None:
-            self.query_one("#settings-sections", ListView).action_cursor_up()
-        elif self.tab == "controls":
-            self.query_one("#settings-controls", ListView).action_cursor_up()
-        elif self.tab == "add-ons":
-            self._active_add_on_view().action_cursor_up()
+        elif (view := self._active_list()) is not None:
+            view.action_cursor_up()
 
     def action_top(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_home(animate=False)
-            return
-        if self.tab == "sections" and self.card is not None:
-            view = self.query_one("#settings-sections", ListView)
-        elif self.tab == "controls":
-            view = self.query_one("#settings-controls", ListView)
-        elif self.tab == "add-ons":
-            view = self._active_add_on_view()
-        else:
-            return
-        if view.children:
+        elif (view := self._active_list()) is not None and view.children:
             view.index = 0
 
     def action_bottom(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_end(animate=False)
-            return
-        if self.tab == "sections" and self.card is not None:
-            view = self.query_one("#settings-sections", ListView)
-        elif self.tab == "controls":
-            view = self.query_one("#settings-controls", ListView)
-        elif self.tab == "add-ons":
-            view = self._active_add_on_view()
-        else:
-            return
-        if view.children:
+        elif (view := self._active_list()) is not None and view.children:
             view.index = len(view.children) - 1
 
     def action_cycle(self) -> None:
@@ -1422,6 +1381,13 @@ class SettingsScreen(Screen[None]):
             return
         item.refresh_mode(self.repetui.preferences, identity)
         self._show_default_footer()
+
+    def _active_list(self) -> ListView | None:
+        if self.tab == "add-ons":
+            return self._active_add_on_view()
+        if self.tab == "controls" or (self.tab == "sections" and self.card is not None):
+            return self.query_one(f"#settings-{self.tab}", ListView)
+        return None
 
     def _active_add_on_view(self) -> ListView:
         return self.query_one(
@@ -1666,8 +1632,49 @@ class NativeDetailScroll(NativeScrollMixin, ScrollableContainer):
     pass
 
 
-class ImageDetailScreen(Screen[None]):
+class NativeImageScreen(Screen[None]):
+    """Share overlay ownership and deferred painting across both image screens."""
+
+    NATIVE_CONTENT: str
+    NATIVE_SCROLL: str
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._native: NativeImageOverlay | None = None
+        self._native_pictures: tuple[NativePicture, ...] = ()
+        self._native_paint_pending = False
+
+    def on_screen_suspend(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+
+    def _native_invalidated(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            self._schedule_native_paint()
+
+    def _schedule_native_paint(self) -> None:
+        if self._native is None or not self._native.enabled:
+            return
+        if not self._native_paint_pending:
+            self._native_paint_pending = True
+            self.call_after_refresh(self._paint_native)
+
+    def _paint_native(self) -> None:
+        self._native_paint_pending = False
+        if self.app.screen is self and self._native is not None:
+            self._native.paint(
+                self.query_one(self.NATIVE_CONTENT, Static),
+                self.query_one(self.NATIVE_SCROLL, ScrollableContainer),
+                self._native_pictures,
+            )
+
+
+class ImageDetailScreen(NativeImageScreen):
     """Full-pane character image that can pan and switch visible card pictures."""
+
+    NATIVE_CONTENT = "#image-detail-picture"
+    NATIVE_SCROLL = "#image-detail-scroll"
 
     BINDINGS = [
         Binding("escape", "back", "Review", show=False),
@@ -1686,9 +1693,6 @@ class ImageDetailScreen(Screen[None]):
         self.resolve = resolve
         self.index = 0
         self._rendered: tuple[int, int, int] | None = None
-        self._native: NativeImageOverlay | None = None
-        self._native_pictures: tuple[NativePicture, ...] = ()
-        self._native_paint_pending = False
         self._pending_picture: Path | None = None
         self._media_active_rendered = False
 
@@ -1705,33 +1709,8 @@ class ImageDetailScreen(Screen[None]):
         if self._native is not None:
             self._native.clear()
 
-    def on_screen_suspend(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-
     def on_screen_resume(self) -> None:
         self._native_invalidated()
-
-    def _native_invalidated(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-            self._schedule_native_paint()
-
-    def _schedule_native_paint(self) -> None:
-        if self._native is None or not self._native.enabled:
-            return
-        if not self._native_paint_pending:
-            self._native_paint_pending = True
-            self.call_after_refresh(self._paint_native)
-
-    def _paint_native(self) -> None:
-        self._native_paint_pending = False
-        if self.app.screen is self and self._native is not None:
-            self._native.paint(
-                self.query_one("#image-detail-picture", Static),
-                self.query_one("#image-detail-scroll", ScrollableContainer),
-                self._native_pictures,
-            )
 
     def on_resize(self) -> None:
         if self.is_mounted:
@@ -1828,7 +1807,9 @@ class ImageDetailScreen(Screen[None]):
         self._render_picture()
 
 
-class ReviewScreen(Screen[None]):
+class ReviewScreen(NativeImageScreen):
+    NATIVE_CONTENT = "#card"
+    NATIVE_SCROLL = "#card-scroll"
     RATING_FEEDBACK_DURATION = 1.0
 
     BINDINGS = [
@@ -1873,9 +1854,6 @@ class ReviewScreen(Screen[None]):
         self._rating_feedback_timer: Timer | None = None
         self._audio = CardAudioPlayer(self._audio_error)
         self._visible_images: tuple[str, ...] = ()
-        self._native: NativeImageOverlay | None = None
-        self._native_pictures: tuple[NativePicture, ...] = ()
-        self._native_paint_pending = False
         self._refresh_failed = False
         self._media_active_rendered = False
         self._pending_pictures: tuple[Path, ...] = ()
@@ -1908,34 +1886,9 @@ class ReviewScreen(Screen[None]):
             self._rating_feedback_timer.stop()
             self._rating_feedback_timer = None
 
-    def on_screen_suspend(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-
     def on_screen_resume(self) -> None:
         self._native_invalidated()
         self.call_after_refresh(self.refresh_media)
-
-    def _native_invalidated(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-            self._schedule_native_paint()
-
-    def _schedule_native_paint(self) -> None:
-        if self._native is None or not self._native.enabled:
-            return
-        if not self._native_paint_pending:
-            self._native_paint_pending = True
-            self.call_after_refresh(self._paint_native)
-
-    def _paint_native(self) -> None:
-        self._native_paint_pending = False
-        if self.app.screen is self and self._native is not None:
-            self._native.paint(
-                self.query_one("#card", Static),
-                self.query_one("#card-scroll", VerticalScroll),
-                self._native_pictures,
-            )
 
     def _busy(self) -> bool:
         if self.repetui.syncing:
@@ -2025,29 +1978,11 @@ class ReviewScreen(Screen[None]):
 
     def _section_states(self) -> tuple[SectionState, ...]:
         assert self.card is not None
-        identity = self.card.presentation.identity
-        folded = self._folded_sections()
-        folded_ids = [section.id for section in folded]
-        if folded_ids:
-            self.selected_folded %= len(folded_ids)
-        else:
-            self.selected_folded = 0
-
-        states: list[SectionState] = []
-        for section in self.card.presentation.back.sections:
-            mode = self.repetui.preferences.mode(identity, section.id)
-            states.append(
-                SectionState(
-                    section=section,
-                    mode=mode,
-                    expanded=section.id in self.expanded_sections,
-                    selected=(
-                        mode is SectionMode.FOLD
-                        and folded_ids.index(section.id) == self.selected_folded
-                    ),
-                )
-            )
-        return tuple(states)
+        self.selected_folded %= len(self._folded_sections()) or 1
+        return section_states(
+            self.card.presentation, self.repetui.preferences,
+            self.selected_folded, self.expanded_sections,
+        )
 
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
         if self._native is not None:
@@ -2440,6 +2375,53 @@ class ReviewScreen(Screen[None]):
         self.repetui.action_sync()
 
 
+class NotificationDetailScreen(ModalScreen[None]):
+    """Keep one complete notice readable until the user returns to study."""
+
+    BINDINGS = [
+        Binding("escape", "back", show=False),
+        Binding("q", "back", show=False, priority=True),
+        Binding("question_mark", "block", show=False, priority=True),
+        Binding("j", "scroll_down", show=False),
+        Binding("k", "scroll_up", show=False),
+    ]
+
+    def __init__(self, notification: Notification) -> None:
+        super().__init__()
+        self.notification = notification
+        self.add_class(f"-{notification.severity}")
+
+    def compose(self) -> ComposeResult:
+        notification = self.notification
+        text = (
+            Content.from_markup(notification.message)
+            if notification.markup else Content(notification.message)
+        )
+        if notification.title:
+            text = Content.assemble(notification.title, "\n", text)
+        yield Vertical(
+            Static(f"notification · {notification.severity}", id="notification-header"),
+            VerticalScroll(Static(text, id="notification-text"), id="notification-body"),
+            Static("j/k scroll · esc back", id="notification-footer"),
+            id="notification-layout",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).focus()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#notification-body", VerticalScroll).scroll_up(animate=False)
+
+    def action_block(self) -> None:
+        pass
+
+    def action_back(self) -> None:
+        self.dismiss()
+
+
 class StatusPill(ModalScreen[None]):
     """Reusable centered one-line terminal status surface."""
 
@@ -2830,11 +2812,7 @@ class RepetuiApp(App[None]):
         color: #e7e1d8;
     }
 
-    #deck-layout {
-        width: 100%;
-        height: 100%;
-    }
-
+    #deck-layout,
     #review-layout {
         width: 100%;
         height: 100%;
@@ -2847,7 +2825,9 @@ class RepetuiApp(App[None]):
         overflow: hidden;
     }
 
-    #deck-header, #error-header {
+    #deck-header, #error-header,
+    #field-profile-header,
+    #settings-header {
         height: 1;
         color: #eee9e0;
     }
@@ -2861,7 +2841,14 @@ class RepetuiApp(App[None]):
         height: 1;
     }
 
-    DeckItem:hover, DeckItem.-highlight {
+    DeckItem:hover, DeckItem.-highlight,
+    FieldProfileItem.-highlight,
+    AnswerLayoutSettingItem.-highlight,
+    TemplateFieldsSettingItem.-highlight,
+    SectionSettingItem.-highlight,
+    ControlSettingItem.-highlight,
+    AddOnItem.-highlight,
+    AddOnSettingItem.-highlight {
         background: #293034;
     }
 
@@ -2920,13 +2907,9 @@ class RepetuiApp(App[None]):
         text-align: center;
     }
 
-    #settings-layout {
-        width: 100%;
-        height: 100%;
-        background: #111416;
-    }
-
-    #field-profile-layout {
+    #settings-layout,
+    #field-profile-layout,
+    #error-layout {
         width: 100%;
         height: 100%;
         background: #111416;
@@ -2935,11 +2918,6 @@ class RepetuiApp(App[None]):
     #field-profile-body {
         width: 100%;
         height: 1fr;
-    }
-
-    #field-profile-header {
-        height: 1;
-        color: #eee9e0;
     }
 
     #field-profile-fields {
@@ -2979,29 +2957,29 @@ class RepetuiApp(App[None]):
         height: 1;
     }
 
-    FieldProfileItem {
+    FieldProfileItem,
+    AnswerLayoutSettingItem,
+    TemplateFieldsSettingItem,
+    SectionSettingItem,
+    ControlSettingItem,
+    AddOnItem,
+    AddOnSettingItem {
         height: 1;
         layout: horizontal;
     }
 
-    FieldProfileItem.-highlight {
-        background: #293034;
-    }
-
-    .field-name {
+    .field-name,
+    .setting-label,
+    .control-label {
         width: 1fr;
         height: 1;
     }
 
-    .field-role {
+    .field-role,
+    .setting-mode {
         width: 7;
         height: 1;
         text-align: right;
-    }
-
-    #settings-header {
-        height: 1;
-        color: #eee9e0;
     }
 
     #settings-tabs {
@@ -3025,42 +3003,8 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    AnswerLayoutSettingItem,
-    TemplateFieldsSettingItem,
-    SectionSettingItem,
-    ControlSettingItem,
-    AddOnItem,
-    AddOnSettingItem {
-        height: 1;
-        layout: horizontal;
-    }
-
-    AnswerLayoutSettingItem.-highlight,
-    TemplateFieldsSettingItem.-highlight,
-    SectionSettingItem.-highlight,
-    ControlSettingItem.-highlight,
-    AddOnItem.-highlight,
-    AddOnSettingItem.-highlight {
-        background: #293034;
-    }
-
-    .setting-label {
-        width: 1fr;
-        height: 1;
-    }
-
-    .setting-mode {
-        width: 7;
-        height: 1;
-        text-align: right;
-    }
-
-    .control-label {
-        width: 1fr;
-        height: 1;
-    }
-
-    .control-binding {
+    .control-binding,
+    .add-on-state, .add-on-setting-value {
         width: 9;
         height: 1;
         text-align: right;
@@ -3073,22 +3017,10 @@ class RepetuiApp(App[None]):
         text-overflow: ellipsis;
     }
 
-    .add-on-state, .add-on-setting-value {
-        width: 9;
-        height: 1;
-        text-align: right;
-    }
-
     .surface-footer {
         height: 1;
         color: #817d76;
         overflow: hidden;
-    }
-
-    #error-layout {
-        width: 100%;
-        height: 100%;
-        background: #111416;
     }
 
     #error-scroll {
@@ -3126,6 +3058,69 @@ class RepetuiApp(App[None]):
         color: #dc6b72;
     }
 
+    ToastRack {
+        overlay: screen;
+        align: center bottom;
+        max-height: 50%;
+        margin-bottom: 0;
+        overflow: hidden;
+    }
+
+    ToastHolder {
+        align-horizontal: center;
+    }
+
+    Toast {
+        width: auto;
+        max-width: 100%;
+        max-height: 2;
+        margin: 0;
+        padding: 0 1;
+        border: none;
+        background: #293034;
+        color: #e7e1d8;
+    }
+
+    Toast.-information {
+        border: none;
+    }
+
+    Toast.-warning, Toast.-warning .toast--title,
+    NotificationDetailScreen.-warning #notification-header {
+        border: none;
+        color: #e8b856;
+    }
+
+    Toast.-error, Toast.-error .toast--title,
+    NotificationDetailScreen.-error #notification-header {
+        border: none;
+        color: #dc6b72;
+    }
+
+    Toast.-information .toast--title {
+        color: #e7e1d8;
+    }
+
+    #notification-layout {
+        height: 1fr;
+        background: #293034;
+    }
+
+    #notification-header, #notification-footer {
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
+    #notification-footer {
+        color: #aaa49b;
+    }
+
+    #notification-body {
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+
     #sync-recovery {
         display: none;
         width: 40;
@@ -3149,6 +3144,8 @@ class RepetuiApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=False, priority=True),
         Binding("question_mark", "help", "Help", show=False, priority=True),
+        # ponytail: n yields to custom review keys; make it configurable if needed.
+        Binding("n", "open_notification", "Read notification", show=False),
     ]
 
     def __init__(
@@ -3180,6 +3177,7 @@ class RepetuiApp(App[None]):
         self._sync_fatal_error: str | None = None
         self._media_task: MediaSyncTask | None = None
         self._media_snapshot: MediaSyncSnapshot | None = None
+        self._media_progress_shown = False
         self._media_endpoint: str | None = None
         self._completion_celebration: CompletionCelebrationScreen | None = None
         self.offered_field_setups: set[tuple[int, int]] = set()
@@ -3279,8 +3277,49 @@ class RepetuiApp(App[None]):
             self._completion_celebration.stop_animation()
             self._completion_celebration = None
 
+    def _refresh_notifications(self) -> None:
+        if not self.screen_stack:
+            return
+        racks = self.screen.query(ToastRack)
+        if not racks:
+            return
+        notifications = list(self._notifications)
+        preview = Notifications()
+        if notifications and not isinstance(self.screen, NotificationDetailScreen):
+            notification = notifications[-1]
+            shortcut_available = not isinstance(self.screen, ReviewScreen) or not any(
+                self.review_controls.binding(action) == "n" for action in ReviewAction
+            )
+            message = f"n: {notification.message}" if shortcut_available else notification.message
+            preview.add(replace(notification, message=message))
+        rack = racks.first()
+
+        async def show_preview() -> None:
+            if rack.is_mounted:
+                # Remove native holders as well, so replaced notices leave no empty rows.
+                await rack.remove_children()
+                rack.show(preview)
+
+        self.call_later(show_preview)
+
+    def action_open_notification(self) -> None:
+        if self.syncing or isinstance(self.screen, (
+            NotificationDetailScreen, OperationStatusPill, CompletionCelebrationScreen,
+        )):
+            return
+        notifications = list(self._notifications)
+        if notifications:
+            notification = notifications[-1]
+            self._unnotify(notification)
+            self.push_screen(
+                NotificationDetailScreen(notification),
+                lambda _: self._maybe_show_media_progress(),
+            )
+
     def action_help(self) -> None:
-        if self.syncing or isinstance(self.screen, StartupRecoveryScreen):
+        if self.syncing or isinstance(self.screen, (
+            StartupRecoveryScreen, NotificationDetailScreen,
+        )):
             return
         screen = self.screen
         if isinstance(screen, CompletionCelebrationScreen):
@@ -3293,7 +3332,9 @@ class RepetuiApp(App[None]):
             self.push_screen(SettingsScreen(initial_tab="help"))
 
     def action_quit(self) -> None:
-        if isinstance(self.screen, CompletionCelebrationScreen):
+        if isinstance(self.screen, NotificationDetailScreen):
+            self.screen.action_back()
+        elif isinstance(self.screen, CompletionCelebrationScreen):
             self.screen.action_skip()
         elif not self.syncing:
             self.exit()
@@ -3355,12 +3396,24 @@ class RepetuiApp(App[None]):
         )
         self._media_task = task
         self._media_snapshot = task.snapshot if task is not None else None
+        self._media_progress_shown = False
         if task is not None:
             task.start()
+
+    def _maybe_show_media_progress(self) -> None:
+        snapshot = self._media_snapshot
+        if (
+            self.syncing or self.lifecycle.stopped or self._media_progress_shown or snapshot is None
+            or isinstance(self.screen, NotificationDetailScreen)
+        ):
+            return
+        if snapshot.has_downloads or snapshot.status is MediaSyncStatus.FAILED:
+            self._show_media_progress()
 
     def _show_media_progress(self) -> None:
         if self._media_snapshot is None:
             return
+        self._media_progress_shown = True
         if isinstance(self.screen, MediaProgressScreen):
             self.screen.update_progress(self._media_snapshot)
         else:
@@ -3381,10 +3434,16 @@ class RepetuiApp(App[None]):
     def on_media_updated(self, message: MediaUpdated) -> None:
         if self.lifecycle.stopped or message.task is not self._media_task:
             return
+        if message.snapshot.status is MediaSyncStatus.FAILED and (
+            self._media_snapshot is None
+            or self._media_snapshot.status is not MediaSyncStatus.FAILED
+        ):
+            self._media_progress_shown = False
         self._media_snapshot = message.snapshot
         if isinstance(self.screen, MediaProgressScreen):
             self.screen.update_progress(message.snapshot)
         self._refresh_media_content()
+        self._maybe_show_media_progress()
         if message.snapshot.status is MediaSyncStatus.COMPLETE:
             self.notify("Media synced.")
         elif message.snapshot.status is MediaSyncStatus.FAILED:
@@ -3412,11 +3471,8 @@ class RepetuiApp(App[None]):
                 return
         if fatal and fatal_error is not None:
             self.push_screen(ErrorScreen(f"Could not reopen the Anki collection: {fatal_error}"))
-        elif self.media_downloading or (
-            self._media_snapshot is not None
-            and self._media_snapshot.status is MediaSyncStatus.FAILED
-        ):
-            self._show_media_progress()
+        else:
+            self._maybe_show_media_progress()
 
     def refresh_open_screens(self) -> None:
         for screen in tuple(self.screen_stack):
