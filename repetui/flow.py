@@ -14,7 +14,7 @@ from .card_text import annotated, inline_readings
 from .card_text import strip as _strip_text
 from .card_text import substitute as _replace_text
 from .controls import ReviewAction, ReviewControls
-from .preferences import AnswerLayout, SectionMode
+from .preferences import AnswerLayout, Preferences, SectionMode
 from .presentation import CardPresentation, PresentationSection
 
 _TYPE_ANSWER_MARKER = "[type answer]"
@@ -31,6 +31,26 @@ class SectionState:
     mode: SectionMode
     expanded: bool = False
     selected: bool = False
+
+
+def section_states(
+    presentation: CardPresentation,
+    preferences: Preferences,
+    selected_folded: int,
+    expanded_sections: set[str] | frozenset[str] = frozenset(),
+) -> tuple[SectionState, ...]:
+    """Resolve saved modes and session folds for review or its unexpanded preview."""
+    sections = presentation.back.sections
+    modes = tuple(preferences.mode(presentation.identity, section.id) for section in sections)
+    folded = [
+        section.id for section, mode in zip(sections, modes, strict=True)
+        if mode is SectionMode.FOLD
+    ]
+    selected = folded[selected_folded % len(folded)] if folded else None
+    return tuple(
+        SectionState(section, mode, section.id in expanded_sections, section.id == selected)
+        for section, mode in zip(sections, modes, strict=True)
+    )
 
 
 def section_name(section: PresentationSection) -> str:
@@ -282,12 +302,7 @@ def _back(
 
     def flush_compact() -> None:
         if compact:
-            row = Text(overflow="fold")
-            for index, part in enumerate(compact):
-                if index:
-                    row.append("  ·  ", style="#d9d5ce")
-                row.append_text(part)
-            rows.append(row)
+            rows.append(Text("  ·  ", style="#d9d5ce", overflow="fold").join(compact))
             compact.clear()
 
     for state in states:
@@ -332,12 +347,7 @@ def _back(
             )
     flush_compact()
 
-    result = Text(overflow="fold")
-    for index, row in enumerate(rows):
-        if index:
-            result.append("\n")
-        result.append_text(row)
-    return result
+    return Text("\n", overflow="fold").join(rows)
 
 
 def compose_review(

@@ -54,6 +54,7 @@ from .flow import (
     compose_ratings,
     compose_review,
     section_name,
+    section_states,
 )
 from .images import (
     ImagePreviewError,
@@ -861,28 +862,8 @@ class TemplateFieldSetupScreen(Screen[None]):
     def _preview_states(
         self, presentation: CardPresentation
     ) -> tuple[SectionState, ...]:
-        identity = presentation.identity
-        modes = tuple(
-            self.review.repetui.preferences.mode(identity, section.id)
-            for section in presentation.back.sections
-        )
-        folded_ids = tuple(
-            section.id
-            for section, mode in zip(presentation.back.sections, modes, strict=True)
-            if mode is SectionMode.FOLD
-        )
-        selected_fold = (
-            folded_ids[self.review.selected_folded % len(folded_ids)]
-            if folded_ids
-            else None
-        )
-        return tuple(
-            SectionState(
-                section=section,
-                mode=mode,
-                selected=section.id == selected_fold,
-            )
-            for section, mode in zip(presentation.back.sections, modes, strict=True)
+        return section_states(
+            presentation, self.review.repetui.preferences, self.review.selected_folded
         )
 
     def _refresh_preview(self) -> None:
@@ -1318,51 +1299,25 @@ class SettingsScreen(Screen[None]):
     def action_down(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_down(animate=False)
-        elif self.tab == "sections" and self.card is not None:
-            self.query_one("#settings-sections", ListView).action_cursor_down()
-        elif self.tab == "controls":
-            self.query_one("#settings-controls", ListView).action_cursor_down()
-        elif self.tab == "add-ons":
-            self._active_add_on_view().action_cursor_down()
+        elif (view := self._active_list()) is not None:
+            view.action_cursor_down()
 
     def action_up(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_up(animate=False)
-        elif self.tab == "sections" and self.card is not None:
-            self.query_one("#settings-sections", ListView).action_cursor_up()
-        elif self.tab == "controls":
-            self.query_one("#settings-controls", ListView).action_cursor_up()
-        elif self.tab == "add-ons":
-            self._active_add_on_view().action_cursor_up()
+        elif (view := self._active_list()) is not None:
+            view.action_cursor_up()
 
     def action_top(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_home(animate=False)
-            return
-        if self.tab == "sections" and self.card is not None:
-            view = self.query_one("#settings-sections", ListView)
-        elif self.tab == "controls":
-            view = self.query_one("#settings-controls", ListView)
-        elif self.tab == "add-ons":
-            view = self._active_add_on_view()
-        else:
-            return
-        if view.children:
+        elif (view := self._active_list()) is not None and view.children:
             view.index = 0
 
     def action_bottom(self) -> None:
         if self.tab == "help":
             self.query_one("#settings-help", VerticalScroll).scroll_end(animate=False)
-            return
-        if self.tab == "sections" and self.card is not None:
-            view = self.query_one("#settings-sections", ListView)
-        elif self.tab == "controls":
-            view = self.query_one("#settings-controls", ListView)
-        elif self.tab == "add-ons":
-            view = self._active_add_on_view()
-        else:
-            return
-        if view.children:
+        elif (view := self._active_list()) is not None and view.children:
             view.index = len(view.children) - 1
 
     def action_cycle(self) -> None:
@@ -1426,6 +1381,13 @@ class SettingsScreen(Screen[None]):
             return
         item.refresh_mode(self.repetui.preferences, identity)
         self._show_default_footer()
+
+    def _active_list(self) -> ListView | None:
+        if self.tab == "add-ons":
+            return self._active_add_on_view()
+        if self.tab == "controls" or (self.tab == "sections" and self.card is not None):
+            return self.query_one(f"#settings-{self.tab}", ListView)
+        return None
 
     def _active_add_on_view(self) -> ListView:
         return self.query_one(
@@ -1670,8 +1632,49 @@ class NativeDetailScroll(NativeScrollMixin, ScrollableContainer):
     pass
 
 
-class ImageDetailScreen(Screen[None]):
+class NativeImageScreen(Screen[None]):
+    """Share overlay ownership and deferred painting across both image screens."""
+
+    NATIVE_CONTENT: str
+    NATIVE_SCROLL: str
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._native: NativeImageOverlay | None = None
+        self._native_pictures: tuple[NativePicture, ...] = ()
+        self._native_paint_pending = False
+
+    def on_screen_suspend(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+
+    def _native_invalidated(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            self._schedule_native_paint()
+
+    def _schedule_native_paint(self) -> None:
+        if self._native is None or not self._native.enabled:
+            return
+        if not self._native_paint_pending:
+            self._native_paint_pending = True
+            self.call_after_refresh(self._paint_native)
+
+    def _paint_native(self) -> None:
+        self._native_paint_pending = False
+        if self.app.screen is self and self._native is not None:
+            self._native.paint(
+                self.query_one(self.NATIVE_CONTENT, Static),
+                self.query_one(self.NATIVE_SCROLL, ScrollableContainer),
+                self._native_pictures,
+            )
+
+
+class ImageDetailScreen(NativeImageScreen):
     """Full-pane character image that can pan and switch visible card pictures."""
+
+    NATIVE_CONTENT = "#image-detail-picture"
+    NATIVE_SCROLL = "#image-detail-scroll"
 
     BINDINGS = [
         Binding("escape", "back", "Review", show=False),
@@ -1690,9 +1693,6 @@ class ImageDetailScreen(Screen[None]):
         self.resolve = resolve
         self.index = 0
         self._rendered: tuple[int, int, int] | None = None
-        self._native: NativeImageOverlay | None = None
-        self._native_pictures: tuple[NativePicture, ...] = ()
-        self._native_paint_pending = False
         self._pending_picture: Path | None = None
         self._media_active_rendered = False
 
@@ -1709,33 +1709,8 @@ class ImageDetailScreen(Screen[None]):
         if self._native is not None:
             self._native.clear()
 
-    def on_screen_suspend(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-
     def on_screen_resume(self) -> None:
         self._native_invalidated()
-
-    def _native_invalidated(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-            self._schedule_native_paint()
-
-    def _schedule_native_paint(self) -> None:
-        if self._native is None or not self._native.enabled:
-            return
-        if not self._native_paint_pending:
-            self._native_paint_pending = True
-            self.call_after_refresh(self._paint_native)
-
-    def _paint_native(self) -> None:
-        self._native_paint_pending = False
-        if self.app.screen is self and self._native is not None:
-            self._native.paint(
-                self.query_one("#image-detail-picture", Static),
-                self.query_one("#image-detail-scroll", ScrollableContainer),
-                self._native_pictures,
-            )
 
     def on_resize(self) -> None:
         if self.is_mounted:
@@ -1832,7 +1807,9 @@ class ImageDetailScreen(Screen[None]):
         self._render_picture()
 
 
-class ReviewScreen(Screen[None]):
+class ReviewScreen(NativeImageScreen):
+    NATIVE_CONTENT = "#card"
+    NATIVE_SCROLL = "#card-scroll"
     RATING_FEEDBACK_DURATION = 1.0
 
     BINDINGS = [
@@ -1877,9 +1854,6 @@ class ReviewScreen(Screen[None]):
         self._rating_feedback_timer: Timer | None = None
         self._audio = CardAudioPlayer(self._audio_error)
         self._visible_images: tuple[str, ...] = ()
-        self._native: NativeImageOverlay | None = None
-        self._native_pictures: tuple[NativePicture, ...] = ()
-        self._native_paint_pending = False
         self._refresh_failed = False
         self._media_active_rendered = False
         self._pending_pictures: tuple[Path, ...] = ()
@@ -1912,34 +1886,9 @@ class ReviewScreen(Screen[None]):
             self._rating_feedback_timer.stop()
             self._rating_feedback_timer = None
 
-    def on_screen_suspend(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-
     def on_screen_resume(self) -> None:
         self._native_invalidated()
         self.call_after_refresh(self.refresh_media)
-
-    def _native_invalidated(self) -> None:
-        if self._native is not None:
-            self._native.clear()
-            self._schedule_native_paint()
-
-    def _schedule_native_paint(self) -> None:
-        if self._native is None or not self._native.enabled:
-            return
-        if not self._native_paint_pending:
-            self._native_paint_pending = True
-            self.call_after_refresh(self._paint_native)
-
-    def _paint_native(self) -> None:
-        self._native_paint_pending = False
-        if self.app.screen is self and self._native is not None:
-            self._native.paint(
-                self.query_one("#card", Static),
-                self.query_one("#card-scroll", VerticalScroll),
-                self._native_pictures,
-            )
 
     def _busy(self) -> bool:
         if self.repetui.syncing:
@@ -2029,29 +1978,11 @@ class ReviewScreen(Screen[None]):
 
     def _section_states(self) -> tuple[SectionState, ...]:
         assert self.card is not None
-        identity = self.card.presentation.identity
-        folded = self._folded_sections()
-        folded_ids = [section.id for section in folded]
-        if folded_ids:
-            self.selected_folded %= len(folded_ids)
-        else:
-            self.selected_folded = 0
-
-        states: list[SectionState] = []
-        for section in self.card.presentation.back.sections:
-            mode = self.repetui.preferences.mode(identity, section.id)
-            states.append(
-                SectionState(
-                    section=section,
-                    mode=mode,
-                    expanded=section.id in self.expanded_sections,
-                    selected=(
-                        mode is SectionMode.FOLD
-                        and folded_ids.index(section.id) == self.selected_folded
-                    ),
-                )
-            )
-        return tuple(states)
+        self.selected_folded %= len(self._folded_sections()) or 1
+        return section_states(
+            self.card.presentation, self.repetui.preferences,
+            self.selected_folded, self.expanded_sections,
+        )
 
     def _refresh_view(self, *, reset_scroll: bool = True) -> None:
         if self._native is not None:
@@ -2881,11 +2812,7 @@ class RepetuiApp(App[None]):
         color: #e7e1d8;
     }
 
-    #deck-layout {
-        width: 100%;
-        height: 100%;
-    }
-
+    #deck-layout,
     #review-layout {
         width: 100%;
         height: 100%;
@@ -2898,7 +2825,9 @@ class RepetuiApp(App[None]):
         overflow: hidden;
     }
 
-    #deck-header, #error-header {
+    #deck-header, #error-header,
+    #field-profile-header,
+    #settings-header {
         height: 1;
         color: #eee9e0;
     }
@@ -2912,7 +2841,14 @@ class RepetuiApp(App[None]):
         height: 1;
     }
 
-    DeckItem:hover, DeckItem.-highlight {
+    DeckItem:hover, DeckItem.-highlight,
+    FieldProfileItem.-highlight,
+    AnswerLayoutSettingItem.-highlight,
+    TemplateFieldsSettingItem.-highlight,
+    SectionSettingItem.-highlight,
+    ControlSettingItem.-highlight,
+    AddOnItem.-highlight,
+    AddOnSettingItem.-highlight {
         background: #293034;
     }
 
@@ -2971,13 +2907,9 @@ class RepetuiApp(App[None]):
         text-align: center;
     }
 
-    #settings-layout {
-        width: 100%;
-        height: 100%;
-        background: #111416;
-    }
-
-    #field-profile-layout {
+    #settings-layout,
+    #field-profile-layout,
+    #error-layout {
         width: 100%;
         height: 100%;
         background: #111416;
@@ -2986,11 +2918,6 @@ class RepetuiApp(App[None]):
     #field-profile-body {
         width: 100%;
         height: 1fr;
-    }
-
-    #field-profile-header {
-        height: 1;
-        color: #eee9e0;
     }
 
     #field-profile-fields {
@@ -3030,29 +2957,29 @@ class RepetuiApp(App[None]):
         height: 1;
     }
 
-    FieldProfileItem {
+    FieldProfileItem,
+    AnswerLayoutSettingItem,
+    TemplateFieldsSettingItem,
+    SectionSettingItem,
+    ControlSettingItem,
+    AddOnItem,
+    AddOnSettingItem {
         height: 1;
         layout: horizontal;
     }
 
-    FieldProfileItem.-highlight {
-        background: #293034;
-    }
-
-    .field-name {
+    .field-name,
+    .setting-label,
+    .control-label {
         width: 1fr;
         height: 1;
     }
 
-    .field-role {
+    .field-role,
+    .setting-mode {
         width: 7;
         height: 1;
         text-align: right;
-    }
-
-    #settings-header {
-        height: 1;
-        color: #eee9e0;
     }
 
     #settings-tabs {
@@ -3076,42 +3003,8 @@ class RepetuiApp(App[None]):
         color: #aaa49b;
     }
 
-    AnswerLayoutSettingItem,
-    TemplateFieldsSettingItem,
-    SectionSettingItem,
-    ControlSettingItem,
-    AddOnItem,
-    AddOnSettingItem {
-        height: 1;
-        layout: horizontal;
-    }
-
-    AnswerLayoutSettingItem.-highlight,
-    TemplateFieldsSettingItem.-highlight,
-    SectionSettingItem.-highlight,
-    ControlSettingItem.-highlight,
-    AddOnItem.-highlight,
-    AddOnSettingItem.-highlight {
-        background: #293034;
-    }
-
-    .setting-label {
-        width: 1fr;
-        height: 1;
-    }
-
-    .setting-mode {
-        width: 7;
-        height: 1;
-        text-align: right;
-    }
-
-    .control-label {
-        width: 1fr;
-        height: 1;
-    }
-
-    .control-binding {
+    .control-binding,
+    .add-on-state, .add-on-setting-value {
         width: 9;
         height: 1;
         text-align: right;
@@ -3124,22 +3017,10 @@ class RepetuiApp(App[None]):
         text-overflow: ellipsis;
     }
 
-    .add-on-state, .add-on-setting-value {
-        width: 9;
-        height: 1;
-        text-align: right;
-    }
-
     .surface-footer {
         height: 1;
         color: #817d76;
         overflow: hidden;
-    }
-
-    #error-layout {
-        width: 100%;
-        height: 100%;
-        background: #111416;
     }
 
     #error-scroll {

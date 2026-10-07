@@ -4782,3 +4782,28 @@ async def test_download_arrives_in_image_viewer_and_refreshes_review_on_return(
         assert app.screen is review and not review.revealed
         assert "[picture downloading]" not in rendered_text(review)
         assert "secret.png" not in rendered_text(review)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tab", ["controls", "sections", "add-ons", "add-on-detail"])
+async def test_settings_navigation_stays_on_active_list_at_40x6(tmp_path, tab):
+    app, _ = make_app(tmp_path)
+    async with app.run_test(size=(40, 6)) as pilot:
+        await pilot.press("enter", "?")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen)
+        settings._show_tab("add-ons" if tab == "add-on-detail" else tab)
+        await pilot.pause()
+        if tab == "add-on-detail":
+            await pilot.press("enter")
+        view = settings.query_one(
+            "#settings-add-on-detail" if tab == "add-on-detail" else f"#settings-{tab}"
+        )
+        await pilot.press("G")
+        assert view.index == len(view.children) - 1
+        await pilot.press("g")
+        assert view.index == 0
+        await pilot.press("j")
+        assert view.index == min(1, len(view.children) - 1)
+        await pilot.press("k")
+        assert view.index == 0 and app.screen is settings
