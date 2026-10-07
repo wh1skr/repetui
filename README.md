@@ -33,6 +33,17 @@ If you have more than one Anki profile:
 repetui --profile PROFILE_NAME
 ```
 
+### Update with uv
+
+To update to the current stable release:
+
+```bash
+uv tool install --force "git+https://github.com/wh1skr/repetui.git@v0.2.3"
+repetui --version
+```
+
+Restart Repetui after updating. See the [0.2.3 release notes](docs/releases/v0.2.3.md).
+
 ### Collection already in use
 
 The startup recovery screen offers `r` to retry after manual closure and `c`
