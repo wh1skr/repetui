@@ -4,6 +4,16 @@ Brief user-visible updates to repetui are recorded here.
 
 ## Unreleased
 
+## 0.2.3 - 2026-10-07
+
+- Open media progress automatically for incoming downloads or errors; checks
+  and uploads keep the study screen available. Press `s` for manual progress.
+- Show one compact notification preview without interrupting study. Press `n`
+  to read its complete text, scroll with `j`/`k`, and return with Escape.
+- Preserve existing custom review keys, notification timeouts, and card state
+  while inspecting notices; narrow panes remain usable.
+- Consolidate rendering and settings code without changing review behavior.
+
 ## 0.1.7 - 2026-09-25
 
 Maintenance release: bug fixes and internal cleanup.
