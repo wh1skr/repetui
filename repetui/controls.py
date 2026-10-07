@@ -105,24 +105,15 @@ class ReviewControls:
             ):
                 return cls.defaults()
             bindings[action] = key
-        if "readings" not in saved and any(
-            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.READINGS]
-            for action_name, key in saved.items()
-            if action_name != "readings"
+        for action in (
+            ReviewAction.READINGS, ReviewAction.REPLAY_AUDIO, ReviewAction.VIEW_IMAGE,
         ):
-            bindings[ReviewAction.READINGS] = None
-        if "replay_audio" not in saved and any(
-            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.REPLAY_AUDIO]
-            for action_name, key in saved.items()
-            if action_name != "replay_audio"
-        ):
-            bindings[ReviewAction.REPLAY_AUDIO] = None
-        if "view_image" not in saved and any(
-            key == DEFAULT_REVIEW_BINDINGS[ReviewAction.VIEW_IMAGE]
-            for action_name, key in saved.items()
-            if action_name != "view_image"
-        ):
-            bindings[ReviewAction.VIEW_IMAGE] = None
+            if action.value not in saved and any(
+                key == DEFAULT_REVIEW_BINDINGS[action]
+                for action_name, key in saved.items()
+                if action_name != action.value
+            ):
+                bindings[action] = None
         assigned = [key for key in bindings.values() if key is not None]
         if len(assigned) != len(set(assigned)):
             return cls.defaults()

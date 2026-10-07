@@ -8,8 +8,9 @@ from repetui.flow import (
     compose_rating_feedback,
     compose_ratings,
     compose_review,
+    section_states,
 )
-from repetui.preferences import AnswerLayout, SectionMode
+from repetui.preferences import AnswerLayout, JsonPreferences, SectionMode
 from repetui.presentation import (
     CardTemplateIdentity,
     RawCardContent,
@@ -630,3 +631,24 @@ def test_rating_feedback_identifies_the_accepted_anki_action(
 
     assert result.plain == f"rated · {rating} {label}"
     assert any(str(span.style) == f"bold {colour}" for span in result.spans)
+
+
+def test_review_and_preview_share_fold_selection_without_temporary_expansion(tmp_path):
+    presentation = present_card(RawCardContent(
+        CardTemplateIdentity(1, "Basic", 0, "Card"), "question",
+        '<hr id=answer><h2>First</h2>one<h2>Second</h2>two<h2>Hidden</h2>three',
+    ))
+    first, second, hidden = presentation.back.sections
+    preferences = JsonPreferences(tmp_path / "preferences.json")
+    for section in (first, second):
+        preferences.set_mode(presentation.identity, section.id, SectionMode.FOLD)
+    preferences.set_mode(presentation.identity, hidden.id, SectionMode.HIDE)
+    review = section_states(presentation, preferences, 3, {second.id})
+    preview = section_states(presentation, preferences, 3)
+    assert [state.section.id for state in review if state.selected] == [second.id]
+    assert [state.section.id for state in preview if state.selected] == [second.id]
+    assert review[1].expanded and not any(state.expanded for state in preview)
+    assert review[2].mode is SectionMode.HIDE and not review[2].selected
+    for section in (first, second):
+        preferences.set_mode(presentation.identity, section.id, SectionMode.SHOW)
+    assert not any(state.selected for state in section_states(presentation, preferences, 3))
